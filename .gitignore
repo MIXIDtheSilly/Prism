@@ -1,0 +1,8 @@
+# Horizon OS files are Meta's and never go in the repo: users bring their own OTA.
+*.zip
+payload.bin
+HorizonOS/
+work/
+
+__pycache__/
+*.pyc

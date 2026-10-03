@@ -150,6 +150,11 @@ DAEMON_RCS = {
     'vrfocusserver.rc': [],  # vrfocus: which app has VR focus
     'xrservice.rc': ['xrservice-permission.xml', 'xrservice-spaces.xml'],  # SpaceManager, for volumetric windows
 }
+# VINTF fragments for stable-AIDL services system_server hosts (Meta's Java services): the service
+# refuses to start if servicemanager won't register it.
+SYSTEM_SERVER_VINTF = [
+    'vrpowermanager.xml',  # VrPowerManagerService: display power, and whether the headset is worn
+]
 DAEMON_SECLABEL = 'u:r:su:s0'  # stock policy has no domains for Meta's daemons (SELinux is permissive)
 
 
@@ -371,6 +376,8 @@ def build(args):
         for name in fragments:
             overlay.add_tree(images['system_ext'], f'/etc/vintf/manifest/{name}',
                              f'/system_ext/etc/vintf/manifest/{name}')
+    for name in SYSTEM_SERVER_VINTF:
+        overlay.add_tree(images['system_ext'], f'/etc/vintf/manifest/{name}', f'/system_ext/etc/vintf/manifest/{name}')
 
     # Prism's JNI glue.
     for name in sorted(os.listdir(args.jni)):
@@ -404,7 +411,12 @@ def build(args):
               '# outside developer mode), and init then stops adbd. The emulator\'s adbd talks over a qemu',
               '# pipe, not USB, so the USB functions don\'t matter to it.',
               'on property:init.svc.adbd=stopped',
-              '    start adbd']
+              '    start adbd',
+              '',
+              '# Apps render only while the headset is worn. There is no proximity sensor, so Prism tells',
+              '# VrPowerManagerService the headset is on (its virtual proximity, a developer setting).',
+              'on property:sys.boot_completed=1',
+              '    exec_background - system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())
 
     # Identity and Meta properties, appended to the stock product build.prop.

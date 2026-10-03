@@ -252,14 +252,14 @@ typedef struct {
 } Scratch;
 
 // In head (a copy of the caller's top-level structure), puts replacement in place of the first
-// structure of its type. The caller's structures are never written: those before it are copied
-// into scratch. If one of those has a size Prism doesn't know, replacement goes ahead of the
+// structure of type in_place_of. The caller's structures are never written: those before it are
+// copied into scratch. If one of those has a size Prism doesn't know, replacement goes ahead of the
 // caller's chain instead; gfxstream reads the first structure of each type.
-static void replace_in_chain(void *head, void *replacement, Scratch *scratch) {
+static void put_in_chain(void *head, VkStructureType in_place_of, void *replacement, Scratch *scratch) {
   VkBaseOutStructure *h = head, *r = replacement, *prev = h;
   VkBaseOutStructure *original = h->pNext;
   for (const VkBaseInStructure *n = (const VkBaseInStructure *)h->pNext; n; n = n->pNext) {
-    if (n->sType == r->sType) {
+    if (n->sType == in_place_of) {
       r->pNext = (VkBaseOutStructure *)n->pNext;
       prev->pNext = r;
       return;
@@ -274,6 +274,11 @@ static void replace_in_chain(void *head, void *replacement, Scratch *scratch) {
   }
   r->pNext = original;
   h->pNext = r;
+}
+
+// Puts replacement in place of the first structure of its own type.
+static void replace_in_chain(void *head, void *replacement, Scratch *scratch) {
+  put_in_chain(head, ((VkBaseOutStructure *)replacement)->sType, replacement, scratch);
 }
 
 static VkExternalMemoryHandleTypeFlags as_ahb(VkExternalMemoryHandleTypeFlags types) {
@@ -1929,7 +1934,7 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
     if (props.allocationSize) copy.allocationSize = props.allocationSize;
     if (!(props.memoryTypeBits & (1u << copy.memoryTypeIndex))) copy.memoryTypeIndex = __builtin_ctz(props.memoryTypeBits);
     import_ahb.buffer = buffer;
-    replace_in_chain(&copy, &import_ahb, &scratch);
+    put_in_chain(&copy, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, &import_ahb, &scratch);  // the fd is consumed
   }
   VkResult result = next.AllocateMemory(device, &copy, allocator, memory);
   if (result == VK_SUCCESS && importing) {

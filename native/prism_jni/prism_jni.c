@@ -24,6 +24,7 @@
 #include <android/log.h>
 #include <jni.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -206,6 +207,7 @@ enum { kJNICallTypeRegular = 1, kJNICallTypeCriticalNative = 2 };
 
 static void *find_symbol(const void *base, const char *name);
 static void hook_translator_dlsym(const struct dl_phdr_info *info);
+static void hook_create_namespace(NativeBridgeCallbacks *itf);
 static const NativeBridgeCallbacks *g_bridge;
 
 static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
@@ -219,6 +221,7 @@ static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
     if (!itf || itf->version < 8) return 0;  // another of the translator's libraries
     g_bridge = itf;
     hook_translator_dlsym(info);
+    hook_create_namespace((NativeBridgeCallbacks *)itf);
     return 1;
   }
   return 0;
@@ -236,6 +239,68 @@ static void *translator_dlsym(void *handle, const char *name) {
   void *symbol = g_loader_dlsym ? g_loader_dlsym(handle, name, __builtin_return_address(0)) : g_dlsym(handle, name);
   void *own = symbol && name ? prism_window_function(name, symbol) : NULL;
   return own ? own : symbol;
+}
+
+// ---- Writing a function pointer in another library's memory (relocated data or the interface
+// struct of the translator), keeping the page's protection as it was: the same page can hold data
+// its library still writes.
+static int page_protection(uintptr_t page) {
+  FILE *maps = fopen("/proc/self/maps", "re");
+  if (!maps) return -1;
+  char line[512];
+  int prot = -1;
+  while (prot < 0 && fgets(line, sizeof line, maps)) {
+    unsigned long start, end;
+    char perms[5];
+    if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3 || page < start || page >= end) continue;
+    prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) | (perms[2] == 'x' ? PROT_EXEC : 0);
+  }
+  fclose(maps);
+  return prot;
+}
+
+static int write_slot(void **slot, void *value) {
+  size_t size = (size_t)getpagesize();
+  uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(size - 1);
+  int prot = page_protection(page);
+  if (prot < 0 || (!(prot & PROT_WRITE) && mprotect((void *)page, size, prot | PROT_WRITE))) return 0;
+  *slot = value;
+  if (!(prot & PROT_WRITE)) mprotect((void *)page, size, prot);
+  return 1;
+}
+
+// ---- One copy of Horizon's arm64 libbinder per process. Apps' classloader namespaces are "shared":
+// they start with every library their parent has loaded. On a headset zygote has loaded libbinder
+// by then, so the app's libraries and the platform's use one copy. Under the translator nothing
+// arm64 is loaded that early, so each namespace loads its own libbinder; each copy opens
+// /dev/binder with its own ProcessState, and objects published through a copy whose thread pool
+// nobody starts never answer. Prism loads the binder libraries into the default arm64 namespace
+// before the first namespace is created, as zygote would have.
+#define GUEST_DIR "/system/lib64/arm64/prism"  // also in tools/deploy.py
+static const char *const kGuestPreload[] = {"libbinder_ndk.so", "libbinder.so", "libhidlbase.so"};
+typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
+static CreateNamespaceFn g_create_namespace;
+
+static void *bridge_create_namespace(const char *name, const char *ld_path, const char *default_path, uint64_t type,
+                                     const char *permitted, void *parent) {
+  static atomic_int preloaded;
+  if (!atomic_exchange(&preloaded, 1)) {
+    void *(*load)(const char *, int) = (void *(*)(const char *, int))g_bridge->v1_to_v6[1];  // loadLibrary
+    for (size_t i = 0; i < sizeof kGuestPreload / sizeof *kGuestPreload; i++) {
+      char path[128];
+      snprintf(path, sizeof path, GUEST_DIR "/%s", kGuestPreload[i]);
+      if (!load(path, RTLD_NOW)) LOGW("arm64 %s: not preloaded", kGuestPreload[i]);
+    }
+    LOGI("arm64 binder libraries preloaded before namespace %s", name);
+  }
+  return g_create_namespace(name, ld_path, default_path, type, permitted, parent);
+}
+
+static void hook_create_namespace(NativeBridgeCallbacks *itf) {
+  void **slot = &itf->v1_to_v6[11];  // createNamespace
+  if (*slot == (void *)bridge_create_namespace) return;
+  g_create_namespace = (CreateNamespaceFn)*slot;
+  if (!write_slot(slot, (void *)bridge_create_namespace)) LOGW("translator's createNamespace: can't write its slot");
 }
 
 static void hook_translator_dlsym(const struct dl_phdr_info *info) {
@@ -265,15 +330,12 @@ static void hook_translator_dlsym(const struct dl_phdr_info *info) {
         continue;
       void **slot = (void **)(info->dlpi_addr + r->r_offset);
       if (*slot == (void *)translator_dlsym) return;
-      uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(getpagesize() - 1);
-      if (mprotect((void *)page, (size_t)getpagesize(), PROT_READ | PROT_WRITE)) {
+      g_loader_dlsym = (LoaderDlsym)dlsym(RTLD_DEFAULT, "__loader_dlsym");
+      g_dlsym = *slot;
+      if (!write_slot(slot, (void *)translator_dlsym)) {
         LOGW("translator's dlsym: can't write its slot");
         return;
       }
-      g_loader_dlsym = (LoaderDlsym)dlsym(RTLD_DEFAULT, "__loader_dlsym");
-      g_dlsym = *slot;
-      *slot = (void *)translator_dlsym;
-      mprotect((void *)page, (size_t)getpagesize(), PROT_READ);
       LOGI("translator's dlsym wrapped (%s)", info->dlpi_name);
       return;
     }

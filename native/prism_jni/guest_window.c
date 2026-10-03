@@ -85,6 +85,9 @@ static ANativeWindow *create_host_window(JNIEnv *env, const char *name, int widt
   (*env)->CallObjectMethod(env, builder, (*env)->GetMethodID(env, builder_class, "setName", sig), jname);
   snprintf(sig, sizeof sig, "(II)%s", builder_sig);
   (*env)->CallObjectMethod(env, builder, (*env)->GetMethodID(env, builder_class, "setBufferSize", sig), width, height);
+  // The compositor's output is a display's scanout, which ignores alpha (its frames leave it 0).
+  snprintf(sig, sizeof sig, "(Z)%s", builder_sig);
+  (*env)->CallObjectMethod(env, builder, (*env)->GetMethodID(env, builder_class, "setOpaque", sig), JNI_TRUE);
   jobject control = (*env)->CallObjectMethod(
       env, builder, (*env)->GetMethodID(env, builder_class, "build", "()Landroid/view/SurfaceControl;"));
   if (failed(env, "SurfaceControl.Builder") || !control) return NULL;

@@ -161,10 +161,40 @@ static struct {
   PFN_vkBindBufferMemory BindBufferMemory;
   PFN_vkMapMemory MapMemory;
   PFN_vkDestroyBuffer DestroyBuffer;
+  PFN_vkVoidFunction AcquireImageANDROID, QueueSignalReleaseImageANDROID;
+  // debug.prism.vk.trace
+  PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
+  PFN_vkCmdBindPipeline CmdBindPipeline;
+  PFN_vkCmdSetViewport CmdSetViewport;
+  PFN_vkCmdSetScissor CmdSetScissor;
+  PFN_vkCmdDraw CmdDraw;
+  PFN_vkCmdDrawIndexed CmdDrawIndexed;
+  PFN_vkCmdClearAttachments CmdClearAttachments;
+  PFN_vkCmdEndRenderPass CmdEndRenderPass;
+  PFN_vkCmdEndRenderPass2 CmdEndRenderPass2;
+  PFN_vkCmdEndRenderPass2KHR CmdEndRenderPass2KHR;
 } next;
 
+// debug.prism.vk.trace=N: when the value changes, the next N lines of commands are logged: render
+// passes, pipelines bound, viewports, scissors, draws, clears, submits and presents. Framebuffers,
+// pipelines and swapchain images are logged as they're made (a bounded number of each).
+static int g_trace;  // lines left
+#define TRACE(...) \
+  do { \
+    if (__atomic_load_n(&g_trace, __ATOMIC_RELAXED) > 0 && __atomic_fetch_sub(&g_trace, 1, __ATOMIC_RELAXED) > 0) \
+      LOGI("trace: " __VA_ARGS__); \
+  } while (0)
+// Whether *counter, counting up, is still below limit.
+static int within(unsigned *counter, unsigned limit) { return __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED) < limit; }
+
+// VK_ANDROID_native_buffer (vulkan/vk_android_native_buffer.h): what the loader's swapchain calls.
+typedef VkResult(VKAPI_PTR *PFN_AcquireImageANDROID)(VkDevice, VkImage, int, VkSemaphore, VkFence);
+typedef VkResult(VKAPI_PTR *PFN_QueueSignalReleaseImageANDROID)(VkQueue, uint32_t, const VkSemaphore *, VkImage, int *);
+static unsigned g_acquires, g_releases;  // swapchain images acquired and presented
+
 // debug.prism.vk.dump=N: every Nth copy into a mirror, and out of one, also copies layer 0 of the
-// image to /data/local/tmp/prism_<into|out>_<pid>.rgba (raw texels, width x height).
+// image to /data/local/tmp/prism_<into|out>_<pid>.rgba (raw texels, width x height). Read once a
+// second (see trace_submit).
 static unsigned g_dump_at;
 static unsigned g_submits, g_pulls, g_pushes;  // vkQueueSubmit calls, copies out of mirrors and into them
 static VkPhysicalDeviceMemoryProperties g_memory_properties;
@@ -439,9 +469,6 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
     NEED(MapMemory);
     NEED(DestroyBuffer);
     if (next.GetPhysicalDeviceMemoryProperties) next.GetPhysicalDeviceMemoryProperties(pd, &g_memory_properties);
-    char dump[PROP_VALUE_MAX] = "";
-    __system_property_get("debug.prism.vk.dump", dump);
-    g_dump_at = (unsigned)atoi(dump);
 #undef NEED
     if (memory_fd) LOGI("device %p: %s backed by AHardwareBuffers", (void *)*device, kMemoryFd);
   }
@@ -579,8 +606,128 @@ static VkFormat mirror_format(VkFormat format) {
 
 #define MAX_VIEW_FORMATS 16
 
+#define NATIVE_BUFFER_ANDROID ((VkStructureType)1000010000)  // VK_STRUCTURE_TYPE_NATIVE_BUFFER_ANDROID
+#define MAX_SWAPCHAIN 16
+static VkImage g_swapchain[MAX_SWAPCHAIN];  // images the loader's swapchain made
+static unsigned g_swapchain_count;
+
+// --- the display ---------------------------------------------------------------------------------
+
+// Horizon's compositor draws for its headset's panel, which on the emulator is larger than the
+// swapchain images it renders to: its viewport for a 1920x1080 window is 3840x2160, 1080 rows above
+// the image, so most of each eye falls outside it. Prism is the display, so in a pass into a
+// swapchain image a viewport larger than the render area is taken for the panel, and the panel is
+// mapped onto the render area: that viewport and the scissors after it, scaled and moved alike.
+static VkImageView g_swapchain_views[MAX_SWAPCHAIN];
+static unsigned g_swapchain_view_count;
+static VkFramebuffer g_screens[MAX_SWAPCHAIN];  // framebuffers of swapchain images
+static unsigned g_screen_count;
+
+#define MAX_PANELS 32
+typedef struct {
+  VkCommandBuffer cb;  // in a pass into a swapchain image
+  VkRect2D area;       // the pass's render area
+  VkViewport panel;    // the panel's viewport, if fit
+  int fit;
+} Panel;
+static Panel g_panels[MAX_PANELS];
+static unsigned g_panel_next;
+
+static int is_screen(VkFramebuffer framebuffer) {
+  for (unsigned i = 0; framebuffer != VK_NULL_HANDLE && i < MAX_SWAPCHAIN; i++)
+    if (g_screens[i] == framebuffer) return 1;
+  return 0;
+}
+
+// The panel cb draws in, if it's in a pass into a swapchain image. Called with g_lock held.
+static Panel *panel_of(VkCommandBuffer cb) {
+  for (unsigned i = 0; i < MAX_PANELS; i++)
+    if (g_panels[i].cb == cb) return &g_panels[i];
+  return NULL;
+}
+
+static void panel_begin(VkCommandBuffer cb, const VkRenderPassBeginInfo *begin) {
+  if (!__atomic_load_n(&g_screen_count, __ATOMIC_RELAXED)) return;
+  pthread_mutex_lock(&g_lock);
+  Panel *p = panel_of(cb);
+  if (is_screen(begin->framebuffer)) {
+    if (!p) p = &g_panels[g_panel_next++ % MAX_PANELS];
+    *p = (Panel){cb, begin->renderArea};
+  } else if (p) {
+    p->cb = VK_NULL_HANDLE;
+  }
+  pthread_mutex_unlock(&g_lock);
+}
+
+static void panel_end(VkCommandBuffer cb) {
+  if (!__atomic_load_n(&g_screen_count, __ATOMIC_RELAXED)) return;
+  pthread_mutex_lock(&g_lock);
+  Panel *p = panel_of(cb);
+  if (p) p->cb = VK_NULL_HANDLE;
+  pthread_mutex_unlock(&g_lock);
+}
+
+// Maps x (horizontal, or vertical) from the panel onto the render area.
+static double panel_x(const Panel *p, double x) {
+  return p->area.offset.x + (x - p->panel.x) * p->area.extent.width / p->panel.width;
+}
+static double panel_y(const Panel *p, double y) {
+  return p->area.offset.y + (y - p->panel.y) * p->area.extent.height / p->panel.height;
+}
+
+// Fits viewports (or, without them, scissors) to the panel into out. Returns whether it did.
+static int panel_fit(VkCommandBuffer cb, uint32_t count, const VkViewport *viewports, VkViewport *out,
+                     const VkRect2D *scissors, VkRect2D *scissors_out) {
+  if (!__atomic_load_n(&g_screen_count, __ATOMIC_RELAXED) || count > MAX_PANELS) return 0;
+  pthread_mutex_lock(&g_lock);
+  Panel *p = panel_of(cb);
+  if (p && viewports) {
+    const VkViewport *v = &viewports[0];
+    p->fit = v->width > p->area.extent.width || v->height > p->area.extent.height;
+    if (p->fit) {
+      static unsigned logged;
+      if (within(&logged, 1))
+        LOGI("display: the compositor's panel, %g,%g %gx%g, fit to %d,%d %ux%u", v->x, v->y, v->width, v->height,
+             p->area.offset.x, p->area.offset.y, p->area.extent.width, p->area.extent.height);
+      p->panel = *v;
+    }
+  }
+  int fit = p && p->fit;
+  for (uint32_t i = 0; fit && i < count; i++) {
+    if (viewports) {
+      out[i] = viewports[i];
+      out[i].x = (float)panel_x(p, viewports[i].x);
+      out[i].y = (float)panel_y(p, viewports[i].y);
+      out[i].width = (float)(viewports[i].width * p->area.extent.width / p->panel.width);
+      out[i].height = (float)(viewports[i].height * p->area.extent.height / p->panel.height);
+      continue;
+    }
+    double left = p->area.offset.x, top = p->area.offset.y;
+    double right = left + p->area.extent.width, bottom = top + p->area.extent.height;
+    double x0 = panel_x(p, scissors[i].offset.x), y0 = panel_y(p, scissors[i].offset.y);
+    double x1 = panel_x(p, (double)scissors[i].offset.x + scissors[i].extent.width);
+    double y1 = panel_y(p, (double)scissors[i].offset.y + scissors[i].extent.height);
+    x0 = x0 < left ? left : x0 > right ? right : x0;
+    y0 = y0 < top ? top : y0 > bottom ? bottom : y0;
+    x1 = x1 < x0 ? x0 : x1 > right ? right : x1;
+    y1 = y1 < y0 ? y0 : y1 > bottom ? bottom : y1;
+    scissors_out[i] = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)((int32_t)x1 - (int32_t)x0),
+                                                              (uint32_t)((int32_t)y1 - (int32_t)y0)}};
+  }
+  pthread_mutex_unlock(&g_lock);
+  return fit;
+}
+
 static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreateInfo *info,
                                              const VkAllocationCallbacks *allocator, VkImage *image) {
+  if (find_in(info, NATIVE_BUFFER_ANDROID)) {
+    VkResult result = next.CreateImage(device, info, allocator, image);
+    unsigned n = __atomic_fetch_add(&g_swapchain_count, 1, __ATOMIC_RELAXED);
+    if (result == VK_SUCCESS) g_swapchain[n % MAX_SWAPCHAIN] = *image;
+    LOGI("image %p: swapchain image %ux%u, format %d, usage %#x", result == VK_SUCCESS ? (void *)*image : NULL,
+         info->extent.width, info->extent.height, info->format, info->usage);
+    return result;
+  }
   const VkExternalMemoryImageCreateInfo *external = find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
   if (!external || !(external->handleTypes & OPAQUE_FD)) return next.CreateImage(device, info, allocator, image);
   VkImageCreateInfo copy = *info;
@@ -733,6 +880,13 @@ static void VKAPI_CALL prism_DestroyImage(VkDevice device, VkImage image, const 
 static VkResult VKAPI_CALL prism_CreateImageView(VkDevice device, const VkImageViewCreateInfo *info,
                                                  const VkAllocationCallbacks *allocator, VkImageView *view) {
   VkResult result = next.CreateImageView(device, info, allocator, view);
+  for (unsigned i = 0; result == VK_SUCCESS && i < MAX_SWAPCHAIN; i++) {
+    if (g_swapchain[i] == VK_NULL_HANDLE || g_swapchain[i] != info->image) continue;
+    unsigned n = __atomic_fetch_add(&g_swapchain_view_count, 1, __ATOMIC_RELAXED);
+    g_swapchain_views[n % MAX_SWAPCHAIN] = *view;
+    LOGI("view %p: of swapchain image %p, format %d", (void *)*view, (void *)info->image, info->format);
+    break;
+  }
   if (result != VK_SUCCESS || !tracking()) return result;
   pthread_mutex_lock(&g_lock);
   if (backed_image(info->image) && ROOM(g_views, g_view_count, g_view_capacity))
@@ -767,6 +921,11 @@ static void add_pass(VkRenderPass pass, uint32_t count, const void *attachments,
 static VkResult VKAPI_CALL prism_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *info,
                                                   const VkAllocationCallbacks *allocator, VkRenderPass *pass) {
   VkResult result = next.CreateRenderPass(device, info, allocator, pass);
+  static unsigned logged;
+  if (result == VK_SUCCESS && info->attachmentCount && within(&logged, 64))
+    LOGI("pass %p: %u attachments, first: format %d, load %d, store %d, %d to %d", (void *)*pass, info->attachmentCount,
+         info->pAttachments->format, info->pAttachments->loadOp, info->pAttachments->storeOp,
+         info->pAttachments->initialLayout, info->pAttachments->finalLayout);
   if (result == VK_SUCCESS)
     add_pass(*pass, info->attachmentCount, info->pAttachments, sizeof *info->pAttachments,
              offsetof(VkAttachmentDescription, finalLayout));
@@ -776,6 +935,12 @@ static VkResult VKAPI_CALL prism_CreateRenderPass(VkDevice device, const VkRende
 static VkResult render_pass2(PFN_vkCreateRenderPass2 down, VkDevice device, const VkRenderPassCreateInfo2 *info,
                              const VkAllocationCallbacks *allocator, VkRenderPass *pass) {
   VkResult result = down(device, info, allocator, pass);
+  static unsigned logged;
+  if (result == VK_SUCCESS && info->attachmentCount && within(&logged, 64))
+    LOGI("pass %p: %u attachments, first: format %d, load %d, store %d, %d to %d; %u views", (void *)*pass,
+         info->attachmentCount, info->pAttachments->format, info->pAttachments->loadOp, info->pAttachments->storeOp,
+         info->pAttachments->initialLayout, info->pAttachments->finalLayout,
+         info->subpassCount ? info->pSubpasses->viewMask : 0);
   if (result == VK_SUCCESS)
     add_pass(*pass, info->attachmentCount, info->pAttachments, sizeof *info->pAttachments,
              offsetof(VkAttachmentDescription2, finalLayout));
@@ -807,6 +972,25 @@ static void VKAPI_CALL prism_DestroyRenderPass(VkDevice device, VkRenderPass pas
 static VkResult VKAPI_CALL prism_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *info,
                                                    const VkAllocationCallbacks *allocator, VkFramebuffer *framebuffer) {
   VkResult result = next.CreateFramebuffer(device, info, allocator, framebuffer);
+  for (uint32_t i = 0; result == VK_SUCCESS && __atomic_load_n(&g_swapchain_view_count, __ATOMIC_RELAXED) &&
+                       !(info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) && i < info->attachmentCount; i++) {
+    int screen = 0;
+    for (unsigned k = 0; k < MAX_SWAPCHAIN && !screen; k++)
+      screen = g_swapchain_views[k] != VK_NULL_HANDLE && g_swapchain_views[k] == info->pAttachments[i];
+    if (!screen) continue;
+    pthread_mutex_lock(&g_lock);
+    g_screens[g_screen_count % MAX_SWAPCHAIN] = *framebuffer;
+    __atomic_store_n(&g_screen_count, g_screen_count + 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_lock);
+    break;
+  }
+  static unsigned logged;
+  if (result == VK_SUCCESS && within(&logged, 64))
+    LOGI("framebuffer %p: %ux%u, %u layers, pass %p, %u attachments: %p %p %p", (void *)*framebuffer, info->width,
+         info->height, info->layers, (void *)info->renderPass, info->attachmentCount,
+         info->attachmentCount > 0 && info->pAttachments ? (void *)info->pAttachments[0] : NULL,
+         info->attachmentCount > 1 && info->pAttachments ? (void *)info->pAttachments[1] : NULL,
+         info->attachmentCount > 2 && info->pAttachments ? (void *)info->pAttachments[2] : NULL);
   if (result != VK_SUCCESS || !__atomic_load_n(&g_view_count, __ATOMIC_RELAXED) ||
       (info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT))
     return result;
@@ -1022,6 +1206,10 @@ static void VKAPI_CALL prism_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const Vk
 
 // A render pass writes its attachments and leaves them in their final layouts.
 static void use_pass(VkCommandBuffer cb, const VkRenderPassBeginInfo *begin) {
+  TRACE("cb %p: begin pass %p, framebuffer %p, area %d,%d %ux%u, %u clears", (void *)cb, (void *)begin->renderPass,
+        (void *)begin->framebuffer, begin->renderArea.offset.x, begin->renderArea.offset.y,
+        begin->renderArea.extent.width, begin->renderArea.extent.height, begin->clearValueCount);
+  panel_begin(cb, begin);
   if (!tracking()) return;
   pthread_mutex_lock(&g_lock);
   const Pass *pass = NULL;
@@ -1382,7 +1570,39 @@ static uint32_t plan_batch(const VkSubmitInfo *batch, Plan *plans) {
 // layouts are followed through each batch, in submission order.
 static time_t g_stats_time;
 
+// Arms the trace when debug.prism.vk.trace changes and reads debug.prism.vk.dump (once a second), and
+// traces the batches.
+static void trace_submit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits) {
+  static time_t checked;
+  static char seen[PROP_VALUE_MAX];
+  time_t now = time(NULL);
+  if (now != __atomic_load_n(&checked, __ATOMIC_RELAXED)) {
+    __atomic_store_n(&checked, now, __ATOMIC_RELAXED);
+    char value[PROP_VALUE_MAX] = "";
+    __system_property_get("debug.prism.vk.dump", value);
+    __atomic_store_n(&g_dump_at, (unsigned)atoi(value), __ATOMIC_RELAXED);
+    value[0] = 0;
+    __system_property_get("debug.prism.vk.trace", value);
+    pthread_mutex_lock(&g_lock);
+    if (strcmp(value, seen)) {
+      strcpy(seen, value);
+      __atomic_store_n(&g_trace, atoi(value), __ATOMIC_RELAXED);
+      if (atoi(value) > 0) LOGI("trace: the next %d lines", atoi(value));
+    }
+    pthread_mutex_unlock(&g_lock);
+  }
+  for (uint32_t i = 0; i < count && __atomic_load_n(&g_trace, __ATOMIC_RELAXED) > 0; i++) {
+    const VkSubmitInfo *s = &submits[i];
+    TRACE("queue %p: batch %u of %u, %u waits, %u command buffers (%p %p %p %p), %u signals", (void *)queue, i, count,
+          s->waitSemaphoreCount, s->commandBufferCount, s->commandBufferCount > 0 ? (void *)s->pCommandBuffers[0] : NULL,
+          s->commandBufferCount > 1 ? (void *)s->pCommandBuffers[1] : NULL,
+          s->commandBufferCount > 2 ? (void *)s->pCommandBuffers[2] : NULL,
+          s->commandBufferCount > 3 ? (void *)s->pCommandBuffers[3] : NULL, s->signalSemaphoreCount);
+  }
+}
+
 static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
+  trace_submit(queue, count, submits);
   if (tracking()) {
     pthread_mutex_lock(&g_lock);
     g_submits++;
@@ -1390,8 +1610,9 @@ static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, cons
     if (now - g_stats_time >= 10) {
       g_stats_time = now;
       LOGI("stats: %u submits, %u copies out of mirrors, %u into; %d backed, %u views, %u descriptors, %u framebuffers, "
-           "%u records, %u sets; %u binds, %u hits", g_submits, g_pulls, g_pushes, g_backed_count, g_view_count,
-           g_descriptor_count, g_framebuffer_count, g_record_count, g_set_pool_count, g_binds, g_bind_hits);
+           "%u records, %u sets; %u binds, %u hits; %u acquires, %u presents", g_submits, g_pulls, g_pushes,
+           g_backed_count, g_view_count, g_descriptor_count, g_framebuffer_count, g_record_count, g_set_pool_count, g_binds,
+           g_bind_hits, g_acquires, g_releases);
     }
     pthread_mutex_unlock(&g_lock);
   }
@@ -1761,6 +1982,114 @@ static VkResult VKAPI_CALL prism_BindImageMemory2KHR(VkDevice device, uint32_t c
   return bind_image_memory2(next.BindImageMemory2KHR, device, count, infos);
 }
 
+static VkResult VKAPI_CALL prism_AcquireImageANDROID(VkDevice device, VkImage image, int fence_fd, VkSemaphore semaphore,
+                                                     VkFence fence) {
+  __atomic_add_fetch(&g_acquires, 1, __ATOMIC_RELAXED);
+  TRACE("acquire %p", (void *)image);
+  return ((PFN_AcquireImageANDROID)next.AcquireImageANDROID)(device, image, fence_fd, semaphore, fence);
+}
+
+static VkResult VKAPI_CALL prism_QueueSignalReleaseImageANDROID(VkQueue queue, uint32_t count, const VkSemaphore *waits,
+                                                                VkImage image, int *fence_fd) {
+  __atomic_add_fetch(&g_releases, 1, __ATOMIC_RELAXED);
+  TRACE("present %p after %u waits", (void *)image, count);
+  return ((PFN_QueueSignalReleaseImageANDROID)next.QueueSignalReleaseImageANDROID)(queue, count, waits, image, fence_fd);
+}
+
+static VkResult VKAPI_CALL prism_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                        const VkGraphicsPipelineCreateInfo *infos,
+                                                        const VkAllocationCallbacks *allocator, VkPipeline *pipelines) {
+  VkResult result = next.CreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+  static unsigned logged;
+  for (uint32_t i = 0; i < count && within(&logged, 96); i++) {
+    const VkGraphicsPipelineCreateInfo *p = &infos[i];
+    const VkPipelineRasterizationStateCreateInfo *r = p->pRasterizationState;
+    const VkPipelineColorBlendStateCreateInfo *c = p->pColorBlendState;
+    const VkPipelineViewportStateCreateInfo *v = p->pViewportState;
+    const VkPipelineDepthStencilStateCreateInfo *d = p->pDepthStencilState;
+    const VkPipelineColorBlendAttachmentState *a = c && c->attachmentCount ? c->pAttachments : NULL;
+    void *made = result == VK_SUCCESS ? (void *)pipelines[i] : NULL;
+    unsigned dynamic = 0;  // bit 0: viewport, 1: scissor
+    for (uint32_t k = 0; p->pDynamicState && k < p->pDynamicState->dynamicStateCount; k++) {
+      VkDynamicState state = p->pDynamicState->pDynamicStates[k];
+      if (state == VK_DYNAMIC_STATE_VIEWPORT || state == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT) dynamic |= 1;
+      if (state == VK_DYNAMIC_STATE_SCISSOR || state == VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT) dynamic |= 2;
+    }
+    LOGI("pipeline %p: result %d, pass %p/%u, %u stages, %u viewports (dynamic %u), discard %d, cull %#x, front %d, "
+         "depth test %d write %d op %d, %u blends: enable %d, write mask %#x, color %d %d %d, alpha %d %d %d",
+         made, result, (void *)p->renderPass, p->subpass, p->stageCount, v ? v->viewportCount : 0, dynamic,
+         r ? r->rasterizerDiscardEnable : -1, r ? r->cullMode : 0, r ? r->frontFace : -1,
+         d ? d->depthTestEnable : -1, d ? d->depthWriteEnable : -1, d ? d->depthCompareOp : -1,
+         c ? c->attachmentCount : 0, a ? a->blendEnable : -1, a ? a->colorWriteMask : 0,
+         a ? a->srcColorBlendFactor : -1, a ? a->dstColorBlendFactor : -1, a ? a->colorBlendOp : -1,
+         a ? a->srcAlphaBlendFactor : -1, a ? a->dstAlphaBlendFactor : -1, a ? a->alphaBlendOp : -1);
+    if (v && v->pViewports && !(dynamic & 1))
+      LOGI("pipeline %p: viewport %g,%g %gx%g", made, v->pViewports[0].x, v->pViewports[0].y, v->pViewports[0].width,
+           v->pViewports[0].height);
+  }
+  return result;
+}
+
+static void VKAPI_CALL prism_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipeline pipeline) {
+  TRACE("cb %p: bind pipeline %p (point %d)", (void *)cb, (void *)pipeline, point);
+  next.CmdBindPipeline(cb, point, pipeline);
+}
+
+static void VKAPI_CALL prism_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                           const VkViewport *viewports) {
+  for (uint32_t i = 0; i < count; i++)
+    TRACE("cb %p: viewport %u: %g,%g %gx%g, depth %g-%g", (void *)cb, first + i, viewports[i].x, viewports[i].y,
+          viewports[i].width, viewports[i].height, viewports[i].minDepth, viewports[i].maxDepth);
+  VkViewport fitted[MAX_PANELS];
+  next.CmdSetViewport(cb, first, count, first == 0 && panel_fit(cb, count, viewports, fitted, NULL, NULL) ? fitted : viewports);
+}
+
+static void VKAPI_CALL prism_CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkRect2D *scissors) {
+  for (uint32_t i = 0; i < count; i++)
+    TRACE("cb %p: scissor %u: %d,%d %ux%u", (void *)cb, first + i, scissors[i].offset.x, scissors[i].offset.y,
+          scissors[i].extent.width, scissors[i].extent.height);
+  VkRect2D fitted[MAX_PANELS];
+  next.CmdSetScissor(cb, first, count, panel_fit(cb, count, NULL, NULL, scissors, fitted) ? fitted : scissors);
+}
+
+static void VKAPI_CALL prism_CmdDraw(VkCommandBuffer cb, uint32_t vertices, uint32_t instances, uint32_t first_vertex,
+                                    uint32_t first_instance) {
+  TRACE("cb %p: draw %u vertices, %u instances", (void *)cb, vertices, instances);
+  next.CmdDraw(cb, vertices, instances, first_vertex, first_instance);
+}
+
+static void VKAPI_CALL prism_CmdDrawIndexed(VkCommandBuffer cb, uint32_t indices, uint32_t instances, uint32_t first_index,
+                                           int32_t vertex_offset, uint32_t first_instance) {
+  TRACE("cb %p: draw %u indices, %u instances", (void *)cb, indices, instances);
+  next.CmdDrawIndexed(cb, indices, instances, first_index, vertex_offset, first_instance);
+}
+
+static void VKAPI_CALL prism_CmdClearAttachments(VkCommandBuffer cb, uint32_t count, const VkClearAttachment *attachments,
+                                                uint32_t rects, const VkClearRect *rect) {
+  TRACE("cb %p: clear %u attachments in %u rects (first %d,%d %ux%u)", (void *)cb, count, rects,
+        rects ? rect->rect.offset.x : 0, rects ? rect->rect.offset.y : 0, rects ? rect->rect.extent.width : 0,
+        rects ? rect->rect.extent.height : 0);
+  next.CmdClearAttachments(cb, count, attachments, rects, rect);
+}
+
+static void VKAPI_CALL prism_CmdEndRenderPass(VkCommandBuffer cb) {
+  TRACE("cb %p: end pass", (void *)cb);
+  panel_end(cb);
+  next.CmdEndRenderPass(cb);
+}
+
+static void VKAPI_CALL prism_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo *end) {
+  TRACE("cb %p: end pass", (void *)cb);
+  panel_end(cb);
+  next.CmdEndRenderPass2(cb, end);
+}
+
+static void VKAPI_CALL prism_CmdEndRenderPass2KHR(VkCommandBuffer cb, const VkSubpassEndInfo *end) {
+  TRACE("cb %p: end pass", (void *)cb);
+  panel_end(cb);
+  next.CmdEndRenderPass2KHR(cb, end);
+}
+
 #define EXPORT_COPIES 4
 
 static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *info, int *fd) {
@@ -1868,6 +2197,18 @@ static const Hook kHooks[] = {
     HOOK(CmdExecuteCommands),
     HOOK(CmdBindDescriptorSets),
     HOOK(QueueSubmit),
+    HOOK(AcquireImageANDROID),
+    HOOK(CreateGraphicsPipelines),
+    HOOK(CmdBindPipeline),
+    HOOK(CmdSetViewport),
+    HOOK(CmdSetScissor),
+    HOOK(CmdDraw),
+    HOOK(CmdDrawIndexed),
+    HOOK(CmdClearAttachments),
+    HOOK(CmdEndRenderPass),
+    HOOK(CmdEndRenderPass2),
+    HOOK(CmdEndRenderPass2KHR),
+    HOOK(QueueSignalReleaseImageANDROID),
     OWN(GetMemoryFdKHR),
     OWN(GetMemoryFdPropertiesKHR),
 };

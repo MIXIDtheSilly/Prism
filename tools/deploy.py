@@ -300,6 +300,16 @@ def prism_props(images):
     # Strata is the headset's display path (Meta's composer HAL). Without it the compositor's
     # output surface comes from SurfaceFlinger, which is what the emulator's window shows.
     props['persist.oculus.strata.disable'] = 'true'
+    # The headset scans its panel out in slices, each rendered in its own pass that clears the whole
+    # image first; on one screen the last slice's clear erased the others. One slice, the height of
+    # the window, renders the frame in one pass.
+    props['ro.ovr.sliceCountY'] = '1'
+    props['debug.oculus.frontbufferHeight'] = '1080'
+    # VrShell gives its environment 15 s to load, times the device's timeout multiplier when Meta's
+    # switch allows it. Under translation the load takes 15 s to well over a minute, so it failed on
+    # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
+    props['ro.hw_timeout_multiplier'] = '8'
+    props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
     return props
 
 

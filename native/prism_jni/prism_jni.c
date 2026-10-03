@@ -144,6 +144,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
 #include <link.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 // ---- SurfaceTexture: Horizon added a boolean to nativeInit and two longs to nativeUpdateTexImage.
@@ -207,7 +208,7 @@ typedef struct {  // libnativebridge's NativeBridgeCallbacks, version 8
 enum { kJNICallTypeRegular = 1, kJNICallTypeCriticalNative = 2 };
 
 static void *find_symbol(const void *base, const char *name);
-static void hook_translator_dlsym(const struct dl_phdr_info *info);
+static void hook_translator_imports(const struct dl_phdr_info *info);
 static void hook_create_namespace(NativeBridgeCallbacks *itf);
 static const NativeBridgeCallbacks *g_bridge;
 
@@ -221,7 +222,7 @@ static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
         find_symbol((const void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr), "NativeBridgeItf");
     if (!itf || itf->version < 8) return 0;  // another of the translator's libraries
     g_bridge = itf;
-    hook_translator_dlsym(info);
+    hook_translator_imports(info);
     hook_create_namespace((NativeBridgeCallbacks *)itf);
     return 1;
   }
@@ -313,7 +314,50 @@ static void hook_create_namespace(NativeBridgeCallbacks *itf) {
   if (!write_slot(slot, (void *)bridge_create_namespace)) LOGW("translator's createNamespace: can't write its slot");
 }
 
-static void hook_translator_dlsym(const struct dl_phdr_info *info) {
+// ---- Horizon's arm64 libraries for arm64 code that opens /system/lib64/<name>.so by path. On a
+// headset that is the arm64 library; here it's the emulator's x86_64 one, which the guest linker
+// rejects. Meta's code doesn't always cope (libvrapiimpl's heap-profiling hooks then call a null
+// pointer and kill VrShell). The guest linker is translated code; its opens reach the host through
+// the translator's imports (open and openat for the paths it emulates, syscall for the rest), where
+// Prism swaps in the GUEST_DIR copy if there is one.
+static const char *guest_library(const char *path, char *buf, size_t size) {
+  if (!path || strncmp(path, "/system/lib64/", 14)) return path;
+  const char *name = path + 14;
+  size_t n = strlen(name);
+  if (n < 4 || strchr(name, '/') || strcmp(name + n - 3, ".so") ||
+      snprintf(buf, size, GUEST_DIR "/%s", name) >= (int)size || access(buf, R_OK))
+    return path;
+  LOGI("arm64 code opens %s: Horizon's copy instead", path);
+  return buf;
+}
+
+static long (*g_syscall)(long, ...);
+static int (*g_open)(const char *, int, ...);
+static int (*g_open_2)(const char *, int);
+static int (*g_openat)(int, const char *, int, ...);
+
+static long translator_syscall(long nr, long a, long b, long c, long d, long e, long f) {
+  char buf[256];
+  if (nr == __NR_openat) b = (long)guest_library((const char *)b, buf, sizeof buf);
+  return g_syscall(nr, a, b, c, d, e, f);
+}
+
+static int translator_open(const char *path, int flags, int mode) {
+  char buf[256];
+  return g_open(guest_library(path, buf, sizeof buf), flags, mode);
+}
+
+static int translator_open_2(const char *path, int flags) {
+  char buf[256];
+  return g_open_2(guest_library(path, buf, sizeof buf), flags);
+}
+
+static int translator_openat(int dirfd, const char *path, int flags, int mode) {
+  char buf[256];
+  return g_openat(dirfd, guest_library(path, buf, sizeof buf), flags, mode);
+}
+
+static void hook_translator_imports(const struct dl_phdr_info *info) {
   const ElfW(Dyn) *dyn = NULL;
   for (int i = 0; i < info->dlpi_phnum; i++)
     if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
@@ -331,25 +375,38 @@ static void hook_translator_dlsym(const struct dl_phdr_info *info) {
     if (dyn->d_tag == DT_RELASZ) sizes[1] = dyn->d_un.d_val;
   }
   if (!symtab || !strtab) return;
+  static const struct {
+    const char *name;
+    void **real;
+    void *wrapper;
+  } kOpens[] = {
+      {"syscall", (void **)&g_syscall, (void *)translator_syscall},
+      {"open", (void **)&g_open, (void *)translator_open},
+      {"__open_2", (void **)&g_open_2, (void *)translator_open_2},
+      {"openat", (void **)&g_openat, (void *)translator_openat},
+  };
   for (int t = 0; t < 2; t++) {
     for (size_t i = 0; tables[t] && i < sizes[t] / sizeof(ElfW(Rela)); i++) {
       const ElfW(Rela) *r = &tables[t][i];
       uint32_t type = ELF64_R_TYPE(r->r_info);
-      if ((type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) ||
-          strcmp(strtab + symtab[ELF64_R_SYM(r->r_info)].st_name, "dlsym") != 0)
-        continue;
+      if (type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) continue;
+      const char *name = strtab + symtab[ELF64_R_SYM(r->r_info)].st_name;
       void **slot = (void **)(info->dlpi_addr + r->r_offset);
-      if (*slot == (void *)translator_dlsym) return;
-      g_loader_dlsym = (LoaderDlsym)dlsym(RTLD_DEFAULT, "__loader_dlsym");
-      g_dlsym = *slot;
-      if (!write_slot(slot, (void *)translator_dlsym)) {
-        LOGW("translator's dlsym: can't write its slot");
-        return;
+      if (!strcmp(name, "dlsym")) {
+        if (*slot == (void *)translator_dlsym) continue;
+        g_loader_dlsym = (LoaderDlsym)dlsym(RTLD_DEFAULT, "__loader_dlsym");
+        g_dlsym = *slot;
+        if (!write_slot(slot, (void *)translator_dlsym)) LOGW("translator's dlsym: can't write its slot");
+        continue;
       }
-      LOGI("translator's dlsym wrapped (%s)", info->dlpi_name);
-      return;
+      for (size_t k = 0; k < sizeof kOpens / sizeof *kOpens; k++) {
+        if (strcmp(name, kOpens[k].name) || *slot == kOpens[k].wrapper) continue;
+        *kOpens[k].real = *slot;
+        if (!write_slot(slot, kOpens[k].wrapper)) LOGW("translator's %s: can't write its slot", name);
+      }
     }
   }
+  LOGI("translator's dlsym and file opens wrapped (%s)", info->dlpi_name);
 }
 
 // "(ILjava/lang/String;[B)V" -> "VILL"

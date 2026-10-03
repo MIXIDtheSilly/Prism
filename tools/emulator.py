@@ -3,7 +3,7 @@
 Prism uses its own AVD (prism-api34) on its own port, so it never touches other AVDs.
 
     python tools/emulator.py create            # write the AVD (stock API 34 x86_64 image)
-    python tools/emulator.py start [--window]  # boot it: writable system, SELinux permissive
+    python tools/emulator.py start [--headless]  # boot it in a window: writable system, SELinux permissive
     python tools/emulator.py wait              # until Android reports boot completed
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
@@ -97,7 +97,7 @@ def start(args):
     command = [os.path.join(sdk_root(), 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator'),
                '-avd', AVD, '-port', str(PORT), '-writable-system', '-selinux', 'permissive', '-no-snapshot',
                '-no-boot-anim', '-gpu', 'host', '-crash-report-mode', 'never']
-    if not args.window:
+    if args.headless:
         command.append('-no-window')
     if args.wipe:
         command.append('-wipe-data')
@@ -165,7 +165,7 @@ def main():
     c.add_argument('--cores', type=int, default=6)
     c.add_argument('--memory', type=int, default=8192)
     s = sub.add_parser('start')
-    s.add_argument('--window', action='store_true')
+    s.add_argument('--headless', action='store_true', help='no emulator window')
     s.add_argument('--wipe', action='store_true', help='reset /data on this boot')
     s.add_argument('--wait', action='store_true')
     for p in (s, sub.add_parser('wait'), sub.add_parser('root')):

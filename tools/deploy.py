@@ -7,12 +7,14 @@ What goes where:
     bind-mounts them over the stock directories in post-fs-data, before zygote starts.
   * Prism's JNI glue goes to /system/lib64; zygote preloads libprism_jni.so.
   * Prism's Vulkan driver goes to /vendor/lib64/hw (ro.hardware.vulkan=prism).
+  * Prism's thermal HAL goes to /vendor/bin/hw, with its init script and VINTF declaration.
   * Horizon's device identity and Meta properties go into /product/etc/build.prop.
 
 Package manager state and compiled code are reset, since the platform signature changes.
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
     python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
+    python tools/thermal.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -155,6 +157,22 @@ DAEMON_RCS = {
 SYSTEM_SERVER_VINTF = [
     'vrpowermanager.xml',  # VrPowerManagerService: display power, and whether the headset is worn
 ]
+# Prism's thermal HAL (tools/thermal.py): vrdevice needs the stable-AIDL IThermal.
+THERMAL_HAL = 'android.hardware.thermal-service.prism'
+THERMAL_RC = f'''service vendor.thermal-prism /vendor/bin/hw/{THERMAL_HAL}
+    class hal
+    user system
+    group system
+    seclabel u:r:su:s0
+'''
+THERMAL_VINTF = '''<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.thermal</name>
+        <version>1</version>
+        <fqname>IThermal/default</fqname>
+    </hal>
+</manifest>
+'''
 DAEMON_SECLABEL = 'u:r:su:s0'  # stock policy has no domains for Meta's daemons (SELinux is permissive)
 
 
@@ -274,6 +292,9 @@ def build(args):
     vulkan = os.path.join(args.vulkan, f'vulkan.{VULKAN_DRIVER}.so')
     if not os.path.exists(vulkan):
         sys.exit(f'no Vulkan driver in {args.vulkan}; run: python tools/vulkan.py')
+    thermal = os.path.join(args.thermal, THERMAL_HAL)
+    if not os.path.exists(thermal):
+        sys.exit(f'no thermal HAL in {args.thermal}; run: python tools/thermal.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -389,6 +410,12 @@ def build(args):
     with open(vulkan, 'rb') as f:
         overlay.add(f'/vendor/lib64/hw/vulkan.{VULKAN_DRIVER}.so', 'f', 0o644, data=f.read())
 
+    # Prism's thermal HAL, beside the emulator's HIDL one (which the framework stops using).
+    with open(thermal, 'rb') as f:
+        overlay.add(f'/vendor/bin/hw/{THERMAL_HAL}', 'f', 0o755, gid=2000, data=f.read())
+    overlay.add(f'/vendor/etc/init/{THERMAL_HAL}.rc', 'f', 0o644, data=THERMAL_RC.encode())
+    overlay.add(f'/vendor/etc/vintf/manifest/{THERMAL_HAL}.xml', 'f', 0o644, data=THERMAL_VINTF.encode())
+
     # zygote preloads libprism_jni.so.
     rc = stock['system'].read(stock['system'].lookup(ZYGOTE_RC)).decode()
     rc = re.sub(r'(service zygote [^\n]*\n)', rf'\1    setenv LD_PRELOAD {PRELOAD}\n', rc, count=1)
@@ -443,6 +470,7 @@ FRESH_PACKAGE_STATE = ('rm -rf /data/system/packages.xml* /data/system/packages-
                        '/data/misc_de/0/apexdata/com.android.permission/*')
 # Once Horizon turns adb off, the setting and the persisted USB config outlive the deploy; stock's
 # boot then has no adb either.
+BOOT_ID = 'cat /proc/sys/kernel/random/boot_id'
 ADB_ON = 'setprop persist.sys.usb.config adb && (settings put global adb_enabled 1 || true)'
 
 
@@ -464,10 +492,19 @@ def reset(args):
                                   [FRESH_PACKAGE_STATE, 'sync', 'echo reset']) + ') 2>&1', check=False)
     if 'reset' not in out:
         sys.exit(f'resetting failed:\n{out}')
+    boot = shell(BOOT_ID, check=False).strip()
     shell(ADB_ON, check=False)  # if this changes the USB config, init restarts adbd and drops the shell
-    emulator.adb('wait-for-device')
-    emulator.adb('reboot')
-    emulator.adb('wait-for-device')
+    # The upper layers were emptied under the live overlay, which now has stale entries: the reboot
+    # must happen. A restarting adbd can swallow it, so it's repeated until the boot id changes.
+    for _ in range(10):
+        emulator.adb('wait-for-device')
+        emulator.adb('reboot', check=False)
+        time.sleep(5)
+        emulator.adb('wait-for-device')
+        if shell(BOOT_ID, check=False).strip() not in ('', boot):
+            break
+    else:
+        sys.exit('the emulator did not reboot after the reset')
     args.timeout = 300
     if not emulator.wait(args):
         sys.exit('stock did not finish booting after the reset')
@@ -490,7 +527,7 @@ def apply(args, replaced):
               f'chcon -hR u:object_r:system_file:s0 {DATA_ROOT}',  # -h: Horizon has dangling symlinks
               'restorecon -R /system/framework /system/priv-app /system/app /system/etc /system/lib64 /system/bin '
               '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc /vendor/lib64/hw '
-              '/vendor/odm/etc',
+              '/vendor/odm/etc /vendor/bin/hw /vendor/etc/init /vendor/etc/vintf',
               'rm -f /data/local/tmp/prism-overlay.tar /data/local/tmp/prism-data.tar',
               # Fresh package manager state and compiled code for the new platform.
               FRESH_PACKAGE_STATE,
@@ -512,6 +549,7 @@ def main():
     ap.add_argument('--compat', default=os.path.join('work', 'build', 'compat'))
     ap.add_argument('--translator', default=os.path.join('work', 'build', 'translator'))
     ap.add_argument('--vulkan', default=os.path.join('work', 'build', 'vulkan'))
+    ap.add_argument('--thermal', default=os.path.join('work', 'build', 'thermal'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')

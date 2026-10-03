@@ -236,7 +236,11 @@ typedef void *(*LoaderDlsym)(void *, const char *, const void *);
 static void *(*g_dlsym)(void *, const char *);
 static LoaderDlsym g_loader_dlsym;
 
+static int hook_proxy_tables(struct dl_phdr_info *info, size_t size, void *data);
+
 static void *translator_dlsym(void *handle, const char *name) {
+  // A proxy library just loaded: its table of host functions is relocated, and not yet read.
+  if (name && !strcmp(name, "InitProxyLibrary")) dl_iterate_phdr(hook_proxy_tables, NULL);
   // dlsym looks RTLD_DEFAULT and RTLD_NEXT up from its caller; keep that the translator.
   void *symbol = g_loader_dlsym ? g_loader_dlsym(handle, name, __builtin_return_address(0)) : g_dlsym(handle, name);
   void *own = symbol && name ? prism_window_function(name, symbol) : NULL;
@@ -407,6 +411,38 @@ static void hook_translator_imports(const struct dl_phdr_info *info) {
     }
   }
   LOGI("translator's dlsym and file opens wrapped (%s)", info->dlpi_name);
+}
+
+// The translator's proxy libraries (libberberis_proxy_libvulkan, ...) don't bind host functions
+// with dlsym: each keeps a table of their addresses, relocated by the host linker (from packed
+// relocations), and builds its trampolines from it in InitProxyLibrary. Prism swaps its
+// replacements in, finding each function's address in the library's writable segments.
+static const char *const kProxied[] = {"vkCreateAndroidSurfaceKHR", "vkGetInstanceProcAddr"};
+
+static int hook_proxy_tables(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size, (void)data;
+  const char *name = info->dlpi_name ? strrchr(info->dlpi_name, '/') : NULL;
+  if (!name || strncmp(name, "/libberberis_proxy_", 19) != 0) return 0;
+  for (size_t k = 0; k < sizeof kProxied / sizeof *kProxied; k++) {
+    void *real = dlsym(RTLD_DEFAULT, kProxied[k]);
+    if (!real) continue;
+    void *own = NULL;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+      const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+      if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_W)) continue;
+      uintptr_t start = (info->dlpi_addr + ph->p_vaddr + sizeof(void *) - 1) & ~(uintptr_t)(sizeof(void *) - 1);
+      void **end = (void **)((info->dlpi_addr + ph->p_vaddr + ph->p_memsz) & ~(uintptr_t)(sizeof(void *) - 1));
+      for (void **slot = (void **)start; slot < end; slot++) {
+        if (*slot != real) continue;
+        if (!own && !(own = prism_window_function(kProxied[k], real))) break;
+        if (write_slot(slot, own))
+          LOGI("%s: %s replaced", name + 1, kProxied[k]);
+        else
+          LOGW("%s: can't write the slot of %s", name + 1, kProxied[k]);
+      }
+    }
+  }
+  return 0;
 }
 
 // "(ILjava/lang/String;[B)V" -> "VILL"

@@ -4,7 +4,9 @@
 // own replacements), the translator's handler gives up and reverts the signal to SIG_DFL, so the
 // process dies without a tombstone. Ahead of it (and of ART's fault handler) this logs the faulting
 // pc and a stack scan for return addresses, as module+offset, then lets the signal go on unchanged
-// (and for a null call in arm64 code, the guest's call chain; see report_guest).
+// (and for a null call in arm64 code, the guest's call chain; see report_guest). Host code that
+// calls an arm64 function directly (an arm64 window's or callback's function pointer) faults in
+// the arm64 library; that is reported too, with the host callers.
 // ART's own faults (implicit null and stack checks, in compiled Java) are not in a host .so, and
 // pass through silently. Only the preloaded libprism_jni has it: libsigchain takes two handlers.
 #ifndef PRISM_STUB_LIB
@@ -134,11 +136,17 @@ static bool on_fault(int sig, siginfo_t *si, void *context) {
   uintptr_t pc = uc->uc_mcontext.pc, sp = uc->uc_mcontext.sp;
 #endif
   Dl_info info;
-  if (!host_module(pc, &info) || reporting++) return false;
+  // Host code that jumps into arm64 code (an arm64 callback called directly) faults on executing a
+  // page that isn't executable for the host: si_addr is the pc itself.
+  bool guest_jump = sig == SIGSEGV && si->si_code == SEGV_ACCERR && (uintptr_t)si->si_addr == pc;
+  if (!(guest_jump || host_module(pc, &info)) || reporting++) return false;
   LOG("signal %d code %d addr %p in tid %d", sig, si->si_code, si->si_addr, gettid());
-  describe("pc", pc, &info);
+  if (guest_jump && read_maps())
+    describe_guest("host code called arm64 code at", pc);
+  else
+    describe("pc", pc, &info);
 #if defined(__x86_64__)
-  if (info.dli_sname && !strcmp(info.dli_sname, "syscall")) {
+  if (!guest_jump && info.dli_sname && !strcmp(info.dli_sname, "syscall")) {
     greg_t *r = uc->uc_mcontext.gregs;
     LOG("  syscall args %#llx %#llx %#llx %#llx", (unsigned long long)r[REG_RDI], (unsigned long long)r[REG_RSI],
         (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_R10]);

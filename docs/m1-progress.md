@@ -81,6 +81,15 @@ python tools\emulator.py status
   and `ANativeWindow_*`. They give EGL an x86_64 stand-in for an arm64 window: a layer of the same
   size created through Java's `SurfaceControl`, shown on top.
 
+- **Front buffer.** The compositor asks EGL for a single-buffered (front-buffer) window surface, which
+  a headset's display scans out as it is drawn; here nothing reaches SurfaceFlinger unless a buffer
+  is queued. Prism refuses that surface with a real EGL error, and the compositor falls back to a
+  back buffer it swaps each frame.
+- **Vulkan compositor** (`setprop debug.oculus.compositorGpuApi vk`, not yet the default). The
+  emulator's GLES lacks `GL_EXT_memory_object_fd`, so the GL compositor can't sample clients'
+  Vulkan swapchains; the Vulkan one shares them through Prism's driver. The x86_64 Vulkan loader
+  drives the window too, so the translator's Vulkan proxy is patched (its table of loader
+  functions) to give `vkCreateAndroidSurfaceKHR` the same stand-in window as EGL.
 - **arm64 libraries by path.** Meta's code dlopens some platform libraries by absolute path
   (`/system/lib64/heapprofd_client_api.so`), which here are x86_64. The guest linker is translated
   code whose opens reach the host through the translator's `open`, `openat` and `syscall` imports;

@@ -16,7 +16,9 @@
 
 #include "prism_guest.h"
 
+#define VK_USE_PLATFORM_ANDROID_KHR
 #include <EGL/egl.h>
+#include <vulkan/vulkan.h>
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
@@ -305,7 +307,22 @@ static EGLBoolean destroy_context(EGLDisplay dpy, EGLContext ctx) {
   return ok;
 }
 
+// Front-buffer rendering (EGL_SINGLE_BUFFER), which Meta's compositor asks for: on a headset the
+// display scans its one buffer out as it is drawn. Here a window's content reaches SurfaceFlinger
+// only when a buffer is queued, and the compositor never swaps a front buffer, so it is refused;
+// the compositor then retries with a back buffer and swaps each frame. It retries only on an EGL
+// error, which EGL itself sets: a surface for no window fails with EGL_BAD_NATIVE_WINDOW.
+static int wants_front_buffer(const EGLint *attrs) {
+  for (const EGLint *a = attrs; a && a[0] != EGL_NONE; a += 2)
+    if (a[0] == EGL_RENDER_BUFFER && a[1] == EGL_SINGLE_BUFFER) return 1;
+  return 0;
+}
+
 static EGLSurface create_window_surface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint *attrs) {
+  if (wants_front_buffer(attrs)) {
+    LOGI("arm64 window %p: front-buffer surface refused (back buffer instead)", (void *)win);
+    return real_create_window_surface(dpy, real_config(config), NULL, NULL);
+  }
   return real_create_window_surface(dpy, real_config(config), host_window_for(win), attrs);
 }
 
@@ -338,6 +355,27 @@ static int32_t get_buffers_data_space(ANativeWindow *w) { return real_get_buffer
 static int32_t lock(ANativeWindow *w, ANativeWindow_Buffer *b, ARect *r) { return real_lock(host_window_for(w), b, r); }
 static int32_t unlock_and_post(ANativeWindow *w) { return real_unlock_and_post(host_window_for(w)); }
 
+// Vulkan surfaces of arm64 windows (Meta's compositor with debug.oculus.compositorGpuApi=vk). The
+// x86_64 Vulkan loader drives the window itself, so it gets the same stand-in as EGL does. The
+// translator's Vulkan proxy calls these through its table of the loader's functions (prism_jni.c
+// patches it); vkGetInstanceProcAddr hands out the wrapper too.
+static PFN_vkCreateAndroidSurfaceKHR real_create_android_surface;
+static PFN_vkGetInstanceProcAddr real_get_instance_proc_addr;
+
+static VkResult VKAPI_CALL create_android_surface(VkInstance instance, const VkAndroidSurfaceCreateInfoKHR *info,
+                                                  const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface) {
+  VkAndroidSurfaceCreateInfoKHR copy = *info;
+  copy.window = host_window_for(info->window);
+  return real_create_android_surface(instance, &copy, allocator, surface);
+}
+
+static PFN_vkVoidFunction VKAPI_CALL get_instance_proc_addr(VkInstance instance, const char *name) {
+  PFN_vkVoidFunction fn = real_get_instance_proc_addr(instance, name);
+  if (!fn || !name || strcmp(name, "vkCreateAndroidSurfaceKHR")) return fn;
+  __atomic_store_n(&real_create_android_surface, (PFN_vkCreateAndroidSurfaceKHR)fn, __ATOMIC_RELEASE);
+  return (PFN_vkVoidFunction)create_android_surface;
+}
+
 #define HOOK(name, fn, real) {name, (void *)fn, (void **)&real}
 static const struct {
   const char *name;
@@ -364,6 +402,8 @@ static const struct {
     HOOK("ANativeWindow_getBuffersDataSpace", get_buffers_data_space, real_get_buffers_data_space),
     HOOK("ANativeWindow_lock", lock, real_lock),
     HOOK("ANativeWindow_unlockAndPost", unlock_and_post, real_unlock_and_post),
+    HOOK("vkCreateAndroidSurfaceKHR", create_android_surface, real_create_android_surface),
+    HOOK("vkGetInstanceProcAddr", get_instance_proc_addr, real_get_instance_proc_addr),
 };
 
 void *prism_window_function(const char *name, void *real) {

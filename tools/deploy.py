@@ -238,6 +238,9 @@ def prism_props(images):
     # The compositor makes its GL contexts current without a surface, which the emulator's EGL
     # refuses (no EGL_KHR_surfaceless_context). Meta's switch gives each context a pbuffer instead.
     props['persist.oculus.forceGLESContextBuffer'] = 'true'
+    # Strata is the headset's display path (Meta's composer HAL). Without it the compositor's
+    # output surface comes from SurfaceFlinger, which is what the emulator's window shows.
+    props['persist.oculus.strata.disable'] = 'true'
     return props
 
 

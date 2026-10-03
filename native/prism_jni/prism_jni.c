@@ -197,7 +197,8 @@ static void register_adapters(JNIEnv *env, jclass clazz, const char *cls) {
 typedef struct {  // libnativebridge's NativeBridgeCallbacks, version 8
   uint32_t version;
   void *v1_to_v6[17];
-  void *get_trampoline_with_jni_call_type;
+  void *(*get_trampoline_with_jni_call_type)(void *handle, const char *name, const char *shorty, uint32_t len,
+                                             int jni_call_type);
   void *(*get_trampoline_for_function_pointer)(const void *method, const char *shorty, uint32_t len,
                                                int jni_call_type);
   _Bool (*is_native_bridge_function_pointer)(const void *method);
@@ -275,7 +276,8 @@ static int write_slot(void **slot, void *value) {
 // arm64 is loaded that early, so each namespace loads its own libbinder; each copy opens
 // /dev/binder with its own ProcessState, and objects published through a copy whose thread pool
 // nobody starts never answer. Prism loads the binder libraries into the default arm64 namespace
-// before the first namespace is created, as zygote would have.
+// before the first namespace is created, as zygote would have, and starts that libbinder's thread
+// pool: on a headset the app's one ProcessState is the runtime's, whose pool the runtime starts.
 #define GUEST_DIR "/system/lib64/arm64/prism"  // also in tools/deploy.py
 static const char *const kGuestPreload[] = {"libbinder_ndk.so", "libbinder.so", "libhidlbase.so"};
 typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
@@ -286,12 +288,20 @@ static void *bridge_create_namespace(const char *name, const char *ld_path, cons
   static atomic_int preloaded;
   if (!atomic_exchange(&preloaded, 1)) {
     void *(*load)(const char *, int) = (void *(*)(const char *, int))g_bridge->v1_to_v6[1];  // loadLibrary
+    void *binder_ndk = NULL;
     for (size_t i = 0; i < sizeof kGuestPreload / sizeof *kGuestPreload; i++) {
       char path[128];
       snprintf(path, sizeof path, GUEST_DIR "/%s", kGuestPreload[i]);
-      if (!load(path, RTLD_NOW)) LOGW("arm64 %s: not preloaded", kGuestPreload[i]);
+      void *handle = load(path, RTLD_NOW);
+      if (!handle) LOGW("arm64 %s: not preloaded", kGuestPreload[i]);
+      if (i == 0) binder_ndk = handle;
     }
-    LOGI("arm64 binder libraries preloaded before namespace %s", name);
+    void (*start_pool)(void) =
+        binder_ndk ? (void (*)(void))g_bridge->get_trampoline_with_jni_call_type(binder_ndk, "ABinderProcess_startThreadPool",
+                                                                                 "V", 1, kJNICallTypeCriticalNative)
+                   : NULL;
+    if (start_pool) start_pool();
+    LOGI("arm64 binder libraries preloaded before namespace %s%s", name, start_pool ? ", thread pool started" : "");
   }
   return g_create_namespace(name, ld_path, default_path, type, permitted, parent);
 }

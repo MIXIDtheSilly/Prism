@@ -163,6 +163,9 @@ python tools\emulator.py status
 - **Home in the window.** The compositor composites VrShell's frames: its home environment shows
   in the emulator window in stereo, both eyes side by side, and `python tools\head.py` looks and
   moves around it with the mouse and keyboard.
+- **Known issue: the emulator sometimes dies silently** (no crash report), most often during a
+  reboot. At those times Windows logs a LiveKernelEvent 141, a GPU engine timeout that it resets:
+  host Vulkan work from the guest hung the GPU. Killing VrShell mid-frame alone doesn't do it.
 - **Next:** VrShell's panels and the Universal Menu, controller input, and
   the services still crash-looping: `com.oculus.os.cm` (a null pointer in its sensor client) and
   `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).

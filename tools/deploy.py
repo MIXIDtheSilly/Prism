@@ -135,6 +135,7 @@ NATIVE_BRIDGE = 'libberberis_arm64.so'
 # are installed: a declared service nobody serves makes clients wait for it forever.
 DAEMON_RCS = {
     'preferencesserver.rc': [],  # settingsserver: PreferencesService
+    'runtimeipcbroker.rc': ['runtimeipc_manifest.xml'],  # RuntimeIPC, which the XR runtime's clients use
     'vrfocusserver.rc': [],  # vrfocus: which app has VR focus
     'xrservice.rc': ['xrservice-permission.xml', 'xrservice-spaces.xml'],  # SpaceManager, for volumetric windows
 }
@@ -280,9 +281,15 @@ def build(args):
         replaced.append(f'/system/apex/{stock_apex}')
         overlay.add_tree(images['system'], f'/system/apex/{horizon_apex}', f'/system/apex/{horizon_apex}')
     overlay.add('/system_ext/apex', 'd', 0o755)
+    odm = Ext4(os.path.join(args.images, 'odm.img'))
     for partition, path in META_APEXES:
-        fs = images.get(partition) or Ext4(os.path.join(args.images, partition + '.img'))
+        fs = odm if partition == 'odm' else images[partition]
         overlay.add_tree(fs, path, f'/system_ext/apex/{path.rsplit("/", 1)[1]}')
+    # The OpenXR loader's fallback when no runtime broker answers: <partition>/etc/openxr/1, links
+    # into com.meta.xr naming VrDriver's runtime. Horizon has them on /odm; the loader also looks
+    # in /product.
+    overlay.add('/product/etc/openxr', 'd', 0o755)
+    overlay.add_tree(odm, '/etc/openxr/1', '/product/etc/openxr/1')
 
     # The Digitalis translator: its guest directories replace stock's, host files are added.
     for guest in ('/system/lib64/arm64', '/system/bin/arm64'):
@@ -315,6 +322,21 @@ def build(args):
         taken |= {name for name, _ in fs.listdir(fs.lookup(src))}
     overlay.add(GUEST_DIR, 'd', 0o755)
     binds.append((f'{DATA_ROOT}/guest', GUEST_DIR))
+    # Meta's code also dlopens its libraries by absolute path (/system_ext/lib64/libosndk...). Each
+    # Horizon library whose name stock's directory doesn't use gets a link there to its GUEST_DIR
+    # copy; host processes never ask for those names.
+    for partition, src, dest in (('system', '/system/lib64', '/system/lib64'),
+                                 ('system_ext', '/lib64', '/system_ext/lib64')):
+        stock_fs = stock_images[partition]
+        try:
+            stock_names = {name for name, _ in stock_fs.listdir(stock_fs.lookup(src))}
+        except FileNotFoundError:
+            stock_names = set()
+            overlay.add(dest, 'd', 0o755)
+        fs = images[partition]
+        for name, _ in fs.listdir(fs.lookup(src)):
+            if name.endswith('.so') and name not in stock_names and name not in GUEST_TRANSLATOR:
+                overlay.add(f'{dest}/{name}', 'l', 0o777, target=f'{GUEST_DIR}/{name}')
     overlay.add(GUEST_LDCONFIG, 'f', 0o644, data=guest_ldconfig(args.translator).encode())
     overlay.add('/system_ext/etc/vintf/manifest', 'd', 0o755)  # stock has only manifest.xml
     for rc, fragments in DAEMON_RCS.items():

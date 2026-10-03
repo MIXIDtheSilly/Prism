@@ -76,8 +76,14 @@ python tools\emulator.py status
   `settingsserver`, `vrfocusserver` and `xrservice` run as arm64 under Digitalis, system_server
   runs every Meta service with the space manager emulated, and Meta's arm64 apps load and run
   their native code.
-- **Next: the XR runtime.** VrShell's 3D side (Clay) fails `xrCreateInstance` with
-  `XR_ERROR_RUNTIME_UNAVAILABLE` and its process restarts: Meta's OpenXR runtime has no compositor
-  or tracking behind it. Other apps wait on services that are the headset's hardware layers
-  (`vrdevice`, `OVRRemoteService`, the maintenance-boot HAL); `com.oculus.os.cm` aborts on a
-  missing service, PresenceService on a missing ID anonymizer.
+- **The XR runtime starts.** The OpenXR loader finds Meta's runtime through
+  `/product/etc/openxr/1` (Horizon has these links on `/odm`), `runtimeipcbroker` runs, and
+  VrDriver's `vrruntimeservice` registers its RuntimeIPC servers; VrShell's client state
+  initializes. Meta's libraries that are dlopened by absolute path (`/system_ext/lib64/...`) are
+  linked there to their `GUEST_DIR` copies.
+- **Next: the compositor.** Meta's `CompositorServer` runs translated, and its Vulkan instance sees
+  the PC's GPU through the emulator (an RTX 3080 at Vulkan 1.3). It aborts because the emulator's
+  Vulkan driver lacks one required device extension, `VK_KHR_external_memory_fd`; the compositor
+  shares memory and fences with other processes as file descriptors (`vkGetMemoryFdKHR`,
+  `vkGetFenceFdKHR`). Other apps still wait on the headset's hardware layers (`vrdevice`,
+  `OVRRemoteService`, the maintenance-boot HAL).

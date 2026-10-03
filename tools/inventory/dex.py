@@ -18,11 +18,12 @@ class Dex:
         if buf[:4] != b'dex\n':
             raise ValueError('not a dex file')
         self.buf = buf
-        (self.string_count, string_off, type_count, type_off, proto_count, proto_off, _fc, _fo,
+        (self.string_count, string_off, type_count, type_off, proto_count, proto_off, field_count, field_off,
          method_count, method_off, class_count, class_off) = struct.unpack_from('<12I', buf, 0x38)
         self._string_off = string_off
         self.types = struct.unpack_from(f'<{type_count}I', buf, type_off)
         self.protos = [struct.unpack_from('<III', buf, proto_off + 12 * i) for i in range(proto_count)]
+        self.fields = [struct.unpack_from('<HHI', buf, field_off + 8 * i) for i in range(field_count)]
         self.methods = [struct.unpack_from('<HHI', buf, method_off + 8 * i) for i in range(method_count)]
         self.class_defs = [struct.unpack_from('<8I', buf, class_off + 32 * i) for i in range(class_count)]
         self._cache = {}
@@ -51,8 +52,41 @@ class Dex:
             params = ''.join(self.type_name(t) for t in struct.unpack_from(f'<{n}H', self.buf, params_off + 4))
         return f'{self.type_name(class_idx)}->{self.string(name_idx)}({params}){self.type_name(return_type)}'
 
+    def field_signature(self, index):
+        class_idx, type_idx, name_idx = self.fields[index]
+        return f'{self.type_name(class_idx)}->{self.string(name_idx)}:{self.type_name(type_idx)}'
+
+    def references(self):
+        """Every field and method this dex refers to, defined here or elsewhere, as signatures."""
+        return ({self.field_signature(i) for i in range(len(self.fields))} |
+                {self.method_signature(i) for i in range(len(self.methods))})
+
     def class_names(self):
         return [self.type_name(c[0]) for c in self.class_defs]
+
+    def defined_members(self):
+        """Signatures of the fields and methods the classes in this dex define."""
+        out = set()
+        for class_def in self.class_defs:
+            pos = class_def[6]
+            if not pos:
+                continue
+            sizes = []
+            for _ in range(4):
+                value, pos = _uleb(self.buf, pos)
+                sizes.append(value)
+            for k, count in enumerate(sizes):  # static fields, instance fields, direct, virtual methods
+                index = 0
+                for _ in range(count):
+                    diff, pos = _uleb(self.buf, pos)
+                    _, pos = _uleb(self.buf, pos)
+                    index += diff
+                    if k < 2:
+                        out.add(self.field_signature(index))
+                    else:
+                        _, pos = _uleb(self.buf, pos)
+                        out.add(self.method_signature(index))
+        return out
 
     def methods_of_classes(self):
         """Yields (class name, method index, access flags, code offset) for every defined method."""

@@ -11,7 +11,7 @@ What goes where:
 Package manager state and compiled code are reset, since the platform signature changes.
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
-    python tools/jni/build.py && python tools/compat.py
+    python tools/jni/build.py && python tools/compat.py && python tools/translator.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -32,13 +32,22 @@ from ext4 import S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Ext4  # noqa: E402
 # with apps in /system. Those partners must be signed with the same key as the modules, so they
 # come from stock too.
 STOCK_NETWORKSTACK = {'skip': {'NetworkStack', 'NetworkStackNext'}, 'stock': ['NetworkStackGoogle']}
+# The module metadata package describes those modules; the stock product overlays name the Google
+# one (config_defaultModuleMetadataProvider), as they name the modules' other Google packages.
+STOCK_MODULEMETADATA = {'stock': ['ModuleMetadataGoogle']}
+# Except these: Horizon's framework uses APIs that only Horizon's builds of them have (see
+# tools/inventory/module_api.py), and they hold no native code, so Horizon's APEX runs as is.
+# Horizon's APEX file -> the stock one it replaces.
+HORIZON_APEXES = {
+    'com.android.configinfrastructure.apex': 'com.google.android.configinfrastructure.apex',  # DeviceConfig
+}
 
 # (partition, path in that partition's image, how[, options])
 #   replace: wipe the stock directory in the overlay, put Horizon's there
 #   merge:   add Horizon's files to the stock directory
 #   bind:    Horizon's directory lives in /data/prism and is bind-mounted over the stock one
 # options: skip  = top-level entries of Horizon's directory to leave out
-#          stock = top-level entries of stock's directory to keep (replace only)
+#          stock = top-level entries of stock's directory to keep (replace and bind)
 LAYOUT = [
     ('system', '/system/framework', 'replace'),
     ('system', '/system/priv-app', 'replace', STOCK_NETWORKSTACK),
@@ -63,7 +72,8 @@ LAYOUT = [
     ('system_ext', '/etc', 'merge',
      {'skip': {'init', 'selinux', 'vintf', 'build.prop', 'fs_config_dirs', 'fs_config_files'}}),
     ('product', '/priv-app', 'replace'),
-    ('product', '/app', 'bind'),
+    ('product', '/app', 'bind', STOCK_MODULEMETADATA),
+    # Merged: the stock RROs point the framework at stock's Google-named mainline packages.
     ('product', '/overlay', 'merge'),
     ('product', '/etc/permissions', 'replace'),
     ('product', '/etc/sysconfig', 'replace'),
@@ -72,8 +82,11 @@ LAYOUT = [
     ('product', '/etc/cameramuxmode', 'merge'),
     ('product', '/etc/perfstream', 'merge'),
 ]
-# Precompiled arm64 code is useless on x86_64; ART recompiles from the dex.
+# Precompiled arm64 code is useless on x86_64; ART recompiles from the dex. (An app's lib/arm64,
+# its JNI libraries, is kept.)
 SKIP_DIRS = {'oat', 'arm', 'arm64'}
+# Apps' lib/arm64 entries link to Horizon's arm64 libraries, which Prism keeps in GUEST_DIR.
+HORIZON_LIB64 = ('/system/lib64/', '/system_ext/lib64/')
 
 # Meta properties copied from Horizon's build.prop files (identity props are handled separately).
 META_PROPS = re.compile(r'^(config\.disable_|ro\.oculus\.|persist\.ovr\.|ro\.ovr\.|ro\.vros\.|ro\.hzos\.|'
@@ -84,22 +97,36 @@ ZYGOTE_RC = '/system/etc/init/hw/init.zygote64.rc'
 PRELOAD = '/system/lib64/libprism_jni.so'
 DATA_ROOT = '/data/prism'
 
-# Meta's native daemons run as arm64 binaries through the stock image's translator
-# (binfmt_misc + ndk_translation). Their libraries are Horizon's own arm64 ones, in
-# GUEST_DIR, except for the translator's bionic and host-proxy libraries, which stay stock.
+# ARM64 code runs through Digitalis (tools/translator.py), which replaces the stock image's
+# libndk_translation: Horizon is built with ARMv8.1 atomics that the stock translator lacks.
+# Meta's native daemons run as arm64 binaries (binfmt_misc). Their libraries are Horizon's own
+# arm64 ones, in GUEST_DIR, except for the translator's bionic and host-proxy libraries. They come
+# from /system, then /system_ext, then Horizon's APEXes (ICU for one), flattened.
 GUEST_DIR = '/system/lib64/arm64/prism'
-GUEST_STOCK = {
+GUEST_SKIP_APEXES = {
+    'com.android.runtime',  # bionic: the translator's
+    'com.android.art',  # ART internals; daemons use none
+    'com.android.vndk.v34',  # vendor variants of system libraries
+}
+GUEST_TRANSLATOR = {
     'libc.so', 'libm.so', 'libdl.so', 'libdl_android.so', 'ld-android.so', 'libnative_bridge_vdso.so',
     'libEGL.so', 'libGLESv1_CM.so', 'libGLESv2.so', 'libGLESv3.so', 'libvulkan.so', 'libOpenMAXAL.so',
     'libOpenSLES.so', 'libaaudio.so', 'libamidi.so', 'libandroid.so', 'libandroid_runtime.so',
     'libcamera2ndk.so', 'libjnigraphics.so', 'libmediandk.so', 'libnativehelper.so', 'libnativewindow.so',
     'libneuralnetworks.so', 'libwebviewchromium_plat_support.so',
-    # Not libbinder_ndk: stock's is a proxy to the host's binder, and a daemon also loading
-    # Horizon's arm64 libbinder can't map /dev/binder twice. Daemons get Horizon's.
+    # Not libbinder_ndk: the translator's is a proxy to the host's binder, and a daemon also
+    # loading Horizon's arm64 libbinder can't map /dev/binder twice. Daemons get Horizon's.
 }
 GUEST_LDCONFIG = '/system/etc/ld.config.arm64.txt'
-# Meta daemons Prism runs, by the Horizon init script that defines them.
-DAEMON_RCS = ['preferencesserver.rc']  # settingsserver: PreferencesService
+NATIVE_BRIDGE = 'libberberis_arm64.so'
+# Meta daemons Prism runs: Horizon's init script for each, and the VINTF manifest fragments that
+# declare its stable-AIDL services (servicemanager refuses undeclared ones). Only these fragments
+# are installed: a declared service nobody serves makes clients wait for it forever.
+DAEMON_RCS = {
+    'preferencesserver.rc': [],  # settingsserver: PreferencesService
+    'vrfocusserver.rc': [],  # vrfocus: which app has VR focus
+    'xrservice.rc': ['xrservice-permission.xml', 'xrservice-spaces.xml'],  # SpaceManager, for volumetric windows
+}
 DAEMON_SECLABEL = 'u:r:su:s0'  # stock policy has no domains for Meta's daemons (SELinux is permissive)
 
 
@@ -132,7 +159,8 @@ class Archive:
         for path, node in fs.walk(ino, src.rstrip('/')) if ino.mode & S_IFMT == S_IFDIR else [(src, ino)]:
             rel = path[len(src.rstrip('/')):]
             parts = rel.strip('/').split('/') if rel.strip('/') else []
-            if any(p in SKIP_DIRS for p in parts) or (parts and parts[0] in skip):
+            if (any(p in SKIP_DIRS and (i == 0 or parts[i - 1] != 'lib') for i, p in enumerate(parts))
+                    or (parts and parts[0] in skip)):
                 continue
             kind = {S_IFDIR: 'd', S_IFLNK: 'l', S_IFREG: 'f'}.get(node.mode & S_IFMT)
             if not kind or (flat and parts and (len(parts) > 1 or kind == 'd')):
@@ -142,17 +170,20 @@ class Archive:
                     data = f.read()
             else:
                 data = fs.read(node) if kind in ('f', 'l') else b''
-            self.add(dest + rel, kind, node.mode & 0o7777, node.uid, node.gid,
-                     data if kind == 'f' else b'', data.decode('utf-8', 'surrogateescape') if kind == 'l' else '')
+            target = data.decode('utf-8', 'surrogateescape') if kind == 'l' else ''
+            if kind == 'l' and '/lib/arm64/' in rel and target.startswith(HORIZON_LIB64):
+                target = f'{GUEST_DIR}/{target.rsplit("/", 1)[1]}'
+            self.add(dest + rel, kind, node.mode & 0o7777, node.uid, node.gid, data if kind == 'f' else b'', target)
 
     def close(self):
         self.tar.close()
 
 
-def guest_ldconfig(stock_system):
-    """Stock's arm64 guest linker config plus a section for Meta's daemons. Apps keep the [system]
-    section; executables under /system_ext and /odm get Horizon's libraries first."""
-    text = stock_system.read(stock_system.lookup(GUEST_LDCONFIG)).decode()
+def guest_ldconfig(translator):
+    """The translator's arm64 guest linker config plus a section for Meta's daemons. Apps keep the
+    [system] section; executables under /system_ext and /odm get Horizon's libraries first."""
+    with open(os.path.join(translator, *GUEST_LDCONFIG.strip('/').split('/')), encoding='utf-8') as f:
+        text = f.read()
     dirs = 'dir.prism = /system_ext/bin\ndir.prism = /odm/bin\n'
     first_section = text.index('\n[')
     section = ('\n[prism]\n'
@@ -183,6 +214,7 @@ def prism_props(images):
             if m:  # the product partition's identity props win, so set Horizon's there
                 props[f'ro.product.product.{m.group(1)}'] = value.strip()
     props['ro.control_privapp_permissions'] = 'log'  # report missing allowlist entries, don't crash
+    props['ro.dalvik.vm.native.bridge'] = NATIVE_BRIDGE
     return props
 
 
@@ -198,6 +230,8 @@ def build(args):
             overrides['/' + os.path.relpath(host, args.compat).replace(os.sep, '/')] = host
     if not overrides:
         sys.exit(f'no compatibility jars in {args.compat}; run: python tools/compat.py')
+    if not os.path.exists(os.path.join(args.translator, 'system', 'lib64', NATIVE_BRIDGE)):
+        sys.exit(f'no translator in {args.translator}; run: python tools/translator.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -220,19 +254,56 @@ def build(args):
             if how == 'replace':
                 replaced.append(target)
         for name in options.get('stock', []):  # stock's images have the same layout
-            overlay.add_tree(stock_images[partition], f'{path}/{name}', f'{target}/{name}')
+            if how == 'bind':
+                data.add_tree(stock_images[partition], f'{path}/{name}', f'{DATA_ROOT}/{partition}{path}/{name}')
+            else:
+                overlay.add_tree(stock_images[partition], f'{path}/{name}', f'{target}/{name}')
+
+    for horizon_apex, stock_apex in HORIZON_APEXES.items():
+        stock_images['system'].lookup(f'/system/apex/{stock_apex}')  # raises if stock has no such file
+        replaced.append(f'/system/apex/{stock_apex}')
+        overlay.add_tree(images['system'], f'/system/apex/{horizon_apex}', f'/system/apex/{horizon_apex}')
+
+    # The Digitalis translator: its guest directories replace stock's, host files are added.
+    for guest in ('/system/lib64/arm64', '/system/bin/arm64'):
+        replaced.append(guest)
+    for base, _dirs, files in os.walk(os.path.join(args.translator, 'system')):
+        for name in files:
+            device = '/' + os.path.relpath(os.path.join(base, name), args.translator).replace(os.sep, '/')
+            if device == GUEST_LDCONFIG or device.endswith('/berberis.rc'):
+                continue  # generated below; binfmt_misc is mounted by stock and registered by prism.rc
+            executable = '/bin/' in device
+            with open(os.path.join(base, name), 'rb') as f:
+                overlay.add(device, 'f', 0o755 if executable else 0o644, gid=2000 if executable else 0,
+                            data=f.read())
 
     # Meta's daemons: binaries, Horizon's arm64 libraries for the translator, linker config, init scripts.
     overlay.add_tree(images['system_ext'], '/bin', '/system_ext/bin')
-    for partition, src in (('system', '/system/lib64'), ('system_ext', '/lib64')):
-        data.add_tree(images[partition], src, f'{DATA_ROOT}/guest', GUEST_STOCK, flat=True)
+    sources = [(images['system'], '/system/lib64'), (images['system_ext'], '/lib64')]
+    apex_dir = os.path.join(args.images, 'apex')
+    for name in sorted(os.listdir(apex_dir)):
+        if name.endswith('.img') and name[:-4] not in GUEST_SKIP_APEXES:
+            fs = Ext4(os.path.join(apex_dir, name))
+            try:
+                fs.lookup('/lib64')
+            except FileNotFoundError:
+                continue
+            sources.append((fs, '/lib64'))
+    taken = set(GUEST_TRANSLATOR)
+    for fs, src in sources:  # the first source with a library wins
+        data.add_tree(fs, src, f'{DATA_ROOT}/guest', taken, flat=True)
+        taken |= {name for name, _ in fs.listdir(fs.lookup(src))}
     overlay.add(GUEST_DIR, 'd', 0o755)
     binds.append((f'{DATA_ROOT}/guest', GUEST_DIR))
-    overlay.add(GUEST_LDCONFIG, 'f', 0o644, data=guest_ldconfig(stock['system']).encode())
-    for rc in DAEMON_RCS:
+    overlay.add(GUEST_LDCONFIG, 'f', 0o644, data=guest_ldconfig(args.translator).encode())
+    overlay.add('/system_ext/etc/vintf/manifest', 'd', 0o755)  # stock has only manifest.xml
+    for rc, fragments in DAEMON_RCS.items():
         text = images['system_ext'].read(images['system_ext'].lookup(f'/etc/init/{rc}')).decode()
         text = re.sub(r'(^service [^\n]*\n)', rf'\1    seclabel {DAEMON_SECLABEL}\n', text, flags=re.M)
         overlay.add(f'/system_ext/etc/init/{rc}', 'f', 0o644, data=text.encode())
+        for name in fragments:
+            overlay.add_tree(images['system_ext'], f'/etc/vintf/manifest/{name}',
+                             f'/system_ext/etc/vintf/manifest/{name}')
 
     # Prism's JNI glue.
     for name in sorted(os.listdir(args.jni)):
@@ -271,28 +342,56 @@ def build(args):
     return replaced, binds
 
 
-def apply(args, replaced, binds):
+RESET_PARTITIONS = ('system', 'system_ext', 'product')
+FRESH_PACKAGE_STATE = ('rm -rf /data/system/packages.xml /data/system/packages.list /data/system/package_cache '
+                       '/data/system/users/0/package-restrictions.xml /data/dalvik-cache/x86_64/* '
+                       '/data/misc/apexdata/com.android.art/dalvik-cache/*')
+
+
+def reset(args):
+    """Empties the writable layer (adb remount's overlayfs) of the partitions Prism changes and
+    reboots into plain stock. Changing those layers goes through overlayfs, so what an earlier
+    deploy deleted stays deleted (whiteouts) unless each deploy starts from stock."""
+    shell = emulator.shell
+    mounts = shell('cat /proc/mounts')
+    uppers = []
+    for partition in RESET_PARTITIONS:
+        m = re.search(rf'^overlay /{partition} overlay \S*upperdir=([^,\s]+)', mounts, re.M)
+        if not m:
+            sys.exit(f'/{partition} has no overlay; run: python tools/emulator.py root')
+        uppers.append(m.group(1))
+    print('resetting to stock...', flush=True)
+    out = shell(' && '.join([f'find {u} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' for u in uppers] +
+                            [FRESH_PACKAGE_STATE, 'sync', 'echo reset']), check=False)
+    if 'reset' not in out:
+        sys.exit(f'resetting failed:\n{out}')
+    emulator.adb('reboot')
+    emulator.adb('wait-for-device')
+    args.timeout = 300
+    if not emulator.wait(args):
+        sys.exit('stock did not finish booting after the reset')
+    emulator.root(args)
+
+
+def apply(args, replaced):
     adb, shell = emulator.adb, emulator.shell
+    reset(args)
     if shell('touch /system/.prism && rm /system/.prism && echo ok', check=False).strip() != 'ok':
         sys.exit('/system is not writable; run: python tools/emulator.py root')
     for name in ('overlay.tar', 'data.tar'):
         print(f'pushing {name}...', flush=True)
         adb('push', os.path.join(args.out, name), f'/data/local/tmp/prism-{name}', capture=False)
     script = ['set -e',
-              # Undo any earlier bind mounts so the stock directories underneath are what we replace.
-              *[f'umount {dst} 2>/dev/null || true' for _src, dst in binds],
               *[f'rm -rf {path}' for path in replaced],
               'tar -xf /data/local/tmp/prism-overlay.tar -C /',
               f'rm -rf {DATA_ROOT}',
               'tar -xf /data/local/tmp/prism-data.tar -C /',
               f'chcon -hR u:object_r:system_file:s0 {DATA_ROOT}',  # -h: Horizon has dangling symlinks
-              'restorecon -R /system/framework /system/priv-app /system/app /system/etc /system/lib64 '
+              'restorecon -R /system/framework /system/priv-app /system/app /system/etc /system/lib64 /system/bin '
               '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc',
               'rm -f /data/local/tmp/prism-overlay.tar /data/local/tmp/prism-data.tar',
               # Fresh package manager state and compiled code for the new platform.
-              'rm -rf /data/system/packages.xml /data/system/packages.list /data/system/package_cache '
-              '/data/system/users/0/package-restrictions.xml /data/dalvik-cache/x86_64/* '
-              '/data/misc/apexdata/com.android.art/dalvik-cache/*',
+              FRESH_PACKAGE_STATE,
               'sync', 'echo applied']
     out = adb('shell', '\n'.join(script), check=False, timeout=900, stderr=True)
     print(out.strip().splitlines()[-1] if out.strip() else '')
@@ -309,13 +408,14 @@ def main():
     ap.add_argument('--baseline', default=os.path.join('work', 'baseline', 'images'))
     ap.add_argument('--jni', default=os.path.join('work', 'build', 'jni'))
     ap.add_argument('--compat', default=os.path.join('work', 'build', 'compat'))
+    ap.add_argument('--translator', default=os.path.join('work', 'build', 'translator'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')
     args = ap.parse_args()
-    replaced, binds = build(args)
+    replaced = build(args)[0]
     if not args.build_only:
-        apply(args, replaced, binds)
+        apply(args, replaced)
 
 
 if __name__ == '__main__':

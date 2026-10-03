@@ -5,6 +5,8 @@
   calls Meta's version with a default for each new parameter.
 * Disabled methods: a few of Meta's methods need Meta's modified ART (stock ART lacks what they
   call). Their bodies are replaced with a plain return.
+* Rewrites: other uses of members Meta added to its ART module are replaced wherever they occur
+  (a constant for a field, stock's overload, or nothing for a debugging call).
 
 The patched jars are built locally from the user's OTA into work/build/compat/<device path>, which
 tools/deploy.py uses instead of the originals.
@@ -45,6 +47,41 @@ class Disable:
         self.cls, self.method, self.reason = cls, method, reason
 
 
+class Rewrite:
+    """Replaces each use of ref, a member stock's modules lack, in every class of the jar.
+
+    constant: a static int field read becomes this value
+    call:     an invocation calls this stock method instead, with the leading arguments it takes
+    drop:     an invocation of a void method is removed"""
+
+    def __init__(self, ref, constant=None, call=None, drop=False, reason=''):
+        self.ref, self.constant, self.call, self.drop, self.reason = ref, constant, call, drop, reason
+
+    def apply(self, text):
+        if self.constant is not None:
+            pattern = re.compile(rf'^(\s*)sget (v\d+|p\d+), {re.escape(self.ref)}$', re.M)
+            return pattern.sub(lambda m: f'{m.group(1)}const/16 {m.group(2)}, {self.constant:#x}', text)
+        pattern = re.compile(rf'^(\s*)(invoke-\w+)(/range)? \{{([^}}]*)\}}, {re.escape(self.ref)}$', re.M)
+        return pattern.sub(self._invoke, text)
+
+    def _invoke(self, m):
+        indent, op, ranged, regs = m.groups()
+        if self.drop:
+            return f'{indent}nop'
+        words = (0 if op == 'invoke-static' else 1) + sum(map(width, params(self.call[self.call.index('('):])))
+        if ranged:
+            first = regs.split('..')[0].strip()
+            last = f'{first[0]}{int(first[1:]) + words - 1}'
+            return f'{indent}{op}/range {{{first} .. {last}}}, {self.call}'
+        kept = [r.strip() for r in regs.split(',')][:words]
+        return f'{indent}{op} {{{", ".join(kept)}}}, {self.call}'
+
+
+VMRUNTIME = 'Ldalvik/system/VMRuntime;'
+REGISTER_LOCK_ORDERING = Rewrite(f'{VMRUNTIME}->registerLockOrdering([I)V', drop=True,
+                                 reason="lock-order checking through Meta's ART")
+
+# Keyed by device path; each jar is read from the partition image its path names.
 BRIDGES = {
     '/system/framework/framework.jar': [
         Bridge('Landroid/view/InputDevice;', '<init>',
@@ -59,7 +96,13 @@ BRIDGES = {
                invoke='virtual', reason='Meta added the file name, only used for logging'),
         Disable('Lcom/android/internal/os/Lockdep;', 'registerHandler(Landroid/content/Context;)V',
                 reason="lock-order checking through Meta's ART (VMRuntime.setLockOrderingViolationLogger)"),
+        Rewrite('Landroid/system/OsConstants;->RLIMIT_RTPRIO:I', constant=14,
+                reason="Meta's libcore adds the constant; 14 on Linux"),
+        Rewrite(f'{VMRUNTIME}->clampGrowthLimit(J)V', call=f'{VMRUNTIME}->clampGrowthLimit()V',
+                reason="Meta's ART takes the limit; stock's clamps to the configured one"),
     ],
+    '/system/framework/services.jar': [REGISTER_LOCK_ORDERING],
+    '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING],
 }
 
 
@@ -133,21 +176,27 @@ def patch_jar(data, bridges, workdir):
     """Returns the jar bytes with the patches applied to the dex files that define their classes."""
     by_class = {}
     for b in bridges:
-        by_class.setdefault(b.cls, []).append(b)
+        if not isinstance(b, Rewrite):
+            by_class.setdefault(b.cls, []).append(b)
+    rewrites = [b for b in bridges if isinstance(b, Rewrite)]
+    unused = {r.ref for r in rewrites}
     src = zipfile.ZipFile(io_bytes(data))
     replaced = {}
     for name in sorted(src.namelist()):
         if not re.fullmatch(r'classes\d*\.dex', name):
             continue
         raw = src.read(name)
-        defined = set(dex.Dex(raw).class_names()) & set(by_class)
-        if not defined:
+        parsed = dex.Dex(raw)
+        defined = set(parsed.class_names()) & set(by_class)
+        used = [r for r in rewrites if r.ref in parsed.references()]
+        if not defined and not used:
             continue
         dex_path = os.path.join(workdir, name)
         out_dir = os.path.join(workdir, name + '.smali')
         with open(dex_path, 'wb') as f:
             f.write(raw)
         smali.run('baksmali', 'd', dex_path, '-o', out_dir)
+        patched = set()
         for cls in defined:
             path = os.path.join(out_dir, *cls[1:-1].split('/')) + '.smali'
             with open(path, encoding='utf-8') as f:
@@ -156,13 +205,30 @@ def patch_jar(data, bridges, workdir):
                 text = disable_method(text, b) if isinstance(b, Disable) else text + '\n' + smali_method(b)
             with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)
+            patched.add(cls[1:-1])
+        for base, _dirs, files in os.walk(out_dir):
+            for file in files:
+                path = os.path.join(base, file)
+                with open(path, encoding='utf-8') as f:
+                    text = f.read()
+                new = text
+                for r in used:
+                    if r.ref in new:
+                        new = r.apply(new)
+                        unused.discard(r.ref)
+                if new != text:
+                    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+                        f.write(new)
+                    patched.add(os.path.relpath(path, out_dir)[:-len('.smali')].replace(os.sep, '/'))
         new_dex = os.path.join(workdir, name + '.new')
         smali.run('smali', 'a', out_dir, '-o', new_dex, '--api', '34')
         with open(new_dex, 'rb') as f:
             replaced[name] = f.read()
-        print(f'  {name}: patched {", ".join(sorted(c[1:-1] for c in defined))}')
+        print(f'  {name}: patched {", ".join(sorted(patched))}')
     if by_class:
         sys.exit(f'classes not found in the jar: {", ".join(by_class)}')
+    if unused:
+        sys.exit(f'members to rewrite that the jar never uses: {", ".join(sorted(unused))}')
     out = io_bytes()
     with zipfile.ZipFile(out, 'w') as dst:
         for info in src.infolist():
@@ -177,12 +243,17 @@ def io_bytes(data=None):
 
 def verify(data, bridges):
     z = zipfile.ZipFile(io_bytes(data))
-    have = set()
+    have, refs = set(), set()
     for n in z.namelist():
         if re.fullmatch(r'classes\d*\.dex', n):
             d = dex.Dex(z.read(n))
             have |= {d.method_signature(i) for _c, i, _f, _code in d.methods_of_classes()}
+            refs |= d.references()
     for b in bridges:
+        if isinstance(b, Rewrite):
+            if b.ref in refs:
+                sys.exit(f'verification failed: {b.ref} is still used')
+            continue
         if isinstance(b, Disable):
             continue
         for sig in (b.stock, b.meta):
@@ -195,10 +266,14 @@ def main():
     ap.add_argument('--images', default=os.path.join('work', 'images'))
     ap.add_argument('--out', default=os.path.join('work', 'build', 'compat'))
     args = ap.parse_args()
-    system = Ext4(os.path.join(args.images, 'system.img'))
+    images = {}
     for device_path, bridges in BRIDGES.items():
         print(f'{device_path}: {len(bridges)} patches')
-        data = system.read(system.lookup(device_path))
+        partition = device_path.split('/')[1]
+        path = device_path if partition == 'system' else device_path[len(partition) + 1:]
+        if partition not in images:
+            images[partition] = Ext4(os.path.join(args.images, partition + '.img'))
+        data = images[partition].read(images[partition].lookup(path))
         workdir = tempfile.mkdtemp(prefix='prism-compat-')
         try:
             patched = patch_jar(data, bridges, workdir)

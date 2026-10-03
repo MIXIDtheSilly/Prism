@@ -174,12 +174,143 @@ static int32_t (*real_get_buffers_data_space)(ANativeWindow *);
 static int32_t (*real_lock)(ANativeWindow *, ANativeWindow_Buffer *, ARect *);
 static int32_t (*real_unlock_and_post)(ANativeWindow *);
 
+// Configs without depth or stencil. The emulator's EGL offers three configs (RGB888, and RGBA8888
+// with 24-bit depth and 8-bit stencil), and Meta's compositor looks for RGBA8888 with neither, an
+// exact match. arm64 code sees a twin of each depth/stencil config that reports none; whatever is
+// created from a twin uses the real config, whose extra buffers go unused.
+#define CONFIG_TWIN ((uintptr_t)1 << 30)
+static EGLBoolean (*real_get_configs)(EGLDisplay, EGLConfig *, EGLint, EGLint *);
+static EGLBoolean (*real_get_config_attrib)(EGLDisplay, EGLConfig, EGLint, EGLint *);
+static EGLContext (*real_create_context)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
+static EGLSurface (*real_create_pbuffer_surface)(EGLDisplay, EGLConfig, const EGLint *);
+
+static int is_twin(EGLConfig config) { return ((uintptr_t)config & CONFIG_TWIN) != 0; }
+static EGLConfig real_config(EGLConfig config) { return (EGLConfig)((uintptr_t)config & ~CONFIG_TWIN); }
+
+static int has_depth_or_stencil(EGLDisplay dpy, EGLConfig config) {
+  EGLint depth = 0, stencil = 0;
+  eglGetConfigAttrib(dpy, config, EGL_DEPTH_SIZE, &depth);
+  eglGetConfigAttrib(dpy, config, EGL_STENCIL_SIZE, &stencil);
+  return depth || stencil;
+}
+
+static EGLBoolean get_configs(EGLDisplay dpy, EGLConfig *configs, EGLint size, EGLint *count) {
+  EGLint n = 0;
+  if (!real_get_configs(dpy, NULL, 0, &n) || n <= 0) return real_get_configs(dpy, configs, size, count);
+  EGLConfig all[2 * n];
+  if (!real_get_configs(dpy, all, n, &n)) return EGL_FALSE;
+  EGLint total = n;
+  for (EGLint i = 0; i < n; i++)
+    if (!is_twin(all[i]) && has_depth_or_stencil(dpy, all[i])) all[total++] = (EGLConfig)((uintptr_t)all[i] | CONFIG_TWIN);
+  if (!configs) {
+    *count = total;
+    return EGL_TRUE;
+  }
+  *count = size < total ? size : total;
+  for (EGLint i = 0; i < *count; i++) configs[i] = all[i];
+  return EGL_TRUE;
+}
+
+static EGLBoolean get_config_attrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint *value) {
+  if (!is_twin(config)) return real_get_config_attrib(dpy, config, attribute, value);
+  if (attribute == EGL_DEPTH_SIZE || attribute == EGL_STENCIL_SIZE) {
+    *value = 0;
+    return EGL_TRUE;
+  }
+  EGLBoolean ok = real_get_config_attrib(dpy, real_config(config), attribute, value);
+  if (ok && attribute == EGL_CONFIG_ID) *value |= 0x10000;  // distinct from its real config's
+  return ok;
+}
+
+static EGLContext create_context(EGLDisplay dpy, EGLConfig config, EGLContext share, const EGLint *attrs) {
+  return real_create_context(dpy, real_config(config), share, attrs);
+}
+
+static EGLSurface create_pbuffer_surface(EGLDisplay dpy, EGLConfig config, const EGLint *attrs) {
+  return real_create_pbuffer_surface(dpy, real_config(config), attrs);
+}
+
+static EGLBoolean (*real_choose_config)(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
+
+// Logs the requests no config matches: what arm64 code needs that the emulator's EGL lacks.
+static EGLBoolean choose_config(EGLDisplay dpy, const EGLint *attrs, EGLConfig *configs, EGLint size, EGLint *count) {
+  EGLBoolean ok = real_choose_config(dpy, attrs, configs, size, count);
+  if (ok && count && *count == 0 && attrs) {
+    char text[512];
+    size_t n = 0;
+    for (const EGLint *a = attrs; a[0] != EGL_NONE && n + 24 < sizeof text; a += 2)
+      n += (size_t)snprintf(text + n, sizeof text - n, " %#x=%#x", a[0], a[1]);
+    text[n] = 0;
+    LOGW("eglChooseConfig from arm64 code: no config for%s", text);
+  }
+  return ok;
+}
+
+// Surfaceless contexts (EGL_KHR_surfaceless_context), which Meta's code uses and the emulator's
+// EGL lacks: a context made current with no surface gets a 1x1 pbuffer of its own config.
+static EGLBoolean (*real_make_current)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+static EGLBoolean (*real_destroy_context)(EGLDisplay, EGLContext);
+#define MAX_PBUFFERS 64
+static struct {
+  EGLDisplay display;
+  EGLContext context;
+  EGLSurface surface;
+} g_pbuffers[MAX_PBUFFERS];
+
+static EGLSurface context_pbuffer(EGLDisplay dpy, EGLContext ctx) {
+  pthread_mutex_lock(&g_lock);
+  EGLSurface surface = EGL_NO_SURFACE;
+  int free_slot = -1;
+  for (int i = 0; i < MAX_PBUFFERS && surface == EGL_NO_SURFACE; i++) {
+    if (g_pbuffers[i].context == ctx && g_pbuffers[i].display == dpy) surface = g_pbuffers[i].surface;
+    else if (free_slot < 0 && g_pbuffers[i].context == EGL_NO_CONTEXT) free_slot = i;
+  }
+  if (surface == EGL_NO_SURFACE) {
+    EGLint id = 0, count = 0;
+    EGLConfig config;
+    const EGLint size[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    if (eglQueryContext(dpy, ctx, EGL_CONFIG_ID, &id)) {
+      EGLint query[] = {EGL_CONFIG_ID, id, EGL_NONE};
+      if (eglChooseConfig(dpy, query, &config, 1, &count) && count == 1)
+        surface = eglCreatePbufferSurface(dpy, config, size);
+    }
+    if (surface != EGL_NO_SURFACE && free_slot >= 0) {
+      g_pbuffers[free_slot].display = dpy;
+      g_pbuffers[free_slot].context = ctx;
+      g_pbuffers[free_slot].surface = surface;
+    }
+    LOGI("surfaceless context %p (config %d): %s", ctx, id, surface != EGL_NO_SURFACE ? "1x1 pbuffer" : "no pbuffer");
+  }
+  pthread_mutex_unlock(&g_lock);
+  return surface;
+}
+
+static EGLBoolean make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+  if (ctx != EGL_NO_CONTEXT && draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE) {
+    EGLSurface pbuffer = context_pbuffer(dpy, ctx);
+    if (pbuffer != EGL_NO_SURFACE) draw = read = pbuffer;
+  }
+  return real_make_current(dpy, draw, read, ctx);
+}
+
+static EGLBoolean destroy_context(EGLDisplay dpy, EGLContext ctx) {
+  EGLBoolean ok = real_destroy_context(dpy, ctx);
+  pthread_mutex_lock(&g_lock);
+  for (int i = 0; i < MAX_PBUFFERS; i++) {
+    if (g_pbuffers[i].context != ctx || g_pbuffers[i].display != dpy) continue;
+    eglDestroySurface(dpy, g_pbuffers[i].surface);  // released once no longer current
+    g_pbuffers[i].context = EGL_NO_CONTEXT;
+  }
+  pthread_mutex_unlock(&g_lock);
+  return ok;
+}
+
 static EGLSurface create_window_surface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint *attrs) {
-  return real_create_window_surface(dpy, config, host_window_for(win), attrs);
+  return real_create_window_surface(dpy, real_config(config), host_window_for(win), attrs);
 }
 
 static EGLSurface create_platform_window_surface(EGLDisplay dpy, EGLConfig config, void *win, const EGLAttrib *attrs) {
-  return real_create_platform_window_surface(dpy, config, host_window_for(win), attrs);
+  return real_create_platform_window_surface(dpy, real_config(config), host_window_for(win), attrs);
 }
 
 // base->incRef or decRef, called the way the window's code needs.
@@ -214,6 +345,13 @@ static const struct {
   void **real;
 } kHooks[] = {
     HOOK("eglCreateWindowSurface", create_window_surface, real_create_window_surface),
+    HOOK("eglChooseConfig", choose_config, real_choose_config),
+    HOOK("eglGetConfigs", get_configs, real_get_configs),
+    HOOK("eglGetConfigAttrib", get_config_attrib, real_get_config_attrib),
+    HOOK("eglCreateContext", create_context, real_create_context),
+    HOOK("eglCreatePbufferSurface", create_pbuffer_surface, real_create_pbuffer_surface),
+    HOOK("eglMakeCurrent", make_current, real_make_current),
+    HOOK("eglDestroyContext", destroy_context, real_destroy_context),
     HOOK("eglCreatePlatformWindowSurface", create_platform_window_surface, real_create_platform_window_surface),
     HOOK("ANativeWindow_acquire", acquire, real_acquire),
     HOOK("ANativeWindow_release", release, real_release),

@@ -105,7 +105,7 @@ def compile_lib(ndk, out, include_dir, soname, defines):
     command = [clang, f'--target=x86_64-linux-android{API}', '-shared', '-fPIC', '-O2', '-std=c11', '-Wall',
                '-Wno-unused-function', f'-I{include_dir}', *defines,
                *sorted(glob.glob(os.path.join(SOURCE_DIR, '*.c'))), '-o', out,
-               f'-Wl,-soname,{soname}', '-llog', '-lm', '-landroid', '-Wl,--build-id=sha1']
+               f'-Wl,-soname,{soname}', '-llog', '-lm', '-landroid', '-lEGL', '-Wl,--build-id=sha1']
     subprocess.run(command, check=True)
 
 

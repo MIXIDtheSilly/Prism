@@ -366,7 +366,7 @@ def build(args):
     overlay.add('/system_ext/etc/vintf/manifest', 'd', 0o755)  # stock has only manifest.xml
     for rc, fragments in DAEMON_RCS.items():
         text = images['system_ext'].read(images['system_ext'].lookup(f'/etc/init/{rc}')).decode()
-        text = re.sub(r'(^service [^\n]*\n)', rf'\1    seclabel {DAEMON_SECLABEL}\n', text, flags=re.M)
+        text = re.sub(r'(^[ \t]*service [^\n]*\n)', rf'\1    seclabel {DAEMON_SECLABEL}\n', text, flags=re.M)
         overlay.add(f'/system_ext/etc/init/{rc}', 'f', 0o644, data=text.encode())
         for name in fragments:
             overlay.add_tree(images['system_ext'], f'/etc/vintf/manifest/{name}',

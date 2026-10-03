@@ -12,6 +12,10 @@
 //   * importing such an fd receives the AHardwareBuffer from it and imports that.
 //
 // An exported fd is good for one import, as Vulkan's are (importing transfers its ownership).
+//
+// gfxstream also leaves out the names of some extensions that later Vulkan versions made core
+// (VK_KHR_16bit_storage, ...), which Meta's apps still ask for by name. Prism lists those the
+// device's version covers (kPromoted), and drops them again when a device is created.
 // Dispatchable handles are the driver's own, so the loader's dispatch works as it does with gfxstream
 // alone; Prism only intercepts functions by name.
 
@@ -82,6 +86,8 @@ static struct {
   PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
   PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
   PFN_vkCreateDevice CreateDevice;
+  PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
+  PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
   PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
   PFN_vkGetPhysicalDeviceImageFormatProperties2KHR GetPhysicalDeviceImageFormatProperties2KHR;
   PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties;
@@ -179,13 +185,46 @@ static int has_extension(const VkExtensionProperties *props, uint32_t count, con
 
 // --- physical device -----------------------------------------------------------------------------
 
+// Extensions promoted to core: listed when the device's version has them (and the feature they
+// exist for, when they have one).
+static int has_16bit_storage(const VkPhysicalDeviceVulkan11Features *f) { return f->storageBuffer16BitAccess; }
+static const struct {
+  const char *name;
+  uint32_t spec_version;
+  uint32_t core;
+  int (*feature)(const VkPhysicalDeviceVulkan11Features *);
+} kPromoted[] = {
+    {VK_KHR_16BIT_STORAGE_EXTENSION_NAME, VK_KHR_16BIT_STORAGE_SPEC_VERSION, VK_API_VERSION_1_1, has_16bit_storage},
+    {VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_SPEC_VERSION, VK_API_VERSION_1_2, NULL},
+};
+#define PROMOTED_COUNT (sizeof kPromoted / sizeof *kPromoted)
+
+static int promoted_index(const char *name) {
+  for (size_t i = 0; i < PROMOTED_COUNT; i++)
+    if (!strcmp(name, kPromoted[i].name)) return (int)i;
+  return -1;
+}
+
+static int promoted_supported(VkPhysicalDevice pd, size_t i) {
+  if (!next.GetPhysicalDeviceProperties) return 0;
+  VkPhysicalDeviceProperties props;
+  next.GetPhysicalDeviceProperties(pd, &props);
+  if (VK_API_VERSION_MAJOR(props.apiVersion) == 1 && props.apiVersion < kPromoted[i].core) return 0;
+  if (!kPromoted[i].feature) return 1;
+  if (!next.GetPhysicalDeviceFeatures2) return 0;
+  VkPhysicalDeviceVulkan11Features v11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+  VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v11};
+  next.GetPhysicalDeviceFeatures2(pd, &features);
+  return kPromoted[i].feature(&v11);
+}
+
 static VkResult VKAPI_CALL prism_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char *layer,
                                                                     uint32_t *count, VkExtensionProperties *props) {
   if (layer) return next.EnumerateDeviceExtensionProperties(pd, layer, count, props);
   uint32_t n = 0;
   VkResult result = next.EnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
   if (result != VK_SUCCESS) return result;
-  VkExtensionProperties *all = calloc(n + 1, sizeof *all);
+  VkExtensionProperties *all = calloc(n + 1 + PROMOTED_COUNT, sizeof *all);
   if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
   result = next.EnumerateDeviceExtensionProperties(pd, NULL, &n, all);
   if (result < 0) {
@@ -195,6 +234,11 @@ static VkResult VKAPI_CALL prism_EnumerateDeviceExtensionProperties(VkPhysicalDe
   if (has_extension(all, n, kAhb) && !has_extension(all, n, kMemoryFd)) {
     strcpy(all[n].extensionName, kMemoryFd);
     all[n++].specVersion = VK_KHR_EXTERNAL_MEMORY_FD_SPEC_VERSION;
+  }
+  for (size_t i = 0; i < PROMOTED_COUNT; i++) {
+    if (has_extension(all, n, kPromoted[i].name) || !promoted_supported(pd, i)) continue;
+    strcpy(all[n].extensionName, kPromoted[i].name);
+    all[n++].specVersion = kPromoted[i].spec_version;
   }
   if (!props) {
     *count = n;
@@ -273,6 +317,7 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
       memory_fd = 1;
       continue;
     }
+    if (promoted_index(name) >= 0) continue;  // core in this device's version
     ahb |= !strcmp(name, kAhb);
     foreign |= !strcmp(name, kForeign);
     names[n++] = name;
@@ -453,6 +498,20 @@ static PFN_vkVoidFunction VKAPI_CALL prism_GetDeviceProcAddr(VkDevice device, co
 // --- HAL module ----------------------------------------------------------------------------------
 
 static hwvulkan_device_t g_device;
+static PFN_vkCreateInstance g_create_instance;
+
+// The driver's instance, and the physical-device queries Prism makes itself.
+static VkResult VKAPI_CALL prism_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator,
+                                                VkInstance *instance) {
+  VkResult result = g_create_instance(info, allocator, instance);
+  if (result == VK_SUCCESS) {
+    next.GetPhysicalDeviceProperties =
+        (PFN_vkGetPhysicalDeviceProperties)next.GetInstanceProcAddr(*instance, "vkGetPhysicalDeviceProperties");
+    next.GetPhysicalDeviceFeatures2 =
+        (PFN_vkGetPhysicalDeviceFeatures2)next.GetInstanceProcAddr(*instance, "vkGetPhysicalDeviceFeatures2");
+  }
+  return result;
+}
 static int g_open_result = -ENOENT;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static hw_module_t *g_module;
@@ -486,7 +545,8 @@ static void open_driver(void) {
   g_device.common.module = g_module;
   g_device.common.close = prism_close;
   g_device.EnumerateInstanceExtensionProperties = down->EnumerateInstanceExtensionProperties;
-  g_device.CreateInstance = down->CreateInstance;
+  g_create_instance = down->CreateInstance;
+  g_device.CreateInstance = prism_CreateInstance;
   g_device.GetInstanceProcAddr = prism_GetInstanceProcAddr;
   LOGI("wrapping %s", path);
 }

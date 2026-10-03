@@ -9,6 +9,7 @@ python tools\emulator.py root              # once per AVD: writable system parti
 python tools\jni\build.py                  # Prism's JNI glue for this Horizon build
 python tools\compat.py                     # bridged framework.jar
 python tools\translator.py                 # Digitalis ARM64 translator, adapted to Android 14
+python tools\vulkan.py                     # Prism's Vulkan driver (opaque-fd memory for the compositor)
 python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot
 python tools\emulator.py status
 ```
@@ -60,6 +61,15 @@ python tools\emulator.py status
   Android looks for a bundled app's libraries only under `lib/<first 64-bit ISA>` (`x86_64`);
   services.jar's `getBundledAppAbis` is replaced so Meta's apps, with `lib/arm64`, get
   `arm64-v8a` and load their libraries through the bridge.
+
+- **Vulkan** ([native/vulkan_prism](../native/vulkan_prism/vulkan_prism.c)). Meta's compositor
+  requires `VK_KHR_external_memory_fd`: it hands swapchain memory to its clients as file
+  descriptors. The emulator's gfxstream driver shares memory on Android only as AHardwareBuffers.
+  Prism's driver (`vulkan.prism.so`, selected by `ro.hardware.vulkan`) wraps the emulator's and
+  backs opaque fds with them: OPAQUE_FD images, buffers and allocations become AHardwareBuffer
+  ones, `vkGetMemoryFdKHR` returns a Unix socket with the memory's AHardwareBuffer queued in it,
+  and importing that fd receives the buffer and imports it. Fences and semaphores already export
+  as sync fds.
 
 - **Mainline modules.** Stock's APEXes stay, except pure-Java ones whose newer APIs Horizon's
   framework needs (`HORIZON_APEXES` in deploy.py); those are Horizon's own: configinfrastructure

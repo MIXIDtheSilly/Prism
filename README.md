@@ -51,9 +51,11 @@ tools/emulator.py     Prism's AVD: create, start, root, status
 tools/jni/            Builds Prism's JNI glue for the user's Horizon build
 tools/compat.py       Compatibility patches in Horizon's framework jars (via smali)
 tools/translator.py   Adapts the Digitalis ARM64 translator to Prism's Android 14 base
+tools/vulkan.py       Builds Prism's Vulkan driver (wraps the emulator's)
 tools/deploy.py       Puts Horizon's layer onto the emulator
 native/prism_jni/     JNI glue between Horizon's Java and stock native code
 native/berberis_compat/  Symbols the Android 16 translator build needs from Android 14
+native/vulkan_prism/  Vulkan driver: gfxstream plus opaque-fd memory for Meta's compositor
 prebuilts/digitalis/  The Digitalis translator (Apache 2.0; see its NOTICE)
 docs/                 Plan, findings and progress
 ```

@@ -6,12 +6,13 @@ What goes where:
   * The large app directories don't fit in that overlay; they go to /data/prism and prism.rc
     bind-mounts them over the stock directories in post-fs-data, before zygote starts.
   * Prism's JNI glue goes to /system/lib64; zygote preloads libprism_jni.so.
+  * Prism's Vulkan driver goes to /vendor/lib64/hw (ro.hardware.vulkan=prism).
   * Horizon's device identity and Meta properties go into /product/etc/build.prop.
 
 Package manager state and compiled code are reset, since the platform signature changes.
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
-    python tools/jni/build.py && python tools/compat.py && python tools/translator.py
+    python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -130,6 +131,8 @@ GUEST_TRANSLATOR = {
 }
 GUEST_LDCONFIG = '/system/etc/ld.config.arm64.txt'
 NATIVE_BRIDGE = 'libberberis_arm64.so'
+# Prism's Vulkan driver (tools/vulkan.py) wraps the emulator's; the loader picks vulkan.<this>.so.
+VULKAN_DRIVER = 'prism'
 # Meta daemons Prism runs: Horizon's init script for each, and the VINTF manifest fragments that
 # declare its stable-AIDL services (servicemanager refuses undeclared ones). Only these fragments
 # are installed: a declared service nobody serves makes clients wait for it forever.
@@ -231,6 +234,7 @@ def prism_props(images):
                 props[f'ro.product.product.{m.group(1)}'] = value.strip()
     props['ro.control_privapp_permissions'] = 'log'  # report missing allowlist entries, don't crash
     props['ro.dalvik.vm.native.bridge'] = NATIVE_BRIDGE
+    props['ro.hardware.vulkan'] = VULKAN_DRIVER  # overrides /vendor/build.prop's: product loads last
     return props
 
 
@@ -248,6 +252,9 @@ def build(args):
         sys.exit(f'no compatibility jars in {args.compat}; run: python tools/compat.py')
     if not os.path.exists(os.path.join(args.translator, 'system', 'lib64', NATIVE_BRIDGE)):
         sys.exit(f'no translator in {args.translator}; run: python tools/translator.py')
+    vulkan = os.path.join(args.vulkan, f'vulkan.{VULKAN_DRIVER}.so')
+    if not os.path.exists(vulkan):
+        sys.exit(f'no Vulkan driver in {args.vulkan}; run: python tools/vulkan.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -353,6 +360,10 @@ def build(args):
             with open(os.path.join(args.jni, name), 'rb') as f:
                 overlay.add(f'/system/lib64/{name}', 'f', 0o644, data=f.read())
 
+    # Prism's Vulkan driver, next to the emulator's.
+    with open(vulkan, 'rb') as f:
+        overlay.add(f'/vendor/lib64/hw/vulkan.{VULKAN_DRIVER}.so', 'f', 0o644, data=f.read())
+
     # zygote preloads libprism_jni.so.
     rc = stock['system'].read(stock['system'].lookup(ZYGOTE_RC)).decode()
     rc = re.sub(r'(service zygote [^\n]*\n)', rf'\1    setenv LD_PRELOAD {PRELOAD}\n', rc, count=1)
@@ -390,7 +401,7 @@ def build(args):
     return replaced, binds
 
 
-RESET_PARTITIONS = ('system', 'system_ext', 'product')
+RESET_PARTITIONS = ('system', 'system_ext', 'product', 'vendor')
 # Per-package state each boot rebuilds. Stock and Horizon write it differently (Horizon has more
 # app ops, and its own permission module), and a deploy boots one, then the other. The .reservecopy
 # backups go too: the package manager restores from them when the file is missing.
@@ -448,7 +459,7 @@ def apply(args, replaced):
               'tar -xf /data/local/tmp/prism-data.tar -C /',
               f'chcon -hR u:object_r:system_file:s0 {DATA_ROOT}',  # -h: Horizon has dangling symlinks
               'restorecon -R /system/framework /system/priv-app /system/app /system/etc /system/lib64 /system/bin '
-              '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc',
+              '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc /vendor/lib64/hw',
               'rm -f /data/local/tmp/prism-overlay.tar /data/local/tmp/prism-data.tar',
               # Fresh package manager state and compiled code for the new platform.
               FRESH_PACKAGE_STATE,
@@ -469,6 +480,7 @@ def main():
     ap.add_argument('--jni', default=os.path.join('work', 'build', 'jni'))
     ap.add_argument('--compat', default=os.path.join('work', 'build', 'compat'))
     ap.add_argument('--translator', default=os.path.join('work', 'build', 'translator'))
+    ap.add_argument('--vulkan', default=os.path.join('work', 'build', 'vulkan'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')

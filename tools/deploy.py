@@ -310,6 +310,10 @@ def prism_props(images):
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
     props['ro.hw_timeout_multiplier'] = '8'
     props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
+    # Until Prism serves the controller HAL (vendor.oculus.hardware.sensors@1.0::IControllerProvider,
+    # Meta's sensors HAL on a headset), CMSHeadset's controller service aborts at start, every few
+    # seconds. Meta's Wi-Fi test switch starts only its Wi-Fi role, which still publishes cm_wifi.
+    props['persist.ovr.tracking.wifi_test'] = 'true'
     return props
 
 

@@ -169,5 +169,7 @@ python tools\emulator.py status
   reboot. At those times Windows logs a LiveKernelEvent 141, a GPU engine timeout that it resets:
   host Vulkan work from the guest hung the GPU. Killing VrShell mid-frame alone doesn't do it.
 - **Next:** VrShell's panels and the Universal Menu, controller input, and
-  the services still crash-looping: `com.oculus.os.cm` (a null pointer in its sensor client) and
+  the services still crash-looping: `com.oculus.os.cm` (it needs Meta's controller HAL,
+  `vendor.oculus.hardware.sensors@1.0::IControllerProvider`; until Prism serves it, Meta's
+  `persist.ovr.tracking.wifi_test` starts only its Wi-Fi role) and
   `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).

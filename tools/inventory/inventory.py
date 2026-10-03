@@ -30,7 +30,7 @@ import elf  # noqa: E402
 from protobuf import fields  # noqa: E402
 
 PARTITIONS = ['system_ext', 'product', 'vendor', 'odm', 'vendor_dlkm', 'odm_dlkm']
-CLASSPATH_KINDS = {1: 'BOOTCLASSPATH', 2: 'DEX2OATBOOTCLASSPATH', 3: 'SYSTEMSERVERCLASSPATH',
+CLASSPATH_KINDS = {1: 'BOOTCLASSPATH', 2: 'SYSTEMSERVERCLASSPATH', 3: 'DEX2OATBOOTCLASSPATH',
                    4: 'STANDALONE_SYSTEMSERVER_JARS'}
 DEFAULT_SERVICES = os.path.expanduser('~/Documents/QuestOnPC/dumps/horizon-dump/services.txt')
 XR_EXTENSION = re.compile(rb'XR_[A-Z][A-Z0-9]+_[A-Za-z0-9_]+')

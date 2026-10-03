@@ -54,8 +54,8 @@ class Dex:
     def class_names(self):
         return [self.type_name(c[0]) for c in self.class_defs]
 
-    def native_methods(self):
-        """Yields the signature of every method declared native."""
+    def methods_of_classes(self):
+        """Yields (class name, method index, access flags, code offset) for every defined method."""
         for class_def in self.class_defs:
             data_off = class_def[6]
             if not data_off:
@@ -68,12 +68,46 @@ class Dex:
             for _ in range(sizes[0] + sizes[1]):  # fields
                 _, pos = _uleb(self.buf, pos)
                 _, pos = _uleb(self.buf, pos)
+            class_name = self.type_name(class_def[0])
             for count in sizes[2:]:  # direct, then virtual methods
                 index = 0
                 for _ in range(count):
                     diff, pos = _uleb(self.buf, pos)
                     flags, pos = _uleb(self.buf, pos)
-                    _, pos = _uleb(self.buf, pos)
+                    code, pos = _uleb(self.buf, pos)
                     index += diff
-                    if flags & 0x100:
-                        yield self.method_signature(index)
+                    yield class_name, index, flags, code
+
+    def native_methods(self):
+        """Yields the signature of every method declared native."""
+        for _cls, index, flags, _code in self.methods_of_classes():
+            if flags & 0x100:
+                yield self.method_signature(index)
+
+    def load_library_calls(self):
+        """Yields (class name, library) for each System.loadLibrary("<constant>") in the code.
+
+        Matches a const-string followed within a few code units by invoke-static of loadLibrary,
+        which is how javac compiles a call with a constant argument."""
+        targets = {i for i, (c, p, n) in enumerate(self.methods)
+                   if self.string(n) == 'loadLibrary' and self.type_name(c) == 'Ljava/lang/System;'}
+        if not targets:
+            return
+        for cls, _index, _flags, code in self.methods_of_classes():
+            if not code:
+                continue
+            units = struct.unpack_from('<I', self.buf, code + 12)[0]
+            insns = struct.unpack_from(f'<{units}H', self.buf, code + 16)
+            for i in range(units - 1):
+                op = insns[i] & 0xFF
+                if op == 0x1A:  # const-string vAA, string@BBBB
+                    string = insns[i + 1]
+                elif op == 0x1B and i + 2 < units:  # const-string/jumbo
+                    string = insns[i + 1] | insns[i + 2] << 16
+                else:
+                    continue
+                for j in range(i + 2, min(i + 8, units - 1)):
+                    if insns[j] & 0xFF == 0x71 and insns[j + 1] in targets:  # invoke-static
+                        if string < self.string_count:
+                            yield cls, self.string(string)
+                        break

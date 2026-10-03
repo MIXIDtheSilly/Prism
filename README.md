@@ -4,7 +4,9 @@ Prism is an experimental Horizon OS emulator for Windows PCs. It aims to run Met
 OS system software (the home environment, system UI, panels and apps) on a PC, in a desktop window
 first and later in a PC VR headset.
 
-> **Status:** M0 (extraction and inventory). Nothing boots yet. See [docs/plan.md](docs/plan.md).
+> **Status:** M1. Horizon's framework boots on the emulator and `system_server` starts Meta's
+> services; native daemons are next. See [docs/plan.md](docs/plan.md) and
+> [docs/m1-progress.md](docs/m1-progress.md).
 
 ## How it works
 
@@ -44,7 +46,12 @@ an inventory to `work\inventory\report.md`.
 tools/prepare.py      One-command workspace setup from an OTA
 tools/ota/            OTA payload, ext4, APEX and super-partition unpackers (pure Python)
 tools/inventory/      Horizon vs stock Android analysis (dex, binary XML, ELF readers)
-docs/                 Plan and findings
+tools/emulator.py     Prism's AVD: create, start, root, status
+tools/jni/            Builds Prism's JNI glue for the user's Horizon build
+tools/compat.py       Compatibility patches in Horizon's framework jars (via smali)
+tools/deploy.py       Puts Horizon's layer onto the emulator
+native/prism_jni/     JNI glue between Horizon's Java and stock native code
+docs/                 Plan, findings and progress
 ```
 
 ## Scope

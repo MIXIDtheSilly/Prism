@@ -23,9 +23,9 @@ in [plan.md](plan.md).
 
 ## Java framework
 
-- Meta adds `com.oculus.os.platform.jar`, `hzos-framework.jar` and `ocui.jar` to the boot and
-  system_server classpaths, and `horizonos-services.jar` and `oculus-system-services.jar` to
-  system_server.
+- Meta adds `com.oculus.os.platform.jar`, `hzos-framework.jar` and `ocui.jar` to the boot
+  classpath, and `horizonos-services.jar` and `oculus-system-services.jar` to the system_server
+  classpath.
 - Native methods to provide on x86_64:
 
   | jar | added vs stock | main classes |

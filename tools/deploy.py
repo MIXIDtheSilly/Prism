@@ -235,6 +235,9 @@ def prism_props(images):
     props['ro.control_privapp_permissions'] = 'log'  # report missing allowlist entries, don't crash
     props['ro.dalvik.vm.native.bridge'] = NATIVE_BRIDGE
     props['ro.hardware.vulkan'] = VULKAN_DRIVER  # overrides /vendor/build.prop's: product loads last
+    # The compositor makes its GL contexts current without a surface, which the emulator's EGL
+    # refuses (no EGL_KHR_surfaceless_context). Meta's switch gives each context a pbuffer instead.
+    props['persist.oculus.forceGLESContextBuffer'] = 'true'
     return props
 
 

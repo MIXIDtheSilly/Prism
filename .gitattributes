@@ -1,0 +1,2 @@
+# Files pushed to the device must keep LF line endings.
+prebuilts/** -text

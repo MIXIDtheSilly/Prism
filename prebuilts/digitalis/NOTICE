@@ -1,0 +1,21 @@
+Digitalis prebuilts, redistributed with Prism so the ARM64 translator does not have to be built
+from AOSP source. This copy comes from the Refract project's bundle (see MANIFEST.txt), which
+includes Refract's performance changes to system/lib64/libberberis_arm64.so.
+
+Digitalis / Berberis (system/lib64/libberberis_*, system/bin/berberis_program_runner_*,
+system/etc/*): Apache License 2.0. Digitalis: https://github.com/DigitalisX64. Berberis is part
+of the Android Open Source Project:
+https://android.googlesource.com/platform/frameworks/libs/binary_translation/
+
+arm64 guest libraries (system/lib64/arm64/*, system/bin/arm64/*): built from the Android Open
+Source Project. Each keeps its upstream license: mostly Apache License 2.0; bionic (libc, libm,
+libdl, linker) BSD-style; ICU (libicu*) Unicode License; BoringSSL (libcrypto, libssl)
+OpenSSL/ISC; zlib (libz) zlib License; SQLite (libsqlite) public domain; libc++ Apache 2.0 with
+LLVM exception. Full texts are in the AOSP source tree (https://source.android.com/), under each
+project's LICENSE or NOTICE file.
+
+Prism does not modify these files in the repository. At build time, tools/translator.py makes
+copies whose DT_NEEDED entry for libc++.so points at Prism's compatibility shim instead (see
+native/berberis_compat), so the Android 16 build loads on Android 14.
+
+These binaries are distributed "AS IS", without warranty of any kind.

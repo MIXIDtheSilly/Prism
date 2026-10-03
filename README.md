@@ -4,9 +4,9 @@ Prism is an experimental Horizon OS emulator for Windows PCs. It aims to run Met
 OS system software (the home environment, system UI, panels and apps) on a PC, in a desktop window
 first and later in a PC VR headset.
 
-> **Status:** M1. Horizon's framework reaches boot completed on the emulator, with Meta's first
-> native daemons running as translated arm64; reimplementing Meta's hardware-facing layers is
-> next. See [docs/plan.md](docs/plan.md) and
+> **Status:** M1. Horizon boots on the emulator to Meta's home shell (VrShell), with Meta's native
+> daemons and apps running as translated arm64; the XR runtime and Meta's other hardware-facing
+> layers are next. See [docs/plan.md](docs/plan.md) and
 > [docs/m1-progress.md](docs/m1-progress.md).
 
 ## How it works

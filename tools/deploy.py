@@ -40,7 +40,18 @@ STOCK_MODULEMETADATA = {'stock': ['ModuleMetadataGoogle']}
 # Horizon's APEX file -> the stock one it replaces.
 HORIZON_APEXES = {
     'com.android.configinfrastructure.apex': 'com.google.android.configinfrastructure.apex',  # DeviceConfig
+    # PermissionController defines the roles; Meta's (extra_roles.xml) grant role permissions such
+    # as horizonos.permission.READ_UI_MODE, which VrShell needs.
+    'com.android.permission.apex': 'com.google.android.permission.apex',
 }
+# Meta's own APEXes: (partition, path). They go in /system_ext/apex, which stock's apexd scans (it
+# has no /odm): com.meta.xr holds VrDriver (the XR runtime) and SystemActivities, com.meta.quest
+# PresenceService, com.meta.hzos native libraries.
+META_APEXES = [
+    ('system_ext', '/apex/com.meta.hzos.apex'),
+    ('product', '/apex/com.meta.quest.apex'),
+    ('odm', '/apex/com.meta.xr.apex'),
+]
 
 # (partition, path in that partition's image, how[, options])
 #   replace: wipe the stock directory in the overlay, put Horizon's there
@@ -102,7 +113,7 @@ DATA_ROOT = '/data/prism'
 # Meta's native daemons run as arm64 binaries (binfmt_misc). Their libraries are Horizon's own
 # arm64 ones, in GUEST_DIR, except for the translator's bionic and host-proxy libraries. They come
 # from /system, then /system_ext, then Horizon's APEXes (ICU for one), flattened.
-GUEST_DIR = '/system/lib64/arm64/prism'
+GUEST_DIR = '/system/lib64/arm64/prism'  # also in tools/compat.py
 GUEST_SKIP_APEXES = {
     'com.android.runtime',  # bionic: the translator's
     'com.android.art',  # ART internals; daemons use none
@@ -180,18 +191,22 @@ class Archive:
 
 
 def guest_ldconfig(translator):
-    """The translator's arm64 guest linker config plus a section for Meta's daemons. Apps keep the
-    [system] section; executables under /system_ext and /odm get Horizon's libraries first."""
+    """The translator's arm64 guest linker config, with Horizon's libraries (GUEST_DIR) searched
+    before the translator's: Meta's code needs Horizon's builds of liblog, libgui, fmt and the like,
+    and the translator's own libraries resolve against them too. The [system] section serves app
+    processes (their JNI libraries) and, through the extra dir lines, Meta's daemons."""
     with open(os.path.join(translator, *GUEST_LDCONFIG.strip('/').split('/')), encoding='utf-8') as f:
         text = f.read()
-    dirs = 'dir.prism = /system_ext/bin\ndir.prism = /odm/bin\n'
+    guest = GUEST_DIR.replace('lib64', '${LIB}')
+    search = 'namespace.default.search.paths += /system/${LIB}/arm64\n'
+    permitted = 'namespace.default.permitted.paths += /system/${LIB}/arm64/bootstrap\n'
+    for line in (search, permitted):
+        assert text.count(line) == 1, line
+    text = text.replace(search, f'namespace.default.search.paths += {guest}\n{search}')
+    text = text.replace(permitted, f'{permitted}namespace.default.permitted.paths += {guest}\n')
+    dirs = 'dir.system = /system_ext/bin\ndir.system = /odm/bin\n'
     first_section = text.index('\n[')
-    section = ('\n[prism]\n'
-               'namespace.default.isolated = false\n'
-               'namespace.default.search.paths  = /system/${LIB}/arm64/bootstrap\n'
-               f'namespace.default.search.paths += {GUEST_DIR.replace("lib64", "${LIB}")}\n'
-               'namespace.default.search.paths += /system/${LIB}/arm64\n')
-    return text[:first_section] + '\n' + dirs + text[first_section:] + section
+    return text[:first_section] + '\n' + dirs + text[first_section:]
 
 
 def read_prop_file(fs, path):
@@ -249,6 +264,7 @@ def build(args):
         if how == 'bind':
             data.add_tree(fs, path, f'{DATA_ROOT}/{partition}{path}', skip)
             binds.append((f'{DATA_ROOT}/{partition}{path}', target))
+            overlay.add(target, 'd', 0o755)  # the mount point; stock has no /system_ext/app
         else:
             overlay.add_tree(fs, path, target, skip)
             if how == 'replace':
@@ -263,6 +279,10 @@ def build(args):
         stock_images['system'].lookup(f'/system/apex/{stock_apex}')  # raises if stock has no such file
         replaced.append(f'/system/apex/{stock_apex}')
         overlay.add_tree(images['system'], f'/system/apex/{horizon_apex}', f'/system/apex/{horizon_apex}')
+    overlay.add('/system_ext/apex', 'd', 0o755)
+    for partition, path in META_APEXES:
+        fs = images.get(partition) or Ext4(os.path.join(args.images, partition + '.img'))
+        overlay.add_tree(fs, path, f'/system_ext/apex/{path.rsplit("/", 1)[1]}')
 
     # The Digitalis translator: its guest directories replace stock's, host files are added.
     for guest in ('/system/lib64/arm64', '/system/bin/arm64'):
@@ -328,6 +348,12 @@ def build(args):
              '# Horizon directories kept on /data (system partitions are too small).',
              'on post-fs-data']
     lines += [f'    mount none {src} {dst} bind' for src, dst in binds]
+    lines += ['',
+              '# adb stays up whatever Horizon decides: Meta\'s software turns adb off (as a headset does',
+              '# outside developer mode), and init then stops adbd. The emulator\'s adbd talks over a qemu',
+              '# pipe, not USB, so the USB functions don\'t matter to it.',
+              'on property:init.svc.adbd=stopped',
+              '    start adbd']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())
 
     # Identity and Meta properties, appended to the stock product build.prop.
@@ -343,15 +369,25 @@ def build(args):
 
 
 RESET_PARTITIONS = ('system', 'system_ext', 'product')
-FRESH_PACKAGE_STATE = ('rm -rf /data/system/packages.xml /data/system/packages.list /data/system/package_cache '
-                       '/data/system/users/0/package-restrictions.xml /data/dalvik-cache/x86_64/* '
-                       '/data/misc/apexdata/com.android.art/dalvik-cache/*')
+# Per-package state each boot rebuilds. Stock and Horizon write it differently (Horizon has more
+# app ops, and its own permission module), and a deploy boots one, then the other. The .reservecopy
+# backups go too: the package manager restores from them when the file is missing.
+FRESH_PACKAGE_STATE = ('rm -rf /data/system/packages.xml* /data/system/packages-backup.xml /data/system/packages.list '
+                       '/data/system/package_cache /data/system/users/0/package-restrictions.xml* '
+                       '/data/dalvik-cache/x86_64/* '
+                       '/data/misc/apexdata/com.android.art/dalvik-cache/* '
+                       '/data/system/appops.xml /data/system/appops_accesses.xml /data/system/appops '
+                       '/data/misc_de/0/apexdata/com.android.permission/*')
+# Once Horizon turns adb off, the setting and the persisted USB config outlive the deploy; stock's
+# boot then has no adb either.
+ADB_ON = 'setprop persist.sys.usb.config adb && (settings put global adb_enabled 1 || true)'
 
 
 def reset(args):
     """Empties the writable layer (adb remount's overlayfs) of the partitions Prism changes and
     reboots into plain stock. Changing those layers goes through overlayfs, so what an earlier
     deploy deleted stays deleted (whiteouts) unless each deploy starts from stock."""
+    emulator.root(args)  # adb root doesn't survive a reboot, and every deploy ends with one
     shell = emulator.shell
     mounts = shell('cat /proc/mounts')
     uppers = []
@@ -361,10 +397,12 @@ def reset(args):
             sys.exit(f'/{partition} has no overlay; run: python tools/emulator.py root')
         uppers.append(m.group(1))
     print('resetting to stock...', flush=True)
-    out = shell(' && '.join([f'find {u} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' for u in uppers] +
-                            [FRESH_PACKAGE_STATE, 'sync', 'echo reset']), check=False)
+    out = shell('(' + ' && '.join([f'find {u} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' for u in uppers] +
+                                  [FRESH_PACKAGE_STATE, 'sync', 'echo reset']) + ') 2>&1', check=False)
     if 'reset' not in out:
         sys.exit(f'resetting failed:\n{out}')
+    shell(ADB_ON, check=False)  # if this changes the USB config, init restarts adbd and drops the shell
+    emulator.adb('wait-for-device')
     emulator.adb('reboot')
     emulator.adb('wait-for-device')
     args.timeout = 300

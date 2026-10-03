@@ -4,7 +4,7 @@ Digitalis is built for Android 16. Its host binaries import a few symbols Androi
 libraries lack (see native/berberis_compat). This builds that shim (libpcx.so), copies the
 bundle to work/build/translator/, points each host binary's DT_NEEDED "libc++.so" at the shim
 (same length, so the change is in place), and checks that every host import then resolves
-against the stock image.
+against the stock image. It also disables the guest libdl's CFI slow path (see disable_guest_cfi).
 
     python tools/translator.py [--ndk PATH]
 """
@@ -109,6 +109,44 @@ def dynamic_symbols(path):
     return undefined, defined
 
 
+def symbol_values(data):
+    """Defined dynamic symbols -> their addresses (names without version suffixes)."""
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum = struct.unpack_from('<HH', data, 0x3A)
+    sections = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+    dynsym = next(s for s in sections if s[1] == 11)
+    dynstr = sections[dynsym[6]]
+    out = {}
+    for i in range(1, dynsym[5] // 24):
+        name, _info, _other, shndx, value, _size = struct.unpack_from('<IBBHQQ', data, dynsym[4] + i * 24)
+        if shndx:
+            out[data[dynstr[4] + name:data.index(b'\0', dynstr[4] + name)].decode()] = value
+    return out
+
+
+# Horizon's platform libraries are built with cross-library CFI. The bionic linker keeps a shadow
+# map of valid call targets for its checks, but the translator's guest loader never records guest
+# libraries there, so a check that reaches the slow path reads an unmapped shadow page and the
+# process dies. Prism turns the guest slow path into a return: CFI is hardening, not function.
+GUEST_LIBDL = os.path.join('system', 'lib64', 'arm64', 'libdl.so')
+CFI_SLOWPATHS = ('__cfi_slowpath', '__cfi_slowpath_diag')
+ARM64_RET = struct.pack('<I', 0xd65f03c0)
+
+
+def disable_guest_cfi(out_dir):
+    path = os.path.join(out_dir, GUEST_LIBDL)
+    with open(path, 'rb') as f:
+        elf = Elf(f.read())
+    values = symbol_values(bytes(elf.data))
+    for name in CFI_SLOWPATHS:
+        if name not in values:
+            sys.exit(f'{GUEST_LIBDL} has no {name}')
+        start = elf.offset(values[name])
+        elf.data[start:start + 4] = ARM64_RET
+    with open(path, 'wb') as f:
+        f.write(elf.data)
+
+
 def build_shim(ndk, out_dir):
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
     clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
@@ -147,6 +185,7 @@ def main():
                     sys.exit(f'{rel}: does not match prebuilts/digitalis/SHA256SUMS')
     shutil.rmtree(args.out, ignore_errors=True)
     shutil.copytree(os.path.join(BUNDLE, 'system'), os.path.join(args.out, 'system'))
+    disable_guest_cfi(args.out)
     shim = build_shim(find_ndk(args.ndk), os.path.join(args.out, 'system', 'lib64'))
     shim_symbols = dynamic_symbols(shim)[1]
 

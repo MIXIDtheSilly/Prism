@@ -7,6 +7,8 @@
   call). Their bodies are replaced with a plain return.
 * Rewrites: other uses of members Meta added to its ART module are replaced wherever they occur
   (a constant for a field, stock's overload, or nothing for a debugging call).
+* Replaced methods: where Horizon on an x86_64 host needs different behaviour, a method's body is
+  replaced with Prism's (smali).
 
 The patched jars are built locally from the user's OTA into work/build/compat/<device path>, which
 tools/deploy.py uses instead of the originals.
@@ -47,6 +49,27 @@ class Disable:
         self.cls, self.method, self.reason = cls, method, reason
 
 
+class Replace:
+    """Replaces a method's body with smali (from .registers through the last instruction)."""
+
+    def __init__(self, cls, method, body, reason=''):
+        self.cls, self.method, self.body, self.reason = cls, method, body, reason
+
+
+class Splice:
+    """Replaces the one occurrence of old (smali lines) in a method with new."""
+
+    def __init__(self, cls, method, old, new, reason=''):
+        self.cls, self.method, self.old, self.new, self.reason = cls, method, old, new, reason
+
+
+class Add:
+    """Adds a method (complete smali, .method through .end method) to a class."""
+
+    def __init__(self, cls, smali, reason=''):
+        self.cls, self.smali, self.reason = cls, smali, reason
+
+
 class Rewrite:
     """Replaces each use of ref, a member stock's modules lack, in every class of the jar.
 
@@ -78,6 +101,77 @@ class Rewrite:
 
 
 VMRUNTIME = 'Ldalvik/system/VMRuntime;'
+GUEST_DIR = '/system/lib64/arm64/prism'  # Horizon's arm64 libraries; see tools/deploy.py
+SYSTEM_LIBRARY_PATH = f'''
+.method static prismSystemLibraryPath(Landroid/content/pm/ApplicationInfo;Ljava/lang/String;)Ljava/lang/String;
+    .registers 4
+    iget-object v0, p0, Landroid/content/pm/ApplicationInfo;->primaryCpuAbi:Ljava/lang/String;
+    if-eqz v0, :host
+    invoke-static {{v0}}, {VMRUNTIME}->getInstructionSet(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v0
+    invoke-static {{}}, {VMRUNTIME}->getCurrentInstructionSet()Ljava/lang/String;
+    move-result-object v1
+    invoke-virtual {{v0, v1}}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+    move-result v0
+    if-nez v0, :host
+    const-string v0, "{GUEST_DIR}"
+    return-object v0
+    :host
+    return-object p1
+.end method
+'''
+PM = 'Lcom/android/server/pm'
+ABIS = f'{PM}/PackageAbiHelper$Abis;'
+PACKAGE = f'{PM}/pkg/AndroidPackage;'
+# Android looks for a bundled app's libraries only in lib/<ISA of the first 64-bit ABI>: x86_64 on
+# Prism, where Meta's apps have lib/arm64. The stock check runs first; failing it, the other 64-bit
+# ABIs are tried in order, so arm64 apps get arm64-v8a and run their libraries through the bridge.
+BUNDLED_APP_ABIS = f'''    .registers 10
+    invoke-interface {{p1}}, {PACKAGE}->getPath()Ljava/lang/String;
+    move-result-object v0
+    invoke-static {{v0}}, {PM}/PackageAbiHelperImpl;->deriveCodePathName(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v0
+    invoke-interface {{p1}}, {PACKAGE}->getBaseApkPath()Ljava/lang/String;
+    move-result-object v1
+    invoke-static {{v1}}, {PM}/PackageAbiHelperImpl;->calculateBundledApkRoot(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v1
+    invoke-direct {{p0, p1, v1, v0}}, {PM}/PackageAbiHelperImpl;->getBundledAppAbi({PACKAGE}Ljava/lang/String;Ljava/lang/String;){ABIS}
+    move-result-object v0
+    iget-object v1, v0, {ABIS}->primary:Ljava/lang/String;
+    if-nez v1, :done
+    new-instance v1, Ljava/io/File;
+    invoke-interface {{p1}}, {PACKAGE}->getPath()Ljava/lang/String;
+    move-result-object v2
+    invoke-direct {{v1, v2}}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+    invoke-static {{v1}}, Landroid/content/pm/parsing/ApkLiteParseUtils;->isApkFile(Ljava/io/File;)Z
+    move-result v2
+    if-nez v2, :done
+    new-instance v2, Ljava/io/File;
+    const-string v3, "lib"
+    invoke-direct {{v2, v1, v3}}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+    sget-object v3, Landroid/os/Build;->SUPPORTED_64_BIT_ABIS:[Ljava/lang/String;
+    array-length v4, v3
+    const/4 v5, 0x1
+    :next
+    if-ge v5, v4, :done
+    aget-object v6, v3, v5
+    invoke-static {{v6}}, {VMRUNTIME}->getInstructionSet(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v7
+    new-instance v8, Ljava/io/File;
+    invoke-direct {{v8, v2, v7}}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+    invoke-virtual {{v8}}, Ljava/io/File;->exists()Z
+    move-result v7
+    if-eqz v7, :skip
+    new-instance v0, {ABIS}
+    const/4 v7, 0x0
+    invoke-direct {{v0, v6, v7}}, {ABIS}-><init>(Ljava/lang/String;Ljava/lang/String;)V
+    goto :done
+    :skip
+    add-int/lit8 v5, v5, 0x1
+    goto :next
+    :done
+    return-object v0
+'''
 REGISTER_LOCK_ORDERING = Rewrite(f'{VMRUNTIME}->registerLockOrdering([I)V', drop=True,
                                  reason="lock-order checking through Meta's ART")
 
@@ -100,8 +194,27 @@ BRIDGES = {
                 reason="Meta's libcore adds the constant; 14 on Linux"),
         Rewrite(f'{VMRUNTIME}->clampGrowthLimit(J)V', call=f'{VMRUNTIME}->clampGrowthLimit()V',
                 reason="Meta's ART takes the limit; stock's clamps to the configured one"),
+        # A bundled app's library path ends with java.library.path (/system/lib64:/system_ext/lib64).
+        # For an app running translated, those are host libraries, and the guest linker stops at the
+        # first one of the wrong architecture; its system libraries are the guest's (GUEST_DIR).
+        Add('Landroid/app/LoadedApk;', SYSTEM_LIBRARY_PATH, reason="translated apps' system libraries"),
+        Splice('Landroid/app/LoadedApk;',
+               'makePaths(Landroid/app/ActivityThread;ZLandroid/content/pm/ApplicationInfo;Ljava/util/List;Ljava/util/List;)V',
+               '''const-string p1, "java.library.path"
+                  invoke-static {p1}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;
+                  move-result-object p1''',
+               '''    const-string p1, "java.library.path"
+    invoke-static {p1}, Ljava/lang/System;->getProperty(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object p1
+    invoke-static {p2, p1}, Landroid/app/LoadedApk;->prismSystemLibraryPath(Landroid/content/pm/ApplicationInfo;Ljava/lang/String;)Ljava/lang/String;
+    move-result-object p1''',
+               reason="translated apps' system libraries"),
     ],
-    '/system/framework/services.jar': [REGISTER_LOCK_ORDERING],
+    '/system/framework/services.jar': [
+        REGISTER_LOCK_ORDERING,
+        Replace(f'{PM}/PackageAbiHelperImpl;', f'getBundledAppAbis({PACKAGE}){ABIS}', BUNDLED_APP_ABIS,
+                reason="bundled apps' libraries for a translated ABI (Meta's apps have lib/arm64)"),
+    ],
     '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING],
 }
 
@@ -167,6 +280,28 @@ def disable_method(text, d):
                                  f'    # Prism: disabled, {d.reason}\n    return-void\n{m.group(3)}', text, count=1)
 
 
+def splice_method(text, s):
+    pattern = re.compile(r'(\.method [^\n]*?' + re.escape(s.method) + r'\n)(.*?)(\.end method)', re.S)
+    m = pattern.search(text)
+    if not m:
+        raise ValueError(f'{s.cls}->{s.method} not found')
+    # baksmali puts a .line directive between instructions; match the old lines with any in between.
+    lines = [re.escape(line.strip()) for line in s.old.strip().splitlines()]
+    old = re.compile(r'^\s*' + r'\n(?:\s*\.line \d+\n|\s*\n)*\s*'.join(lines) + r'$', re.M)
+    found = old.findall(m.group(2))
+    if len(found) != 1:
+        raise ValueError(f'{s.cls}->{s.method}: expected one match of the spliced code, found {len(found)}')
+    body = old.sub(lambda _: f'    # Prism: {s.reason}\n{s.new.rstrip()}', m.group(2), count=1)
+    return text[:m.start(2)] + body + text[m.end(2):]
+
+
+def replace_method(text, r):
+    pattern = re.compile(r'(\.method [^\n]*?' + re.escape(r.method) + r'\n)(.*?)(\.end method)', re.S)
+    if not pattern.search(text):
+        raise ValueError(f'{r.cls}->{r.method} not found')
+    return pattern.sub(lambda m: f'{m.group(1)}    # Prism: replaced, {r.reason}\n{r.body}{m.group(3)}', text, count=1)
+
+
 def registers_for(method):
     # Parameter registers plus "this"; enough for any instance or static method with no locals.
     return sum(map(width, params(method[method.index('('):]))) + 1
@@ -202,7 +337,16 @@ def patch_jar(data, bridges, workdir):
             with open(path, encoding='utf-8') as f:
                 text = f.read()
             for b in by_class.pop(cls):
-                text = disable_method(text, b) if isinstance(b, Disable) else text + '\n' + smali_method(b)
+                if isinstance(b, Disable):
+                    text = disable_method(text, b)
+                elif isinstance(b, Replace):
+                    text = replace_method(text, b)
+                elif isinstance(b, Splice):
+                    text = splice_method(text, b)
+                elif isinstance(b, Add):
+                    text += f'\n# Prism: {b.reason}\n{b.smali.strip()}\n'
+                else:
+                    text += '\n' + smali_method(b)
             with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)
             patched.add(cls[1:-1])
@@ -254,7 +398,12 @@ def verify(data, bridges):
             if b.ref in refs:
                 sys.exit(f'verification failed: {b.ref} is still used')
             continue
-        if isinstance(b, Disable):
+        if isinstance(b, (Disable, Replace, Splice)):
+            continue
+        if isinstance(b, Add):
+            name = re.search(r'^\.method [^\n]*?(\S+)$', b.smali.strip(), re.M).group(1)
+            if f'{b.cls}->{name}' not in have:
+                sys.exit(f'verification failed: {b.cls}->{name} missing')
             continue
         for sig in (b.stock, b.meta):
             if f'{b.cls}->{b.name}{sig}' not in have:

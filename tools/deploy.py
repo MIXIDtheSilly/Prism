@@ -54,6 +54,9 @@ META_APEXES = [
     ('odm', '/apex/com.meta.xr.apex'),
 ]
 
+# Files in Horizon's /odm/etc that belong to the partition, not to Meta's software.
+ODM_STOCK = {'build.prop', 'fs_config_dirs', 'fs_config_files', 'group', 'passwd', 'NOTICE.xml.gz'}
+
 # (partition, path in that partition's image, how[, options])
 #   replace: wipe the stock directory in the overlay, put Horizon's there
 #   merge:   add Horizon's files to the stock directory
@@ -77,8 +80,12 @@ LAYOUT = [
     ('system', '/system/etc/mrsystemservice.cfg', 'merge'),
     ('system', '/system/etc/xrs-hmdconfig.capnp.bin', 'merge'),
     ('system', '/system/etc/xrs_version_code', 'merge'),
+    ('system', '/system/etc/display.conf', 'merge'),  # vrdevice: display timing
+    ('system', '/system/etc/device_props.json', 'merge'),  # vrdevice: chipset, refresh rate
     ('system_ext', '/framework', 'replace'),
-    ('system_ext', '/priv-app', 'bind'),
+    # DeviceAuthServer proves the device's identity with the headset's certificate hardware, which
+    # Prism doesn't fake (see README, Scope); without that hardware it crashes in a loop.
+    ('system_ext', '/priv-app', 'bind', {'skip': {'DeviceAuthServer'}}),
     ('system_ext', '/app', 'bind'),
     # Native daemons, SELinux policy and HAL manifests stay stock until Prism provides them.
     ('system_ext', '/etc', 'merge',
@@ -138,6 +145,7 @@ VULKAN_DRIVER = 'prism'
 # are installed: a declared service nobody serves makes clients wait for it forever.
 DAEMON_RCS = {
     'preferencesserver.rc': [],  # settingsserver: PreferencesService
+    'vrdevicemanagerserver.rc': [],  # vrdevice: the headset's device manager (display, thermal)
     'runtimeipcbroker.rc': ['runtimeipc_manifest.xml'],  # RuntimeIPC, which the XR runtime's clients use
     'vrfocusserver.rc': [],  # vrfocus: which app has VR focus
     'xrservice.rc': ['xrservice-permission.xml', 'xrservice-spaces.xml'],  # SpaceManager, for volumetric windows
@@ -303,6 +311,10 @@ def build(args):
     # in /product.
     overlay.add('/product/etc/openxr', 'd', 0o755)
     overlay.add_tree(odm, '/etc/openxr/1', '/product/etc/openxr/1')
+    # Meta's configuration files in /odm/etc (thread priorities, tracking and sensor services, ...).
+    # The emulator's /odm/etc links to /vendor/odm/etc. Only the files: the directories hold
+    # tracking models (over 200 MB), and the partition's own files stay stock.
+    overlay.add_tree(odm, '/etc', '/vendor/odm/etc', ODM_STOCK, flat=True)
 
     # The Digitalis translator: its guest directories replace stock's, host files are added.
     for guest in ('/system/lib64/arm64', '/system/bin/arm64'):
@@ -465,7 +477,8 @@ def apply(args, replaced):
               'tar -xf /data/local/tmp/prism-data.tar -C /',
               f'chcon -hR u:object_r:system_file:s0 {DATA_ROOT}',  # -h: Horizon has dangling symlinks
               'restorecon -R /system/framework /system/priv-app /system/app /system/etc /system/lib64 /system/bin '
-              '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc /vendor/lib64/hw',
+              '/system_ext/framework /system_ext/etc /product/priv-app /product/overlay /product/etc /vendor/lib64/hw '
+              '/vendor/odm/etc',
               'rm -f /data/local/tmp/prism-overlay.tar /data/local/tmp/prism-data.tar',
               # Fresh package manager state and compiled code for the new platform.
               FRESH_PACKAGE_STATE,

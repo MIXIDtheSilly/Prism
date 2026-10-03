@@ -11,7 +11,10 @@
 //     it (AHardwareBuffer_sendHandleToUnixSocket); the fd crosses processes like any other;
 //   * importing such an fd receives the AHardwareBuffer from it and imports that.
 //
-// An exported fd is good for one import, as Vulkan's are (importing transfers its ownership).
+// Importing transfers an fd's ownership, but a dup of an opaque fd names the same memory, and Meta's
+// compositor imports its own swapchain memory and hands a dup of the same fd to its client. So the
+// buffer is queued in the socket EXPORT_COPIES times, one for each import; copies nobody reads go
+// when the socket's last fd is closed.
 // gralloc here makes only single-layer buffers in a few formats, and the host takes only images of
 // those for them. Any other image (the compositor's multiview swapchains, sRGB ones) is a plain image
 // whose memory is a tall single-layer RGBA8 buffer Prism allocates: every process binds its own image
@@ -550,6 +553,8 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
   return result;
 }
 
+#define EXPORT_COPIES 4
+
 static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *info, int *fd) {
   if (info->handleType != OPAQUE_FD || !next.GetMemoryAndroidHardwareBufferANDROID)
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -570,7 +575,8 @@ static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryG
     AHardwareBuffer_release(buffer);
     return VK_ERROR_TOO_MANY_OBJECTS;
   }
-  int sent = AHardwareBuffer_sendHandleToUnixSocket(buffer, pair[0]);
+  int sent = 0;
+  for (int i = 0; i < EXPORT_COPIES && !sent; i++) sent = AHardwareBuffer_sendHandleToUnixSocket(buffer, pair[0]);
   close(pair[0]);  // what was sent stays readable at the other end
   AHardwareBuffer_release(buffer);
   if (sent) {

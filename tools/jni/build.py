@@ -1,7 +1,8 @@
 """Build Prism's x86_64 JNI glue (native/prism_jni) for the user's Horizon OS build.
 
 Reads Horizon's framework jars from work/fs to find every native method Meta added (compared with
-stock work/baseline/fs) and which library each class loads, generates the stub table, and compiles:
+stock work/baseline/fs) and which library each class loads, generates the stub table, and compiles
+it with the HLE sources (natives Prism implements, see native/prism_jni/prism_hle.h) into:
 
   work/build/jni/libprism_jni.so   preloaded into zygote
   work/build/jni/lib<name>.so      stand-ins for Meta's arm64 JNI libraries
@@ -24,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools', 'ota'))
 import dex  # noqa: E402
 from inventory import Tree, classpaths  # noqa: E402
 
-SOURCE = os.path.join(ROOT, 'native', 'prism_jni', 'prism_jni.c')
+SOURCE_DIR = os.path.join(ROOT, 'native', 'prism_jni')  # prism_jni.c and the HLE sources (hle_*.c)
 API = 34
 
 
@@ -102,8 +103,9 @@ def compile_lib(ndk, out, include_dir, soname, defines):
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
     clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
     command = [clang, f'--target=x86_64-linux-android{API}', '-shared', '-fPIC', '-O2', '-std=c11', '-Wall',
-               '-Wno-unused-function', f'-I{include_dir}', *defines, SOURCE, '-o', out,
-               f'-Wl,-soname,{soname}', '-llog', '-Wl,--build-id=sha1']
+               '-Wno-unused-function', f'-I{include_dir}', *defines,
+               *sorted(glob.glob(os.path.join(SOURCE_DIR, '*.c'))), '-o', out,
+               f'-Wl,-soname,{soname}', '-llog', '-lm', '-Wl,--build-id=sha1']
     subprocess.run(command, check=True)
 
 

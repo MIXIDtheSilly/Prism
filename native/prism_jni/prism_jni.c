@@ -15,7 +15,10 @@
 // * lib<name>.so stand-ins (PRISM_STUB_LIB="<name>") for the arm64 JNI libraries Meta's Java code
 //   loads with System.loadLibrary. Their JNI_OnLoad registers that library's natives.
 //
-// Stubs log once per method and return 0 / null / false.
+// Stubs log once per method and return 0 / null / false. Natives Prism emulates (PRISM_HLE, see
+// prism_hle.h) are registered with their implementation instead.
+
+#include "prism_hle.h"
 
 #include <android/log.h>
 #include <jni.h>
@@ -71,6 +74,15 @@ static int register_one(JNIEnv *env, jclass clazz, const char *cls, const char *
   return 0;
 }
 
+extern const PrismHle __start_prism_hle[] __attribute__((weak));
+extern const PrismHle __stop_prism_hle[] __attribute__((weak));
+
+const PrismHle *prism_hle_find(const char *cls, const char *name, const char *sig) {
+  for (const PrismHle *h = __start_prism_hle; h < __stop_prism_hle; h++)
+    if (!strcmp(h->cls, cls) && !strcmp(h->name, name) && !strcmp(h->sig, sig)) return h;
+  return NULL;
+}
+
 static int has_table_entries(const char *cls) {
   for (int i = 0; i < kNativeCount; i++)
     if (strcmp(kNatives[i].cls, cls) == 0) return 1;
@@ -83,7 +95,8 @@ static int register_table(JNIEnv *env, jclass clazz, const char *cls, const char
   for (int i = 0; i < kNativeCount; i++) {
     if (strcmp(kNatives[i].cls, cls) != 0) continue;
     if (lib && strcmp(kNatives[i].lib, lib) != 0) continue;
-    count += register_one(env, clazz, cls, kNatives[i].name, kNatives[i].sig, kNatives[i].fn);
+    const PrismHle *hle = prism_hle_find(cls, kNatives[i].name, kNatives[i].sig);
+    count += register_one(env, clazz, cls, kNatives[i].name, kNatives[i].sig, hle ? hle->fn : kNatives[i].fn);
   }
   return count;
 }
@@ -172,6 +185,86 @@ static void register_adapters(JNIEnv *env, jclass clazz, const char *cls) {
     register_one(env, clazz, cls, "nativeUpdateTexImage", "(JJ)V", (void *)surface_texture_update);
 }
 
+// ---- arm64 code registering natives. Since Android 15, ART's RegisterNatives asks the native bridge
+// whether each function is guest code and registers a trampoline to it instead
+// (NativeBridgeGetTrampolineForFunctionPointer). Digitalis, an Android 16 build, leaves that to ART;
+// Android 14's ART registers the arm64 address itself, and the first call jumps into arm64 code from
+// x86_64. Prism's RegisterNatives does what newer ART does.
+typedef struct {  // libnativebridge's NativeBridgeCallbacks, version 8
+  uint32_t version;
+  void *v1_to_v6[17];
+  void *get_trampoline_with_jni_call_type;
+  void *(*get_trampoline_for_function_pointer)(const void *method, const char *shorty, uint32_t len,
+                                               int jni_call_type);
+  _Bool (*is_native_bridge_function_pointer)(const void *method);
+} NativeBridgeCallbacks;
+
+enum { kJNICallTypeRegular = 1 };
+
+static void *find_symbol(const void *base, const char *name);
+static const NativeBridgeCallbacks *g_bridge;
+
+static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size, (void)data;
+  const char *name = info->dlpi_name ? strrchr(info->dlpi_name, '/') : NULL;
+  if (!name || strncmp(name, "/libberberis", 12) != 0) return 0;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    if (info->dlpi_phdr[i].p_type != PT_LOAD || info->dlpi_phdr[i].p_offset != 0) continue;
+    const NativeBridgeCallbacks *itf =
+        find_symbol((const void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr), "NativeBridgeItf");
+    if (itf && itf->version >= 8) g_bridge = itf;
+    return 1;
+  }
+  return 0;
+}
+
+// "(ILjava/lang/String;[B)V" -> "VILL"
+static int shorty_of(const char *sig, char *out, size_t size) {
+  const char *ret = strchr(sig, ')');
+  if (!ret || size < 2) return 0;
+  size_t n = 0;
+  out[n++] = ret[1] == '[' ? 'L' : ret[1];
+  for (const char *p = sig + 1; p < ret && n + 1 < size; p++) {
+    char c = *p;
+    while (*p == '[') p++;
+    if (*p == 'L') p = strchr(p, ';');
+    if (!p) return 0;
+    out[n++] = c == '[' ? 'L' : *p == ';' ? 'L' : c;
+  }
+  out[n] = 0;
+  return 1;
+}
+
+// The function to register for fn: fn itself, or a trampoline if it is guest (arm64) code.
+static void *host_callable(void *fn, const char *sig) {
+  Dl_info info;
+  if (!fn || dladdr(fn, &info)) return fn;  // the host linker knows it: host code
+  if (!g_bridge) dl_iterate_phdr(find_bridge, NULL);
+  if (!g_bridge || !g_bridge->is_native_bridge_function_pointer(fn)) return fn;
+  char shorty[256];
+  if (!shorty_of(sig, shorty, sizeof shorty)) return fn;
+  void *trampoline = g_bridge->get_trampoline_for_function_pointer(fn, shorty, (uint32_t)strlen(shorty),
+                                                                   kJNICallTypeRegular);
+  return trampoline ? trampoline : fn;
+}
+
+// methods with guest functions replaced by trampolines: methods itself if none are, else a copy
+// the caller frees.
+static const JNINativeMethod *host_methods(const JNINativeMethod *methods, jint count) {
+  JNINativeMethod *copy = NULL;
+  for (jint i = 0; i < count; i++) {
+    void *fn = host_callable(methods[i].fnPtr, methods[i].signature);
+    if (fn == methods[i].fnPtr) continue;
+    if (!copy) {
+      copy = malloc(sizeof *copy * (size_t)count);
+      if (!copy) return methods;
+      memcpy(copy, methods, sizeof *copy * (size_t)count);
+    }
+    copy[i].fnPtr = fn;
+  }
+  return copy ? copy : methods;
+}
+
 // ---- The RegisterNatives override.
 static jmethodID g_class_get_name;
 
@@ -191,8 +284,7 @@ static int class_name(JNIEnv *env, jclass clazz, char *out, size_t size) {
   return 1;
 }
 
-static jint JNICALL prism_register_natives(JNIEnv *env, jclass clazz, const JNINativeMethod *methods,
-                                           jint count) {
+static jint register_host_natives(JNIEnv *env, jclass clazz, const JNINativeMethod *methods, jint count) {
   char cls[512];
   if (!class_name(env, clazz, cls, sizeof cls)) return g_register(env, clazz, methods, count);
   int changed = strcmp(cls, kSurfaceTexture) == 0;
@@ -215,6 +307,14 @@ static jint JNICALL prism_register_natives(JNIEnv *env, jclass clazz, const JNIN
   register_adapters(env, clazz, cls);
   LOGI("%s: %d stock natives dropped, %d Meta natives added", cls, dropped, added);
   return JNI_OK;
+}
+
+static jint JNICALL prism_register_natives(JNIEnv *env, jclass clazz, const JNINativeMethod *methods,
+                                           jint count) {
+  const JNINativeMethod *host = host_methods(methods, count);
+  jint result = register_host_natives(env, clazz, host, count);
+  if (host != methods) free((void *)host);
+  return result;
 }
 
 // ---- Finding libart's internals: they're exported, but libart lives in the ART module's linker

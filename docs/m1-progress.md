@@ -97,11 +97,18 @@ python tools\emulator.py status
   `libprism_jni` wraps those and hands it Horizon's arm64 copy from `GUEST_DIR`.
 - **Layered and sRGB images.** gralloc here makes single-layer buffers in a few formats only, and
   gfxstream can't export an sRGB image at all. A shared sRGB image is its UNORM twin, created
-  mutable so its views stay sRGB. Multiview swapchains (two layers) get memory from a tall RGBA8
-  buffer Prism allocates, imported through a stand-in image of the buffer's shape; that lets them be
-  created and imported, but the host aliases a color buffer's memory only for an image of its own
-  shape, so their contents don't reach the other process yet. VrShell renders everything it shows
-  into such a swapchain (its eye buffers, 1440x1584, two layers).
+  mutable so its views stay sRGB. Multiview swapchains (two layers, such as VrShell's eye buffers,
+  1440x1584) can't share memory at all: the host aliases a color buffer's memory only for an image
+  of the buffer's own shape. Each process keeps its own copy of such an image, and they share a
+  mirror: a single-layer buffer as wide as the image and as tall as its layers stacked, which is
+  what the image's fd carries. Prism follows what command buffers do to these images (render
+  passes, barriers, transfers, bound descriptor sets, layouts) and, at `vkQueueSubmit`, ends a batch
+  that writes one with a copy into its mirror, and begins a batch that only reads one with a copy
+  out of it, after the semaphores the batch waits for. The compositor imports the memory of each
+  swapchain image it exports and binds a second image to it, which it samples without barriers in
+  the layout its descriptors name; that image gets the mirror the imported buffer holds. VrShell's
+  home environment reaches the compositor this way. `setprop debug.prism.vk.dump N` (read when a
+  device is created) writes layer 0 of every Nth copied image to `/data/local/tmp/prism_*.rgba`.
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.

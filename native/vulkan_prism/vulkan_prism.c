@@ -12,6 +12,9 @@
 //   * importing such an fd receives the AHardwareBuffer from it and imports that.
 //
 // An exported fd is good for one import, as Vulkan's are (importing transfers its ownership).
+// gralloc here makes only single-layer buffers, and the host takes only single-layer images for
+// them, so a layered image (the compositor's multiview swapchains) is a plain image whose memory is a
+// tall single-layer buffer Prism allocates: every process binds its own image of the same shape to it.
 //
 // gfxstream also leaves out the names of some extensions that later Vulkan versions made core
 // (VK_KHR_16bit_storage, ...), which Meta's apps still ask for by name. Prism lists those the
@@ -93,6 +96,8 @@ static struct {
   PFN_vkGetPhysicalDeviceExternalBufferProperties GetPhysicalDeviceExternalBufferProperties;
   PFN_vkGetPhysicalDeviceExternalBufferPropertiesKHR GetPhysicalDeviceExternalBufferPropertiesKHR;
   PFN_vkCreateImage CreateImage;
+  PFN_vkDestroyImage DestroyImage;
+  PFN_vkFreeMemory FreeMemory;
   PFN_vkCreateBuffer CreateBuffer;
   PFN_vkAllocateMemory AllocateMemory;
   PFN_vkGetMemoryAndroidHardwareBufferANDROID GetMemoryAndroidHardwareBufferANDROID;
@@ -336,6 +341,10 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
         *device, "vkGetMemoryAndroidHardwareBufferANDROID");
     next.GetAndroidHardwareBufferPropertiesANDROID = (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)gdpa(
         *device, "vkGetAndroidHardwareBufferPropertiesANDROID");
+    // Prism calls these itself, whether or not the loader has asked for them yet.
+    if (!next.CreateImage) next.CreateImage = (PFN_vkCreateImage)gdpa(*device, "vkCreateImage");
+    if (!next.DestroyImage) next.DestroyImage = (PFN_vkDestroyImage)gdpa(*device, "vkDestroyImage");
+    if (!next.FreeMemory) next.FreeMemory = (PFN_vkFreeMemory)gdpa(*device, "vkFreeMemory");
     if (memory_fd) LOGI("device %p: %s backed by AHardwareBuffers", (void *)*device, kMemoryFd);
   }
   return result;
@@ -343,16 +352,47 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
 
 // --- device --------------------------------------------------------------------------------------
 
+// Opaque-fd images with more than one layer (the compositor's multiview swapchains). gralloc here
+// has no layered buffers, so their memory is a plain blob AHardwareBuffer of the allocation's size,
+// not one shaped like the image: the dedicated-allocation link to the image is dropped.
+#define MAX_LAYERED 256
+static VkImage g_layered[MAX_LAYERED];
+static pthread_mutex_t g_layered_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int layered_image(VkImage image, int add, int remove) {
+  int found = 0;
+  pthread_mutex_lock(&g_layered_lock);
+  for (int i = 0; i < MAX_LAYERED && !found; i++) {
+    if (g_layered[i] != image) continue;
+    found = 1;
+    if (remove) g_layered[i] = VK_NULL_HANDLE;
+  }
+  for (int i = 0; add && !found && i < MAX_LAYERED; i++)
+    if (g_layered[i] == VK_NULL_HANDLE) g_layered[i] = image, found = 1;
+  pthread_mutex_unlock(&g_layered_lock);
+  return found;
+}
+
 static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreateInfo *info,
                                              const VkAllocationCallbacks *allocator, VkImage *image) {
   const VkExternalMemoryImageCreateInfo *external = find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
   if (!external || !(external->handleTypes & OPAQUE_FD)) return next.CreateImage(device, info, allocator, image);
   VkImageCreateInfo copy = *info;
   VkExternalMemoryImageCreateInfo ahb = *external;
-  ahb.handleTypes = as_ahb(external->handleTypes);
+  // The host accepts only single-layer AHardwareBuffer images; a layered one is a plain image whose
+  // memory comes from a shared buffer all the same (see prism_AllocateMemory).
+  ahb.handleTypes = info->arrayLayers > 1 ? external->handleTypes & ~(VkExternalMemoryHandleTypeFlags)OPAQUE_FD
+                                          : as_ahb(external->handleTypes);
   Scratch scratch = {.used = 0};
   replace_in_chain(&copy, &ahb, &scratch);
-  return next.CreateImage(device, &copy, allocator, image);
+  VkResult result = next.CreateImage(device, &copy, allocator, image);
+  if (result == VK_SUCCESS && info->arrayLayers > 1) layered_image(*image, 1, 0);
+  return result;
+}
+
+static void VKAPI_CALL prism_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *allocator) {
+  if (image != VK_NULL_HANDLE) layered_image(image, 0, 1);
+  next.DestroyImage(device, image, allocator);
 }
 
 static VkResult VKAPI_CALL prism_CreateBuffer(VkDevice device, const VkBufferCreateInfo *info,
@@ -367,6 +407,67 @@ static VkResult VKAPI_CALL prism_CreateBuffer(VkDevice device, const VkBufferCre
   return next.CreateBuffer(device, &copy, allocator, buffer);
 }
 
+// A single-layer color buffer of at least size bytes: what gralloc here can share. Memory for a
+// layered image lives in one; every process binds its own image of the same shape to that memory.
+static AHardwareBuffer *buffer_of_size(VkDeviceSize size) {
+  const uint32_t width = 1024;  // RGBA8: 4 KiB a row
+  AHardwareBuffer_Desc desc = {width, (uint32_t)((size + width * 4 - 1) / (width * 4)), 1,
+                               AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                               AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT,
+                               0, 0, 0};
+  AHardwareBuffer *buffer = NULL;
+  if (AHardwareBuffer_allocate(&desc, &buffer)) {
+    LOGE("no %u x %u buffer for a layered image's %llu bytes", desc.width, desc.height, (unsigned long long)size);
+    return NULL;
+  }
+  return buffer;
+}
+
+// Memory backed by a buffer Prism allocated (layered images): the driver exports only buffers it
+// allocated itself, so Prism keeps these for vkGetMemoryFdKHR.
+#define MAX_OWN 256
+static struct {
+  VkDeviceMemory memory;
+  AHardwareBuffer *buffer;
+} g_own[MAX_OWN];
+
+static AHardwareBuffer *own_buffer(VkDeviceMemory memory, AHardwareBuffer *add, int remove) {
+  AHardwareBuffer *found = NULL;
+  pthread_mutex_lock(&g_layered_lock);
+  for (int i = 0; i < MAX_OWN && !found; i++) {
+    if (g_own[i].memory != memory || !g_own[i].buffer) continue;
+    found = g_own[i].buffer;
+    if (remove) g_own[i].memory = VK_NULL_HANDLE, g_own[i].buffer = NULL;
+  }
+  for (int i = 0; add && !found && i < MAX_OWN; i++) {
+    if (g_own[i].buffer) continue;
+    AHardwareBuffer_acquire(add);
+    g_own[i].memory = memory, g_own[i].buffer = found = add;
+  }
+  pthread_mutex_unlock(&g_layered_lock);
+  return found;
+}
+
+static void VKAPI_CALL prism_FreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *allocator) {
+  AHardwareBuffer *buffer = memory != VK_NULL_HANDLE ? own_buffer(memory, NULL, 1) : NULL;
+  if (buffer) AHardwareBuffer_release(buffer);
+  next.FreeMemory(device, memory, allocator);
+}
+
+// An image shaped like buffer, for the driver's import of it.
+static VkImage buffer_image(VkDevice device, AHardwareBuffer *buffer) {
+  AHardwareBuffer_Desc desc;
+  AHardwareBuffer_describe(buffer, &desc);
+  VkExternalMemoryImageCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, AHB};
+  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &external, 0, VK_IMAGE_TYPE_2D,
+                            VK_FORMAT_R8G8B8A8_UNORM, {desc.width, desc.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+  VkImage image = VK_NULL_HANDLE;
+  if (next.CreateImage(device, &info, NULL, &image) != VK_SUCCESS) return VK_NULL_HANDLE;
+  return image;
+}
+
 static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
                                                 const VkAllocationCallbacks *allocator, VkDeviceMemory *memory) {
   const VkExportMemoryAllocateInfo *export = find_in(info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -375,6 +476,8 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
   int importing = import && import->handleType == OPAQUE_FD;
   if (!exporting && !importing) return next.AllocateMemory(device, info, allocator, memory);
 
+  const VkMemoryDedicatedAllocateInfo *dedicated = find_in(info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+  int layered = dedicated && dedicated->image != VK_NULL_HANDLE && layered_image(dedicated->image, 0, 0);
   VkMemoryAllocateInfo copy = *info;
   Scratch scratch = {.used = 0};
   VkExportMemoryAllocateInfo export_ahb;
@@ -384,29 +487,42 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
     replace_in_chain(&copy, &export_ahb, &scratch);
   }
   AHardwareBuffer *buffer = NULL;
+  if (importing && (AHardwareBuffer_recvHandleFromUnixSocket(import->fd, &buffer) != 0 || !buffer)) {
+    LOGE("fd %d holds no AHardwareBuffer; only memory exported by Prism's driver can be imported", import->fd);
+    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+  }
+  if (!importing && layered) {
+    // Prism's own buffer, imported: the driver shouldn't allocate one to export as well.
+    if (!(buffer = buffer_of_size(info->allocationSize))) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    export_ahb.handleTypes &= ~(VkExternalMemoryHandleTypeFlags)AHB;
+  }
   VkImportAndroidHardwareBufferInfoANDROID import_ahb = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};
-  if (importing) {
-    if (!next.GetAndroidHardwareBufferPropertiesANDROID ||
-        AHardwareBuffer_recvHandleFromUnixSocket(import->fd, &buffer) != 0 || !buffer) {
-      LOGE("fd %d holds no AHardwareBuffer; only memory exported by Prism's driver can be imported", import->fd);
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-    }
+  if (buffer) {
     VkAndroidHardwareBufferPropertiesANDROID props = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
-    VkResult result = next.GetAndroidHardwareBufferPropertiesANDROID(device, buffer, &props);
+    VkResult result = next.GetAndroidHardwareBufferPropertiesANDROID
+                          ? next.GetAndroidHardwareBufferPropertiesANDROID(device, buffer, &props)
+                          : VK_ERROR_INVALID_EXTERNAL_HANDLE;
     if (result != VK_SUCCESS || !props.memoryTypeBits) {
       AHardwareBuffer_release(buffer);
       return result != VK_SUCCESS ? result : VK_ERROR_INVALID_EXTERNAL_HANDLE;
     }
-    copy.allocationSize = props.allocationSize;
+    // gfxstream may not know the size of a buffer it didn't allocate (0); the caller's is the image's.
+    if (props.allocationSize) copy.allocationSize = props.allocationSize;
     if (!(props.memoryTypeBits & (1u << copy.memoryTypeIndex))) copy.memoryTypeIndex = __builtin_ctz(props.memoryTypeBits);
     import_ahb.buffer = buffer;
     replace_in_chain(&copy, &import_ahb, &scratch);
   }
+  // The buffer isn't shaped like a layered image. The driver imports color buffers only for an
+  // image of their shape, so the memory is dedicated to a stand-in of that shape, and the layered
+  // image is bound to it afterwards.
+  VkMemoryDedicatedAllocateInfo stand_in = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+  if (layered && buffer && (stand_in.image = buffer_image(device, buffer)) != VK_NULL_HANDLE)
+    replace_in_chain(&copy, &stand_in, &scratch);
   VkResult result = next.AllocateMemory(device, &copy, allocator, memory);
-  if (buffer) {
-    AHardwareBuffer_release(buffer);  // the imported memory holds its own reference
-    if (result == VK_SUCCESS) close(import->fd);  // a successful import owns the fd
-  }
+  if (stand_in.image != VK_NULL_HANDLE) next.DestroyImage(device, stand_in.image, NULL);  // the memory stays
+  if (result == VK_SUCCESS && layered && buffer) own_buffer(*memory, buffer, 0);
+  if (buffer) AHardwareBuffer_release(buffer);  // the memory holds its own reference
+  if (importing && result == VK_SUCCESS) close(import->fd);  // a successful import owns the fd
   return result;
 }
 
@@ -415,8 +531,12 @@ static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryG
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
   VkMemoryGetAndroidHardwareBufferInfoANDROID get = {VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
                                                      NULL, info->memory};
-  AHardwareBuffer *buffer = NULL;
-  VkResult result = next.GetMemoryAndroidHardwareBufferANDROID(device, &get, &buffer);
+  AHardwareBuffer *buffer = own_buffer(info->memory, NULL, 0);
+  VkResult result = VK_SUCCESS;
+  if (buffer)
+    AHardwareBuffer_acquire(buffer);
+  else
+    result = next.GetMemoryAndroidHardwareBufferANDROID(device, &get, &buffer);
   if (result != VK_SUCCESS) {
     LOGE("vkGetMemoryFdKHR: memory has no AHardwareBuffer (%d)", result);
     return result;
@@ -467,6 +587,8 @@ static const Hook kHooks[] = {
     HOOK(GetPhysicalDeviceExternalBufferProperties),
     HOOK(GetPhysicalDeviceExternalBufferPropertiesKHR),
     HOOK(CreateImage),
+    HOOK(DestroyImage),
+    HOOK(FreeMemory),
     HOOK(CreateBuffer),
     HOOK(AllocateMemory),
     OWN(GetMemoryFdKHR),

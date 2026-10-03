@@ -10,6 +10,7 @@ python tools\jni\build.py                  # Prism's JNI glue for this Horizon b
 python tools\compat.py                     # bridged framework.jar
 python tools\translator.py                 # Digitalis ARM64 translator, adapted to Android 14
 python tools\vulkan.py                     # Prism's Vulkan driver (opaque-fd memory for the compositor)
+python tools\thermal.py                    # Prism's thermal HAL (stable-AIDL IThermal, for vrdevice)
 python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot
 python tools\emulator.py status
 ```
@@ -80,6 +81,23 @@ python tools\emulator.py status
   and `ANativeWindow_*`. They give EGL an x86_64 stand-in for an arm64 window: a layer of the same
   size created through Java's `SurfaceControl`, shown on top.
 
+- **arm64 libraries by path.** Meta's code dlopens some platform libraries by absolute path
+  (`/system/lib64/heapprofd_client_api.so`), which here are x86_64. The guest linker is translated
+  code whose opens reach the host through the translator's `open`, `openat` and `syscall` imports;
+  `libprism_jni` wraps those and hands it Horizon's arm64 copy from `GUEST_DIR`.
+- **Layered and sRGB images.** gralloc here makes single-layer buffers in a few formats only, and
+  gfxstream can't export an sRGB image at all. Opaque-fd images that no AHardwareBuffer can hold
+  (the compositor's multiview swapchains, VrShell's sRGB ones) get memory from a tall RGBA8 buffer
+  Prism allocates, imported through a stand-in image of the buffer's shape.
+- **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
+  needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
+  HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
+- **Wearing the headset.** VrPowerManagerService (declared in VINTF so servicemanager registers it)
+  puts Horizon to sleep 15 s after boot unless the headset is worn; `prism.rc` sets its virtual
+  proximity sensor to "close" once boot completes.
+- **Crash reports** ([fault_report.c](../native/prism_jni/fault_report.c)). App processes that
+  crash in host code under the translator die without a tombstone. `libprism_jni` logs those
+  (`PrismFault`) and, for a null call in arm64 code, the guest's call chain.
 - **Mainline modules.** Stock's APEXes stay, except pure-Java ones whose newer APIs Horizon's
   framework needs (`HORIZON_APEXES` in deploy.py); those are Horizon's own: configinfrastructure
   (DeviceConfig) and permission (PermissionController holds Meta's roles, which grant role-only
@@ -104,5 +122,10 @@ python tools\emulator.py status
   the PC's GPU (an RTX 3080 through the emulator), builds its distortion meshes and timing, and
   waits for its first client, drawing to a Prism layer on the emulator's display. It has no
   display state provider (vsync comes from its fallback timing).
-- **Next:** clients for the compositor (VrShell), head tracking, and the headset's other hardware
-  layers apps wait on (`vrdevice`, `OVRRemoteService`, sensors, the maintenance-boot HAL).
+- **VrShell runs in VR.** With the headset worn, VrShell's OpenXR session reaches FOCUSED with
+  rendering enabled: it creates and imports its swapchains through Prism's Vulkan driver. Horizon's
+  first-time setup (`FirstTimeNuxActivity`, the controller-batteries step) shows in the emulator
+  window as a 2D panel.
+- **Next:** the compositor's own output in the window (frames VrShell submits), head tracking, and
+  the services still crash-looping: `com.oculus.os.cm` (a null pointer in its sensor client) and
+  `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).

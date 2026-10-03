@@ -125,7 +125,9 @@ python tools\emulator.py status
   host and keeps the headset's pose in that region (a mode in which readers take the latest pose
   as of the time they ask): still at the origin, or moved from the PC by `tools/head.py`, a window
   whose mouse and keys stream poses to the service through `adb forward`. The compositor and
-  VrShell read it with Meta's own client code.
+  VrShell read it with Meta's own client code. The same host keeps the hand regions (left and
+  right) and the input-type map, as a headset's are before any sample: no hands, no input devices.
+  Anchors aren't hosted: the broker leaves them out on an emulator.
 - **Wearing the headset.** VrPowerManagerService (declared in VINTF so servicemanager registers it)
   puts Horizon to sleep 15 s after boot unless the headset is worn; `prism.rc` sets its virtual
   proximity sensor to "close" once boot completes.

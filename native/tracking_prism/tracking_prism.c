@@ -21,6 +21,13 @@
  * position, and its time (ns, CLOCK_MONOTONIC); a second quaternion at 0x80 must be a unit one
  * too for the state to count as valid.
  *
+ * It hosts the regions trackingservice keeps for hands and input devices too, in the state a
+ * headset's are in before any sample: no hands tracked, no input devices. Without a host, their
+ * clients (the compositor, VrShell) ask the broker again and again.
+ *   HAND_TRACKER, left and right (0x13e8 bytes each): two hand snapshots (0x7c8 apart, at 8) and
+ *     two hand configurations (0x68 apart, at 0x1308), whose times, -1, mean no sample yet
+ *   INPUT_TYPE_MAP (0xc8 bytes): the input devices' ids and the regions they're in, none
+ *
  * The binder thread-pool calls are platform APIs the NDK doesn't declare, so they're looked up.
  */
 #include <android/log.h>
@@ -58,6 +65,12 @@ struct region_info {
 };
 #define HEAD_TRACKER 8  // SharedMemoryType HEAD_TRACKER (11)
 #define REGION_SIZE 0x1680
+#define HAND_TRACKER 7  // SharedMemoryType HAND_TRACKER (10)
+#define HAND_SIZE 0x13e8
+#define INPUT_TYPE_MAP 13  // SharedMemoryType INPUT_TYPE_MAP (13)
+#define INPUT_MAP_SIZE 0xc8
+#define LEFT 1   // the C API's specifiers
+#define RIGHT 2
 
 struct head_state {
   uint8_t valid;
@@ -158,6 +171,38 @@ static void *serve_poses(void *unused) {
   }
 }
 
+static void put_i64(uint8_t *at, int64_t v) { memcpy(at, &v, sizeof v); }
+static void put_f32(uint8_t *at, float v) { memcpy(at, &v, sizeof v); }
+
+// A hand region as trackingservice first allocates it: no sample yet.
+static void hand_ready(void *context, void *memory) {
+  uint8_t *region = memory;
+  memset(region, 0, HAND_SIZE);
+  for (size_t at = 8; at < 0xf98; at += 0x7c8) {  // the two snapshots
+    put_i64(region + at + 0x008, -1);
+    put_i64(region + at + 0x010, -1);  // the sample's time
+    for (int i = 0; i < 6; i++) put_i64(region + at + 0x470 + i * 0x80, -1);  // history
+    uint16_t status = 0x01ff;
+    memcpy(region + at + 0x740, &status, sizeof status);
+    put_i64(region + at + 0x790, -1);
+    put_i64(region + at + 0x798, -1);
+    put_i64(region + at + 0x7a0, -1);
+    put_f32(region + at + 0x7b4, 1.0f);  // an identity quaternion, w first
+  }
+  for (size_t at = 0x1308; at <= 0x1370; at += 0x68) {  // the two configurations
+    put_f32(region + at + 4, 1.0f);
+    put_i64(region + at + 8, -1);
+  }
+  LOG("%s hand region at %p", context ? "right" : "left", memory);
+}
+
+// No input devices: both copies of the map empty.
+static void input_map_ready(void *context, void *memory) {
+  (void)context;
+  memset(memory, 0, INPUT_MAP_SIZE);
+  LOG("input map region at %p", memory);
+}
+
 static void *open_symbol(const char *lib, const char *name) {
   void *handle = dlopen(lib, RTLD_NOW);
   void *symbol = handle ? dlsym(handle, name) : NULL;
@@ -197,6 +242,14 @@ static int run_host(void) {
     ERR("can't register the head tracker region");
     return 1;
   }
+  // One host connection holds several regions, each a type and specifier of its own.
+  const struct region_info others[] = {
+      {.type = HAND_TRACKER, .specifier = LEFT, .size = HAND_SIZE, .context = NULL, .ready = hand_ready},
+      {.type = HAND_TRACKER, .specifier = RIGHT, .size = HAND_SIZE, .context = (void *)1, .ready = hand_ready},
+      {.type = INPUT_TYPE_MAP, .size = INPUT_MAP_SIZE, .ready = input_map_ready},
+  };
+  for (size_t i = 0; i < sizeof others / sizeof *others; i++)
+    if (!register_region(host, &others[i])) ERR("can't register region type %u/%u", others[i].type, others[i].specifier);
   pthread_t poses;
   pthread_create(&poses, NULL, serve_poses, NULL);
   for (;;) {

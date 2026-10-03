@@ -111,6 +111,7 @@ static struct {
   PFN_vkBindImageMemory BindImageMemory;
   PFN_vkBindImageMemory2 BindImageMemory2;
   PFN_vkBindImageMemory2KHR BindImageMemory2KHR;
+  PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
   PFN_vkGetMemoryAndroidHardwareBufferANDROID GetMemoryAndroidHardwareBufferANDROID;
   PFN_vkGetAndroidHardwareBufferPropertiesANDROID GetAndroidHardwareBufferPropertiesANDROID;
   // What backed images' copies need: their use is tracked, and Prism records and submits copies.
@@ -179,6 +180,7 @@ static struct {
 // passes, pipelines bound, viewports, scissors, draws, clears, submits and presents. Framebuffers,
 // pipelines and swapchain images are logged as they're made (a bounded number of each).
 static int g_trace;  // lines left
+static int g_trace_images;  // debug.prism.vk.images: log every image and view made (bounded)
 #define TRACE(...) \
   do { \
     if (__atomic_load_n(&g_trace, __ATOMIC_RELAXED) > 0 && __atomic_fetch_sub(&g_trace, 1, __ATOMIC_RELAXED) > 0) \
@@ -192,9 +194,9 @@ typedef VkResult(VKAPI_PTR *PFN_AcquireImageANDROID)(VkDevice, VkImage, int, VkS
 typedef VkResult(VKAPI_PTR *PFN_QueueSignalReleaseImageANDROID)(VkQueue, uint32_t, const VkSemaphore *, VkImage, int *);
 static unsigned g_acquires, g_releases;  // swapchain images acquired and presented
 
-// debug.prism.vk.dump=N: every Nth copy into a mirror, and out of one, also copies layer 0 of the
-// image to /data/local/tmp/prism_<into|out>_<pid>.rgba (raw texels, width x height). Read once a
-// second (see trace_submit).
+// debug.prism.vk.dump=N: every Nth copy into a mirror, and out of one, also copies the image to
+// /data/local/tmp/prism_<into|out>_<pid>.rgba (raw texels, width x height x layers, the layers one
+// under another). Read once a second (see trace_submit).
 static unsigned g_dump_at;
 static unsigned g_submits, g_pulls, g_pushes;  // vkQueueSubmit calls, copies out of mirrors and into them
 static VkPhysicalDeviceMemoryProperties g_memory_properties;
@@ -295,6 +297,7 @@ static int has_extension(const VkExtensionProperties *props, uint32_t count, con
 // Extensions promoted to core: listed when the device's version has them (and the feature they
 // exist for, when they have one).
 static int has_16bit_storage(const VkPhysicalDeviceVulkan11Features *f) { return f->storageBuffer16BitAccess; }
+static int has_multiview(const VkPhysicalDeviceVulkan11Features *f) { return f->multiview; }
 static const struct {
   const char *name;
   uint32_t spec_version;
@@ -303,6 +306,8 @@ static const struct {
 } kPromoted[] = {
     {VK_KHR_16BIT_STORAGE_EXTENSION_NAME, VK_KHR_16BIT_STORAGE_SPEC_VERSION, VK_API_VERSION_1_1, has_16bit_storage},
     {VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_SPEC_VERSION, VK_API_VERSION_1_2, NULL},
+    {VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MULTIVIEW_SPEC_VERSION, VK_API_VERSION_1_1, has_multiview},
+    {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, VK_KHR_DRIVER_PROPERTIES_SPEC_VERSION, VK_API_VERSION_1_2, NULL},
 };
 #define PROMOTED_COUNT (sizeof kPromoted / sizeof *kPromoted)
 
@@ -451,6 +456,7 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
     NEED(FreeMemory);
     NEED(AllocateMemory);
     NEED(BindImageMemory);
+    NEED(GetImageMemoryRequirements);
     NEED(BeginCommandBuffer);
     NEED(EndCommandBuffer);
     NEED(CmdPipelineBarrier);
@@ -469,8 +475,17 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
     NEED(MapMemory);
     NEED(DestroyBuffer);
     if (next.GetPhysicalDeviceMemoryProperties) next.GetPhysicalDeviceMemoryProperties(pd, &g_memory_properties);
+    char images[PROP_VALUE_MAX] = "";
+    __system_property_get("debug.prism.vk.images", images);
+    g_trace_images = atoi(images);
 #undef NEED
     if (memory_fd) LOGI("device %p: %s backed by AHardwareBuffers", (void *)*device, kMemoryFd);
+    const VkPhysicalDeviceVulkan11Features *v11 = find_in(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
+    const VkPhysicalDeviceMultiviewFeatures *mv = find_in(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES);
+    LOGI("device %p: %u extensions, multiview %s", (void *)*device, info->enabledExtensionCount,
+         v11 ? (v11->multiview ? "on (1.1 features)" : "off (1.1 features)")
+         : mv ? (mv->multiview ? "on" : "off")
+              : "not asked");
   }
   return result;
 }
@@ -498,6 +513,7 @@ typedef struct {
   VkFormat mirror_format;  // VK_FORMAT_UNDEFINED: no mirror holds it, its contents aren't shared
   VkImageLayout layout;    // its layout once the work submitted so far is done
   VkDeviceMemory memory;   // the app's memory for it; VK_NULL_HANDLE until allocated and once freed
+  VkDeviceMemory own;      // memory it's bound to instead, when the app's is the mirror's (imported)
   AHardwareBuffer *buffer;  // what that memory exports: the mirror's
   VkImage mirror;
   VkDeviceMemory mirror_memory;
@@ -729,7 +745,14 @@ static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreat
     return result;
   }
   const VkExternalMemoryImageCreateInfo *external = find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-  if (!external || !(external->handleTypes & OPAQUE_FD)) return next.CreateImage(device, info, allocator, image);
+  if (!external || !(external->handleTypes & OPAQUE_FD)) {
+    VkResult result = next.CreateImage(device, info, allocator, image);
+    static unsigned logged;
+    if (result == VK_SUCCESS && __atomic_load_n(&g_trace_images, __ATOMIC_RELAXED) && within(&logged, 64))
+      LOGI("image %p: %ux%u, %u layers, format %d, %u samples, usage %#x", (void *)*image, info->extent.width,
+           info->extent.height, info->arrayLayers, info->format, info->samples, info->usage);
+    return result;
+  }
   VkImageCreateInfo copy = *info;
   VkExternalMemoryImageCreateInfo ahb = *external;
   Scratch scratch = {.used = 0};
@@ -887,10 +910,19 @@ static VkResult VKAPI_CALL prism_CreateImageView(VkDevice device, const VkImageV
     LOGI("view %p: of swapchain image %p, format %d", (void *)*view, (void *)info->image, info->format);
     break;
   }
+  static unsigned logged;
+  if (result == VK_SUCCESS && __atomic_load_n(&g_trace_images, __ATOMIC_RELAXED) && within(&logged, 96))
+    LOGI("view %p: of image %p, type %d, format %d, layers %u+%u", (void *)*view, (void *)info->image, info->viewType,
+         info->format, info->subresourceRange.baseArrayLayer, info->subresourceRange.layerCount);
   if (result != VK_SUCCESS || !tracking()) return result;
   pthread_mutex_lock(&g_lock);
-  if (backed_image(info->image) && ROOM(g_views, g_view_count, g_view_capacity))
+  if (backed_image(info->image) && ROOM(g_views, g_view_count, g_view_capacity)) {
     g_views[g_view_count++] = (View){*view, info->image};
+    static unsigned logged;
+    if (within(&logged, 32))
+      LOGI("view %p: of backed image %p, type %d, format %d, layers %u-%u", (void *)*view, (void *)info->image,
+           info->viewType, info->format, info->subresourceRange.baseArrayLayer, info->subresourceRange.layerCount);
+  }
   pthread_mutex_unlock(&g_lock);
   return result;
 }
@@ -922,10 +954,12 @@ static VkResult VKAPI_CALL prism_CreateRenderPass(VkDevice device, const VkRende
                                                   const VkAllocationCallbacks *allocator, VkRenderPass *pass) {
   VkResult result = next.CreateRenderPass(device, info, allocator, pass);
   static unsigned logged;
+  const VkRenderPassMultiviewCreateInfo *multiview = find_in(info, VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO);
   if (result == VK_SUCCESS && info->attachmentCount && within(&logged, 64))
-    LOGI("pass %p: %u attachments, first: format %d, load %d, store %d, %d to %d", (void *)*pass, info->attachmentCount,
-         info->pAttachments->format, info->pAttachments->loadOp, info->pAttachments->storeOp,
-         info->pAttachments->initialLayout, info->pAttachments->finalLayout);
+    LOGI("pass %p: %u attachments, first: format %d, load %d, store %d, %d to %d; views %#x", (void *)*pass,
+         info->attachmentCount, info->pAttachments->format, info->pAttachments->loadOp, info->pAttachments->storeOp,
+         info->pAttachments->initialLayout, info->pAttachments->finalLayout,
+         multiview && multiview->subpassCount ? multiview->pViewMasks[0] : 0);
   if (result == VK_SUCCESS)
     add_pass(*pass, info->attachmentCount, info->pAttachments, sizeof *info->pAttachments,
              offsetof(VkAttachmentDescription, finalLayout));
@@ -1428,21 +1462,28 @@ static VkCommandBuffer slot_cb(Ring *r, Slot *s) {
   return *cb;
 }
 
-// Records a copy of layer 0 of b's image (in layout) to a host-visible buffer, for prism_QueueSubmit
-// to write to a file. Returns the image's layout afterwards.
+// The first memory type of bits with flags want; memoryTypeCount if there's none.
+static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+  uint32_t type = 0;
+  while (type < g_memory_properties.memoryTypeCount &&
+         (!(bits & (1u << type)) || (g_memory_properties.memoryTypes[type].propertyFlags & want) != want))
+    type++;
+  return type;
+}
+
+// Records a copy of b's image (in layout) to a host-visible buffer, for prism_QueueSubmit to write to
+// a file. Returns the image's layout afterwards.
 static VkImageLayout record_dump(VkCommandBuffer cb, Backed *b, int push, VkImageLayout layout) {
-  VkDeviceSize size = (VkDeviceSize)b->extent.width * b->extent.height * 4;
+  VkDeviceSize layer_size = (VkDeviceSize)b->extent.width * b->extent.height * 4;
+  VkDeviceSize size = layer_size * b->layers;
   VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              VK_SHARING_MODE_EXCLUSIVE};
   VkBuffer buffer;
   if (next.CreateBuffer(b->device, &info, NULL, &buffer) != VK_SUCCESS) return layout;
   VkMemoryRequirements req;
   next.GetBufferMemoryRequirements(b->device, buffer, &req);
-  uint32_t type = 0;
-  const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  while (type < g_memory_properties.memoryTypeCount &&
-         (!(req.memoryTypeBits & (1u << type)) || (g_memory_properties.memoryTypes[type].propertyFlags & want) != want))
-    type++;
+  uint32_t type =
+      memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
   VkDeviceMemory memory;
   if (type == g_memory_properties.memoryTypeCount || next.AllocateMemory(b->device, &allocate, NULL, &memory) != VK_SUCCESS) {
@@ -1456,10 +1497,13 @@ static VkImageLayout record_dump(VkCommandBuffer cb, Backed *b, int push, VkImag
                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
   next.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
                           &barrier);
-  VkBufferImageCopy region = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                              {b->extent.width, b->extent.height, 1}};
-  next.CmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+  VkBufferImageCopy regions[MAX_LAYERS];
+  for (uint32_t i = 0; i < b->layers; i++)
+    regions[i] = (VkBufferImageCopy){i * layer_size, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, i, 1}, {0, 0, 0},
+                                     {b->extent.width, b->extent.height, 1}};
+  next.CmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, b->layers, regions);
   g_dump.device = b->device, g_dump.buffer = buffer, g_dump.memory = memory, g_dump.extent = b->extent;
+  g_dump.extent.height *= b->layers;
   g_dump.push = push;
   return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 }
@@ -1921,13 +1965,44 @@ static void VKAPI_CALL prism_FreeMemory(VkDevice device, VkDeviceMemory memory, 
   }
   if (gone.mirror != VK_NULL_HANDLE) next.DestroyImage(device, gone.mirror, NULL);
   if (gone.mirror_memory != VK_NULL_HANDLE) next.FreeMemory(device, gone.mirror_memory, NULL);
+  if (gone.own != VK_NULL_HANDLE) next.FreeMemory(device, gone.own, NULL);
   if (gone.buffer) AHardwareBuffer_release(gone.buffer);
   next.FreeMemory(device, memory, allocator);
 }
 
+// Memory imported from a mirror's buffer is the mirror's memory on the host, whatever image is bound
+// to it, and the mirror is an image of another shape: a layered image bound there would share its
+// first layer with the mirror's top rows and scramble the rest with every copy between them. So a
+// backed image bound to such memory (the compositor binds a second image to the memory of each
+// swapchain image it exports) is bound to memory of its own instead, returned in own; the import
+// only holds the mirror.
+static VkDeviceMemory memory_to_bind(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceMemory *own) {
+  *own = VK_NULL_HANDLE;
+  if (!tracking() || !next.GetImageMemoryRequirements) return memory;
+  pthread_mutex_lock(&g_lock);
+  Backed *b = backed_image(image);
+  int imported = 0;
+  for (int i = 0; b && b->mirror_format != VK_FORMAT_UNDEFINED && b->memory == VK_NULL_HANDLE && i < MAX_IMPORTS; i++)
+    imported |= g_imports[i].memory == memory && g_imports[i].buffer;
+  pthread_mutex_unlock(&g_lock);
+  if (!imported) return memory;
+  VkMemoryRequirements req;
+  next.GetImageMemoryRequirements(device, image, &req);
+  uint32_t type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (type == g_memory_properties.memoryTypeCount) type = memory_type(req.memoryTypeBits, 0);
+  VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, image};
+  VkMemoryAllocateInfo allocate = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated, req.size, type};
+  if (type == g_memory_properties.memoryTypeCount || next.AllocateMemory(device, &allocate, NULL, own) != VK_SUCCESS) {
+    LOGE("image %p: no memory of its own; bound to its mirror's, its layers won't survive copies", (void *)image);
+    *own = VK_NULL_HANDLE;
+    return memory;
+  }
+  return *own;
+}
+
 // A backed image bound to another's memory (the compositor binds a second image to the memory of
 // each swapchain image it exports) aliases that image here, and shares its mirror.
-static void bound(VkImage image, VkDeviceMemory memory) {
+static void bound(VkImage image, VkDeviceMemory memory, VkDeviceMemory own) {
   if (!tracking()) return;
   pthread_mutex_lock(&g_lock);
   Backed *b = backed_image(image), *owner = backed_memory(memory);
@@ -1935,8 +2010,8 @@ static void bound(VkImage image, VkDeviceMemory memory) {
     b->owner = owner;
     LOGI("image %p: bound to the memory of image %p, shares its mirror", (void *)image, (void *)owner->image);
   } else if (b && !owner && b->memory == VK_NULL_HANDLE) {
-    // Imported memory: its buffer is the exporter's mirror, which this image gets too. The memory
-    // itself, a buffer of another shape, holds this process's copy of the image.
+    // Imported memory: its buffer is the exporter's mirror, which this image gets too. The image
+    // itself, this process's copy, is in own (see memory_to_bind).
     AHardwareBuffer *buffer = take_import(memory);
     VkImage mirror = VK_NULL_HANDLE;
     VkDeviceMemory mirror_memory = VK_NULL_HANDLE;
@@ -1948,7 +2023,7 @@ static void bound(VkImage image, VkDeviceMemory memory) {
         result = import_mirror(b->device, buffer, b->mirror_format, &mirror, &mirror_memory);
     }
     if (buffer) {
-      b->memory = memory, b->buffer = buffer;  // freed with the memory
+      b->memory = memory, b->buffer = buffer, b->own = own;  // freed with the memory
       if (result == VK_SUCCESS) b->mirror = mirror, b->mirror_memory = mirror_memory, b->mirror_general = 0;
     }
     if (result == VK_SUCCESS)
@@ -1961,15 +2036,33 @@ static void bound(VkImage image, VkDeviceMemory memory) {
 
 static VkResult VKAPI_CALL prism_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
                                                  VkDeviceSize offset) {
-  VkResult result = next.BindImageMemory(device, image, memory, offset);
-  if (result == VK_SUCCESS) bound(image, memory);
+  VkDeviceMemory own;
+  VkDeviceMemory to = memory_to_bind(device, image, memory, &own);
+  VkResult result = next.BindImageMemory(device, image, to, own != VK_NULL_HANDLE ? 0 : offset);
+  if (result == VK_SUCCESS)
+    bound(image, memory, own);
+  else if (own != VK_NULL_HANDLE)
+    next.FreeMemory(device, own, NULL);
   return result;
 }
 
 static VkResult bind_image_memory2(PFN_vkBindImageMemory2 down, VkDevice device, uint32_t count,
                                    const VkBindImageMemoryInfo *infos) {
-  VkResult result = down(device, count, infos);
-  for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) bound(infos[i].image, infos[i].memory);
+  if (!count) return down(device, count, infos);
+  VkBindImageMemoryInfo copy[count];
+  VkDeviceMemory own[count];
+  for (uint32_t i = 0; i < count; i++) {
+    copy[i] = infos[i];
+    copy[i].memory = memory_to_bind(device, infos[i].image, infos[i].memory, &own[i]);
+    if (own[i] != VK_NULL_HANDLE) copy[i].memoryOffset = 0;
+  }
+  VkResult result = down(device, count, copy);
+  for (uint32_t i = 0; i < count; i++) {
+    if (result == VK_SUCCESS)
+      bound(infos[i].image, infos[i].memory, own[i]);
+    else if (own[i] != VK_NULL_HANDLE)
+      next.FreeMemory(device, own[i], NULL);
+  }
   return result;
 }
 
@@ -2244,6 +2337,8 @@ static PFN_vkCreateInstance g_create_instance;
 static VkResult VKAPI_CALL prism_CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator,
                                                 VkInstance *instance) {
   VkResult result = g_create_instance(info, allocator, instance);
+  if (result == VK_SUCCESS)
+    LOGI("instance %p: API %#x", (void *)*instance, info->pApplicationInfo ? info->pApplicationInfo->apiVersion : 0);
   if (result == VK_SUCCESS) {
     next.GetPhysicalDeviceProperties =
         (PFN_vkGetPhysicalDeviceProperties)next.GetInstanceProcAddr(*instance, "vkGetPhysicalDeviceProperties");

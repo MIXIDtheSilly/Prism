@@ -98,17 +98,22 @@ python tools\emulator.py status
 - **Layered and sRGB images.** gralloc here makes single-layer buffers in a few formats only, and
   gfxstream can't export an sRGB image at all. A shared sRGB image is its UNORM twin, created
   mutable so its views stay sRGB. Multiview swapchains (two layers, such as VrShell's eye buffers,
-  1440x1584) can't share memory at all: the host aliases a color buffer's memory only for an image
-  of the buffer's own shape. Each process keeps its own copy of such an image, and they share a
-  mirror: a single-layer buffer as wide as the image and as tall as its layers stacked, which is
-  what the image's fd carries. Prism follows what command buffers do to these images (render
+  1440x1584) can't share memory directly: memory imported from a color buffer is that buffer's
+  memory on the host, laid out for the buffer's own shape, so a layered image bound there shares
+  its first layer and scrambles the rest. Each process keeps its own copy of such an image, in
+  memory of its own, and they share a mirror: a single-layer buffer as wide as the image and as
+  tall as its layers stacked, which is what the image's fd carries. Prism follows what command buffers do to these images (render
   passes, barriers, transfers, bound descriptor sets, layouts) and, at `vkQueueSubmit`, ends a batch
   that writes one with a copy into its mirror, and begins a batch that only reads one with a copy
   out of it, after the semaphores the batch waits for. The compositor imports the memory of each
   swapchain image it exports and binds a second image to it, which it samples without barriers in
-  the layout its descriptors name; that image gets the mirror the imported buffer holds. VrShell's
-  home environment reaches the compositor this way. `setprop debug.prism.vk.dump N` (read when a
-  device is created) writes layer 0 of every Nth copied image to `/data/local/tmp/prism_*.rgba`.
+  the layout its descriptors name; that image is bound to memory of its own instead and gets the
+  mirror the imported buffer holds. `setprop debug.prism.vk.dump N` (read live) writes every Nth
+  copied image, its layers one under another, to `/data/local/tmp/prism_*.rgba`.
+- **Multiview.** VrShell's renderer draws both eyes in one multiview pass only if the device lists
+  `VK_KHR_multiview`; otherwise it draws one view, into the left eye's layer. Multiview is core
+  since Vulkan 1.1 and gfxstream doesn't list it, so Prism's driver does (and other extensions
+  promoted to core that Meta's code looks for by name, such as `VK_KHR_driver_properties`).
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
@@ -154,6 +159,8 @@ python tools\emulator.py status
   rendering enabled: it creates and imports its swapchains through Prism's Vulkan driver. Horizon's
   first-time setup (`FirstTimeNuxActivity`, the controller-batteries step) shows in the emulator
   window as a 2D panel.
-- **Next:** the compositor's own output in the window (frames VrShell submits), head tracking, and
+- **Home in the window.** The compositor composites VrShell's frames: its home environment shows
+  in the emulator window in stereo, both eyes side by side, seen from a still head at the origin.
+- **Next:** head tracking from the PC's input, VrShell's panels and the Universal Menu, and
   the services still crash-looping: `com.oculus.os.cm` (a null pointer in its sensor client) and
   `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).

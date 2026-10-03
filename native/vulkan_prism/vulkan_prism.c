@@ -12,9 +12,10 @@
 //   * importing such an fd receives the AHardwareBuffer from it and imports that.
 //
 // An exported fd is good for one import, as Vulkan's are (importing transfers its ownership).
-// gralloc here makes only single-layer buffers, and the host takes only single-layer images for
-// them, so a layered image (the compositor's multiview swapchains) is a plain image whose memory is a
-// tall single-layer buffer Prism allocates: every process binds its own image of the same shape to it.
+// gralloc here makes only single-layer buffers in a few formats, and the host takes only images of
+// those for them. Any other image (the compositor's multiview swapchains, sRGB ones) is a plain image
+// whose memory is a tall single-layer RGBA8 buffer Prism allocates: every process binds its own image
+// of the same shape to it.
 //
 // gfxstream also leaves out the names of some extensions that later Vulkan versions made core
 // (VK_KHR_16bit_storage, ...), which Meta's apps still ask for by name. Prism lists those the
@@ -352,25 +353,47 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
 
 // --- device --------------------------------------------------------------------------------------
 
-// Opaque-fd images with more than one layer (the compositor's multiview swapchains). gralloc here
-// has no layered buffers, so their memory is a plain blob AHardwareBuffer of the allocation's size,
-// not one shaped like the image: the dedicated-allocation link to the image is dropped.
-#define MAX_LAYERED 256
-static VkImage g_layered[MAX_LAYERED];
-static pthread_mutex_t g_layered_lock = PTHREAD_MUTEX_INITIALIZER;
+// Opaque-fd images no AHardwareBuffer can hold: more than one layer (the compositor's multiview
+// swapchains; gralloc here has no layered buffers), or a format without an AHardwareBuffer one
+// (gfxstream fails exporting an sRGB image). Their memory is a buffer of the allocation's size, not
+// one shaped like the image: the dedicated-allocation link to the image is dropped.
+#define MAX_BACKED 256
+static VkImage g_backed[MAX_BACKED];
+static pthread_mutex_t g_backed_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int layered_image(VkImage image, int add, int remove) {
+static int backed_image(VkImage image, int add, int remove) {
   int found = 0;
-  pthread_mutex_lock(&g_layered_lock);
-  for (int i = 0; i < MAX_LAYERED && !found; i++) {
-    if (g_layered[i] != image) continue;
+  pthread_mutex_lock(&g_backed_lock);
+  for (int i = 0; i < MAX_BACKED && !found; i++) {
+    if (g_backed[i] != image) continue;
     found = 1;
-    if (remove) g_layered[i] = VK_NULL_HANDLE;
+    if (remove) g_backed[i] = VK_NULL_HANDLE;
   }
-  for (int i = 0; add && !found && i < MAX_LAYERED; i++)
-    if (g_layered[i] == VK_NULL_HANDLE) g_layered[i] = image, found = 1;
-  pthread_mutex_unlock(&g_layered_lock);
+  for (int i = 0; add && !found && i < MAX_BACKED; i++)
+    if (g_backed[i] == VK_NULL_HANDLE) g_backed[i] = image, found = 1;
+  pthread_mutex_unlock(&g_backed_lock);
   return found;
+}
+
+// The formats with an AHardwareBuffer equivalent (AHardwareBuffer_Format).
+static int ahb_format(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8_UNORM:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+    case VK_FORMAT_S8_UINT:
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreateInfo *info,
@@ -379,19 +402,20 @@ static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreat
   if (!external || !(external->handleTypes & OPAQUE_FD)) return next.CreateImage(device, info, allocator, image);
   VkImageCreateInfo copy = *info;
   VkExternalMemoryImageCreateInfo ahb = *external;
-  // The host accepts only single-layer AHardwareBuffer images; a layered one is a plain image whose
-  // memory comes from a shared buffer all the same (see prism_AllocateMemory).
-  ahb.handleTypes = info->arrayLayers > 1 ? external->handleTypes & ~(VkExternalMemoryHandleTypeFlags)OPAQUE_FD
-                                          : as_ahb(external->handleTypes);
+  // The host accepts only single-layer AHardwareBuffer images of AHardwareBuffer formats; any other
+  // is a plain image whose memory comes from a shared buffer all the same (see prism_AllocateMemory).
+  int backed = info->arrayLayers > 1 || !ahb_format(info->format);
+  ahb.handleTypes = backed ? external->handleTypes & ~(VkExternalMemoryHandleTypeFlags)OPAQUE_FD
+                           : as_ahb(external->handleTypes);
   Scratch scratch = {.used = 0};
   replace_in_chain(&copy, &ahb, &scratch);
   VkResult result = next.CreateImage(device, &copy, allocator, image);
-  if (result == VK_SUCCESS && info->arrayLayers > 1) layered_image(*image, 1, 0);
+  if (result == VK_SUCCESS && backed) backed_image(*image, 1, 0);
   return result;
 }
 
 static void VKAPI_CALL prism_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *allocator) {
-  if (image != VK_NULL_HANDLE) layered_image(image, 0, 1);
+  if (image != VK_NULL_HANDLE) backed_image(image, 0, 1);
   next.DestroyImage(device, image, allocator);
 }
 
@@ -408,7 +432,7 @@ static VkResult VKAPI_CALL prism_CreateBuffer(VkDevice device, const VkBufferCre
 }
 
 // A single-layer color buffer of at least size bytes: what gralloc here can share. Memory for a
-// layered image lives in one; every process binds its own image of the same shape to that memory.
+// backed image lives in one; every process binds its own image of the same shape to that memory.
 static AHardwareBuffer *buffer_of_size(VkDeviceSize size) {
   const uint32_t width = 1024;  // RGBA8: 4 KiB a row
   AHardwareBuffer_Desc desc = {width, (uint32_t)((size + width * 4 - 1) / (width * 4)), 1,
@@ -417,13 +441,13 @@ static AHardwareBuffer *buffer_of_size(VkDeviceSize size) {
                                0, 0, 0};
   AHardwareBuffer *buffer = NULL;
   if (AHardwareBuffer_allocate(&desc, &buffer)) {
-    LOGE("no %u x %u buffer for a layered image's %llu bytes", desc.width, desc.height, (unsigned long long)size);
+    LOGE("no %u x %u buffer for an image's %llu bytes", desc.width, desc.height, (unsigned long long)size);
     return NULL;
   }
   return buffer;
 }
 
-// Memory backed by a buffer Prism allocated (layered images): the driver exports only buffers it
+// Memory backed by a buffer Prism allocated (backed images): the driver exports only buffers it
 // allocated itself, so Prism keeps these for vkGetMemoryFdKHR.
 #define MAX_OWN 256
 static struct {
@@ -433,7 +457,7 @@ static struct {
 
 static AHardwareBuffer *own_buffer(VkDeviceMemory memory, AHardwareBuffer *add, int remove) {
   AHardwareBuffer *found = NULL;
-  pthread_mutex_lock(&g_layered_lock);
+  pthread_mutex_lock(&g_backed_lock);
   for (int i = 0; i < MAX_OWN && !found; i++) {
     if (g_own[i].memory != memory || !g_own[i].buffer) continue;
     found = g_own[i].buffer;
@@ -444,7 +468,7 @@ static AHardwareBuffer *own_buffer(VkDeviceMemory memory, AHardwareBuffer *add, 
     AHardwareBuffer_acquire(add);
     g_own[i].memory = memory, g_own[i].buffer = found = add;
   }
-  pthread_mutex_unlock(&g_layered_lock);
+  pthread_mutex_unlock(&g_backed_lock);
   return found;
 }
 
@@ -477,7 +501,7 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
   if (!exporting && !importing) return next.AllocateMemory(device, info, allocator, memory);
 
   const VkMemoryDedicatedAllocateInfo *dedicated = find_in(info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
-  int layered = dedicated && dedicated->image != VK_NULL_HANDLE && layered_image(dedicated->image, 0, 0);
+  int backed = dedicated && dedicated->image != VK_NULL_HANDLE && backed_image(dedicated->image, 0, 0);
   VkMemoryAllocateInfo copy = *info;
   Scratch scratch = {.used = 0};
   VkExportMemoryAllocateInfo export_ahb;
@@ -491,7 +515,7 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
     LOGE("fd %d holds no AHardwareBuffer; only memory exported by Prism's driver can be imported", import->fd);
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
   }
-  if (!importing && layered) {
+  if (!importing && backed) {
     // Prism's own buffer, imported: the driver shouldn't allocate one to export as well.
     if (!(buffer = buffer_of_size(info->allocationSize))) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     export_ahb.handleTypes &= ~(VkExternalMemoryHandleTypeFlags)AHB;
@@ -512,15 +536,15 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
     import_ahb.buffer = buffer;
     replace_in_chain(&copy, &import_ahb, &scratch);
   }
-  // The buffer isn't shaped like a layered image. The driver imports color buffers only for an
-  // image of their shape, so the memory is dedicated to a stand-in of that shape, and the layered
+  // The buffer isn't shaped like a backed image. The driver imports color buffers only for an
+  // image of their shape, so the memory is dedicated to a stand-in of that shape, and the backed
   // image is bound to it afterwards.
   VkMemoryDedicatedAllocateInfo stand_in = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
-  if (layered && buffer && (stand_in.image = buffer_image(device, buffer)) != VK_NULL_HANDLE)
+  if (backed && buffer && (stand_in.image = buffer_image(device, buffer)) != VK_NULL_HANDLE)
     replace_in_chain(&copy, &stand_in, &scratch);
   VkResult result = next.AllocateMemory(device, &copy, allocator, memory);
   if (stand_in.image != VK_NULL_HANDLE) next.DestroyImage(device, stand_in.image, NULL);  // the memory stays
-  if (result == VK_SUCCESS && layered && buffer) own_buffer(*memory, buffer, 0);
+  if (result == VK_SUCCESS && backed && buffer) own_buffer(*memory, buffer, 0);
   if (buffer) AHardwareBuffer_release(buffer);  // the memory holds its own reference
   if (importing && result == VK_SUCCESS) close(import->fd);  // a successful import owns the fd
   return result;

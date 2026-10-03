@@ -443,7 +443,7 @@ def build(args):
               '# Apps render only while the headset is worn. There is no proximity sensor, so Prism tells',
               '# VrPowerManagerService the headset is on (its virtual proximity, a developer setting).',
               'on property:sys.boot_completed=1',
-              '    exec_background - system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close']
+              f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())
 
     # Identity and Meta properties, appended to the stock product build.prop.

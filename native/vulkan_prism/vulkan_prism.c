@@ -16,9 +16,11 @@
 // buffer is queued in the socket EXPORT_COPIES times, one for each import; copies nobody reads go
 // when the socket's last fd is closed.
 // gralloc here makes only single-layer buffers in a few formats, and the host takes only images of
-// those for them. Any other image (the compositor's multiview swapchains, sRGB ones) is a plain image
-// whose memory is a tall single-layer RGBA8 buffer Prism allocates: every process binds its own image
-// of the same shape to it.
+// those for them. An sRGB image is its UNORM twin, created mutable so its views keep their sRGB
+// format. Any other image (multiview swapchains: two layers) is a plain image whose memory is a tall
+// single-layer RGBA8 buffer Prism allocates, which every process binds its own image of the same
+// shape to; but the host aliases a color buffer's memory only for an image of its own shape, so
+// those images' contents aren't shared yet.
 //
 // gfxstream also leaves out the names of some extensions that later Vulkan versions made core
 // (VK_KHR_16bit_storage, ...), which Meta's apps still ask for by name. Prism lists those the
@@ -399,21 +401,53 @@ static int ahb_format(VkFormat format) {
   }
 }
 
+// sRGB formats whose UNORM twin has an AHardwareBuffer format (VK_FORMAT_UNDEFINED for others).
+static VkFormat unorm_twin(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_R8G8B8_SRGB: return VK_FORMAT_R8G8B8_UNORM;
+    default: return VK_FORMAT_UNDEFINED;
+  }
+}
+
+#define MAX_VIEW_FORMATS 16
+
 static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreateInfo *info,
                                              const VkAllocationCallbacks *allocator, VkImage *image) {
   const VkExternalMemoryImageCreateInfo *external = find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
   if (!external || !(external->handleTypes & OPAQUE_FD)) return next.CreateImage(device, info, allocator, image);
   VkImageCreateInfo copy = *info;
   VkExternalMemoryImageCreateInfo ahb = *external;
+  Scratch scratch = {.used = 0};
+  // gfxstream exports no sRGB image, but shares an sRGB image's UNORM twin, which can have sRGB
+  // views if it's created mutable: views keep the format they ask for, so sampling and rendering
+  // still convert.
+  VkFormat twin = info->arrayLayers == 1 ? unorm_twin(info->format) : VK_FORMAT_UNDEFINED;
+  VkFormat formats[MAX_VIEW_FORMATS];
+  VkImageFormatListCreateInfo list = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 0, formats};
+  if (twin != VK_FORMAT_UNDEFINED) {
+    const VkImageFormatListCreateInfo *asked = find_in(info, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    formats[list.viewFormatCount++] = twin;
+    formats[list.viewFormatCount++] = info->format;
+    for (uint32_t i = 0; asked && i < asked->viewFormatCount && list.viewFormatCount < MAX_VIEW_FORMATS; i++)
+      if (asked->pViewFormats[i] != twin && asked->pViewFormats[i] != info->format)
+        formats[list.viewFormatCount++] = asked->pViewFormats[i];
+    copy.format = twin;
+    copy.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    replace_in_chain(&copy, &list, &scratch);
+  }
   // The host accepts only single-layer AHardwareBuffer images of AHardwareBuffer formats; any other
   // is a plain image whose memory comes from a shared buffer all the same (see prism_AllocateMemory).
-  int backed = info->arrayLayers > 1 || !ahb_format(info->format);
+  int backed = copy.arrayLayers > 1 || !ahb_format(copy.format);
   ahb.handleTypes = backed ? external->handleTypes & ~(VkExternalMemoryHandleTypeFlags)OPAQUE_FD
                            : as_ahb(external->handleTypes);
-  Scratch scratch = {.used = 0};
   replace_in_chain(&copy, &ahb, &scratch);
   VkResult result = next.CreateImage(device, &copy, allocator, image);
-  if (result == VK_SUCCESS && backed) backed_image(*image, 1, 0);
+  if (result == VK_SUCCESS && backed) {
+    backed_image(*image, 1, 0);
+    LOGI("image %p: %ux%u, %u layers, format %d: backed (its memory isn't shared)", (void *)*image,
+         info->extent.width, info->extent.height, info->arrayLayers, info->format);
+  }
   return result;
 }
 

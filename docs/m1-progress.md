@@ -96,9 +96,12 @@ python tools\emulator.py status
   code whose opens reach the host through the translator's `open`, `openat` and `syscall` imports;
   `libprism_jni` wraps those and hands it Horizon's arm64 copy from `GUEST_DIR`.
 - **Layered and sRGB images.** gralloc here makes single-layer buffers in a few formats only, and
-  gfxstream can't export an sRGB image at all. Opaque-fd images that no AHardwareBuffer can hold
-  (the compositor's multiview swapchains, VrShell's sRGB ones) get memory from a tall RGBA8 buffer
-  Prism allocates, imported through a stand-in image of the buffer's shape.
+  gfxstream can't export an sRGB image at all. A shared sRGB image is its UNORM twin, created
+  mutable so its views stay sRGB. Multiview swapchains (two layers) get memory from a tall RGBA8
+  buffer Prism allocates, imported through a stand-in image of the buffer's shape; that lets them be
+  created and imported, but the host aliases a color buffer's memory only for an image of its own
+  shape, so their contents don't reach the other process yet. VrShell renders everything it shows
+  into such a swapchain (its eye buffers, 1440x1584, two layers).
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.

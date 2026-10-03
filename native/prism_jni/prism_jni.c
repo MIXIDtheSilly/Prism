@@ -18,6 +18,7 @@
 // Stubs log once per method and return 0 / null / false. Natives Prism emulates (PRISM_HLE, see
 // prism_hle.h) are registered with their implementation instead.
 
+#include "prism_guest.h"
 #include "prism_hle.h"
 
 #include <android/log.h>
@@ -141,6 +142,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
 #include <dlfcn.h>
 #include <link.h>
 #include <stdint.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // ---- SurfaceTexture: Horizon added a boolean to nativeInit and two longs to nativeUpdateTexImage.
 // Forward to the stock implementations, captured when stock libandroid_runtime registers them.
@@ -199,9 +202,10 @@ typedef struct {  // libnativebridge's NativeBridgeCallbacks, version 8
   _Bool (*is_native_bridge_function_pointer)(const void *method);
 } NativeBridgeCallbacks;
 
-enum { kJNICallTypeRegular = 1 };
+enum { kJNICallTypeRegular = 1, kJNICallTypeCriticalNative = 2 };
 
 static void *find_symbol(const void *base, const char *name);
+static void hook_translator_dlsym(const struct dl_phdr_info *info);
 static const NativeBridgeCallbacks *g_bridge;
 
 static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
@@ -212,10 +216,68 @@ static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
     if (info->dlpi_phdr[i].p_type != PT_LOAD || info->dlpi_phdr[i].p_offset != 0) continue;
     const NativeBridgeCallbacks *itf =
         find_symbol((const void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr), "NativeBridgeItf");
-    if (itf && itf->version >= 8) g_bridge = itf;
+    if (!itf || itf->version < 8) return 0;  // another of the translator's libraries
+    g_bridge = itf;
+    hook_translator_dlsym(info);
     return 1;
   }
   return 0;
+}
+
+// ---- x86_64 functions arm64 code calls. The translator binds each one (eglCreateWindowSurface,
+// ANativeWindow_acquire, ...) with dlsym on the real library, so Prism wraps the translator's own
+// dlsym import and swaps in its replacements (prism_window_function).
+typedef void *(*LoaderDlsym)(void *, const char *, const void *);
+static void *(*g_dlsym)(void *, const char *);
+static LoaderDlsym g_loader_dlsym;
+
+static void *translator_dlsym(void *handle, const char *name) {
+  // dlsym looks RTLD_DEFAULT and RTLD_NEXT up from its caller; keep that the translator.
+  void *symbol = g_loader_dlsym ? g_loader_dlsym(handle, name, __builtin_return_address(0)) : g_dlsym(handle, name);
+  void *own = symbol && name ? prism_window_function(name, symbol) : NULL;
+  return own ? own : symbol;
+}
+
+static void hook_translator_dlsym(const struct dl_phdr_info *info) {
+  const ElfW(Dyn) *dyn = NULL;
+  for (int i = 0; i < info->dlpi_phnum; i++)
+    if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+  const ElfW(Sym) *symtab = NULL;
+  const char *strtab = NULL;
+  const ElfW(Rela) *tables[2] = {NULL, NULL};
+  size_t sizes[2] = {0, 0};
+  for (; dyn && dyn->d_tag != DT_NULL; dyn++) {
+    uintptr_t p = info->dlpi_addr + dyn->d_un.d_ptr;
+    if (dyn->d_tag == DT_SYMTAB) symtab = (const ElfW(Sym) *)p;
+    if (dyn->d_tag == DT_STRTAB) strtab = (const char *)p;
+    if (dyn->d_tag == DT_JMPREL) tables[0] = (const ElfW(Rela) *)p;
+    if (dyn->d_tag == DT_PLTRELSZ) sizes[0] = dyn->d_un.d_val;
+    if (dyn->d_tag == DT_RELA) tables[1] = (const ElfW(Rela) *)p;
+    if (dyn->d_tag == DT_RELASZ) sizes[1] = dyn->d_un.d_val;
+  }
+  if (!symtab || !strtab) return;
+  for (int t = 0; t < 2; t++) {
+    for (size_t i = 0; tables[t] && i < sizes[t] / sizeof(ElfW(Rela)); i++) {
+      const ElfW(Rela) *r = &tables[t][i];
+      uint32_t type = ELF64_R_TYPE(r->r_info);
+      if ((type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) ||
+          strcmp(strtab + symtab[ELF64_R_SYM(r->r_info)].st_name, "dlsym") != 0)
+        continue;
+      void **slot = (void **)(info->dlpi_addr + r->r_offset);
+      if (*slot == (void *)translator_dlsym) return;
+      uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(getpagesize() - 1);
+      if (mprotect((void *)page, (size_t)getpagesize(), PROT_READ | PROT_WRITE)) {
+        LOGW("translator's dlsym: can't write its slot");
+        return;
+      }
+      g_loader_dlsym = (LoaderDlsym)dlsym(RTLD_DEFAULT, "__loader_dlsym");
+      g_dlsym = *slot;
+      *slot = (void *)translator_dlsym;
+      mprotect((void *)page, (size_t)getpagesize(), PROT_READ);
+      LOGI("translator's dlsym wrapped (%s)", info->dlpi_name);
+      return;
+    }
+  }
 }
 
 // "(ILjava/lang/String;[B)V" -> "VILL"
@@ -235,12 +297,23 @@ static int shorty_of(const char *sig, char *out, size_t size) {
   return 1;
 }
 
+int prism_is_guest_code(const void *fn) {
+  Dl_info info;
+  if (!fn || dladdr(fn, &info)) return 0;  // the host linker knows it: host code
+  if (!g_bridge) dl_iterate_phdr(find_bridge, NULL);
+  return g_bridge && g_bridge->is_native_bridge_function_pointer(fn);
+}
+
+void *prism_guest_function(void *fn, const char *shorty) {
+  if (!prism_is_guest_code(fn)) return NULL;
+  // A critical native's arguments are exactly its shorty's: no JNIEnv or class in front.
+  return g_bridge->get_trampoline_for_function_pointer(fn, shorty, (uint32_t)strlen(shorty),
+                                                        kJNICallTypeCriticalNative);
+}
+
 // The function to register for fn: fn itself, or a trampoline if it is guest (arm64) code.
 static void *host_callable(void *fn, const char *sig) {
-  Dl_info info;
-  if (!fn || dladdr(fn, &info)) return fn;  // the host linker knows it: host code
-  if (!g_bridge) dl_iterate_phdr(find_bridge, NULL);
-  if (!g_bridge || !g_bridge->is_native_bridge_function_pointer(fn)) return fn;
+  if (!prism_is_guest_code(fn)) return fn;
   char shorty[256];
   if (!shorty_of(sig, shorty, sizeof shorty)) return fn;
   void *trampoline = g_bridge->get_trampoline_for_function_pointer(fn, shorty, (uint32_t)strlen(shorty),
@@ -378,6 +451,7 @@ static void install(JNIEnv *env) {
   g_table.RegisterNatives = prism_register_natives;
   set_override(&g_table);
   LOGI("JNI table override installed (%s)", info.dli_fname);
+  dl_iterate_phdr(find_bridge, NULL);  // the translator is loaded with the VM; wrap its dlsym now
   register_classes(env, NULL, 1);
 }
 

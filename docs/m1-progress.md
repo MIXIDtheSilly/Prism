@@ -69,7 +69,16 @@ python tools\emulator.py status
   backs opaque fds with them: OPAQUE_FD images, buffers and allocations become AHardwareBuffer
   ones, `vkGetMemoryFdKHR` returns a Unix socket with the memory's AHardwareBuffer queued in it,
   and importing that fd receives the buffer and imports it. Fences and semaphores already export
-  as sync fds.
+  as sync fds. Two of Meta's switches fit the compositor to the emulator: GL contexts get pbuffers
+  (`persist.oculus.forceGLESContextBuffer`; the emulator's EGL has no surfaceless contexts), and
+  its output surface comes from SurfaceFlinger rather than the headset's display path
+  (`persist.oculus.strata.disable`).
+- **arm64 windows** ([guest_window.c](../native/prism_jni/guest_window.c)). The compositor creates
+  that surface with Horizon's arm64 libgui and hands it to x86_64 EGL, which would call its arm64
+  hooks directly. The translator binds the x86_64 functions arm64 code calls with `dlsym`;
+  `libprism_jni` wraps that import in the translator and swaps in its own `eglCreateWindowSurface`
+  and `ANativeWindow_*`. They give EGL an x86_64 stand-in for an arm64 window: a layer of the same
+  size created through Java's `SurfaceControl`, shown on top.
 
 - **Mainline modules.** Stock's APEXes stay, except pure-Java ones whose newer APIs Horizon's
   framework needs (`HORIZON_APEXES` in deploy.py); those are Horizon's own: configinfrastructure
@@ -91,9 +100,9 @@ python tools\emulator.py status
   VrDriver's `vrruntimeservice` registers its RuntimeIPC servers; VrShell's client state
   initializes. Meta's libraries that are dlopened by absolute path (`/system_ext/lib64/...`) are
   linked there to their `GUEST_DIR` copies.
-- **Next: the compositor.** Meta's `CompositorServer` runs translated, and its Vulkan instance sees
-  the PC's GPU through the emulator (an RTX 3080 at Vulkan 1.3). It aborts because the emulator's
-  Vulkan driver lacks one required device extension, `VK_KHR_external_memory_fd`; the compositor
-  shares memory and fences with other processes as file descriptors (`vkGetMemoryFdKHR`,
-  `vkGetFenceFdKHR`). Other apps still wait on the headset's hardware layers (`vrdevice`,
-  `OVRRemoteService`, the maintenance-boot HAL).
+- **The compositor initializes.** Meta's `CompositorServer` runs translated with Vulkan and GL on
+  the PC's GPU (an RTX 3080 through the emulator), builds its distortion meshes and timing, and
+  waits for its first client, drawing to a Prism layer on the emulator's display. It has no
+  display state provider (vsync comes from its fallback timing).
+- **Next:** clients for the compositor (VrShell), head tracking, and the headset's other hardware
+  layers apps wait on (`vrdevice`, `OVRRemoteService`, sensors, the maintenance-boot HAL).

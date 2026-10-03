@@ -122,9 +122,10 @@ python tools\emulator.py status
   system_server hosts on a headset from an arm64 JNI library; a headset's trackingservice fills
   them from its cameras and IMU. Prism's tracking service, an arm64 daemon, hosts the broker
   (`memorybroker::registerService()`) and, in a second process, registers as the head tracker's
-  host and keeps a headset sitting still at the origin in that region (a mode in which readers
-  take the latest pose as of the time they ask). The compositor and VrShell read it with Meta's
-  own client code.
+  host and keeps the headset's pose in that region (a mode in which readers take the latest pose
+  as of the time they ask): still at the origin, or moved from the PC by `tools/head.py`, a window
+  whose mouse and keys stream poses to the service through `adb forward`. The compositor and
+  VrShell read it with Meta's own client code.
 - **Wearing the headset.** VrPowerManagerService (declared in VINTF so servicemanager registers it)
   puts Horizon to sleep 15 s after boot unless the headset is worn; `prism.rc` sets its virtual
   proximity sensor to "close" once boot completes.
@@ -160,7 +161,8 @@ python tools\emulator.py status
   first-time setup (`FirstTimeNuxActivity`, the controller-batteries step) shows in the emulator
   window as a 2D panel.
 - **Home in the window.** The compositor composites VrShell's frames: its home environment shows
-  in the emulator window in stereo, both eyes side by side, seen from a still head at the origin.
-- **Next:** head tracking from the PC's input, VrShell's panels and the Universal Menu, and
+  in the emulator window in stereo, both eyes side by side, and `python tools\head.py` looks and
+  moves around it with the mouse and keyboard.
+- **Next:** VrShell's panels and the Universal Menu, controller input, and
   the services still crash-looping: `com.oculus.os.cm` (a null pointer in its sensor client) and
   `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).

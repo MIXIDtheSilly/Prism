@@ -52,6 +52,8 @@ tools/jni/            Builds Prism's JNI glue for the user's Horizon build
 tools/compat.py       Compatibility patches in Horizon's framework jars (via smali)
 tools/translator.py   Adapts the Digitalis ARM64 translator to Prism's Android 14 base
 tools/vulkan.py       Builds Prism's Vulkan driver (wraps the emulator's)
+tools/tracking.py     Builds Prism's tracking service (Meta's MemoryBroker, the head pose)
+tools/head.py         Moves the headset from the PC: mouse and keys drive the head pose
 tools/deploy.py       Puts Horizon's layer onto the emulator
 native/prism_jni/     JNI glue between Horizon's Java and stock native code
 native/berberis_compat/  Symbols the Android 16 translator build needs from Android 14

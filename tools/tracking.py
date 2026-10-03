@@ -31,7 +31,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     out = os.path.join(args.out, BINARY)
     subprocess.run([clang, f'--target=aarch64-linux-android{API}', '-fPIE', '-pie', '-O2', '-std=c11', '-Wall',
-                    SOURCE, '-o', out, '-llog', '-ldl', '-Wl,--build-id=sha1'], check=True)
+                    SOURCE, '-o', out, '-llog', '-ldl', '-lm', '-Wl,--build-id=sha1'], check=True)
     print(f'built {out}')
 
 

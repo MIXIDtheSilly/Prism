@@ -7,8 +7,10 @@
  * broker, loading Meta's arm64 libmemorybroker.so from a JNI library; system_server is x86_64
  * here, so this arm64 daemon (run by the translator) hosts it instead (`prism_tracking broker`).
  * In a second process (`prism_tracking host`) it registers with the broker as the host of the
- * head tracker's region, as trackingservice does, and keeps a headset that sits still at the
- * tracking origin in it.
+ * head tracker's region, as trackingservice does, and keeps the headset's pose in it: still at the
+ * tracking origin, until a client on the PC moves it (tools/head.py, through `adb forward` to
+ * POSE_PORT: lines of seven numbers, the position in meters and the orientation quaternion,
+ * px py pz qx qy qz qw, in OpenXR's axes, Y up and -Z ahead).
  *
  * The head tracker's region (libtrackingserviceclients' HeadTrackerSharedMemory, 0x1680 bytes):
  *   0x0000  the latest state: two sequence words, then two copies of HeadState (seqlock)
@@ -22,12 +24,17 @@
  * The binder thread-pool calls are platform APIs the NDK doesn't declare, so they're looked up.
  */
 #include <android/log.h>
+#include <arpa/inet.h>
 #include <dlfcn.h>
+#include <math.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -74,9 +81,11 @@ struct seqlock {
 #define MODE 0x1588
 #define MODE_LATEST 1
 #define RATE_HZ 100
+#define POSE_PORT 7340  // on the guest's loopback
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;  // the region can move under the writer
 static uint8_t *g_region;
+static float g_position[3], g_orientation[4] = {0, 0, 0, 1};  // the head's pose
 
 static int64_t now_ns(void) {
   struct timespec ts;
@@ -96,9 +105,10 @@ static void publish(uint8_t *at, const void *value, size_t size, size_t stride) 
 static void publish_head(uint8_t *region) {
   struct head_state state = {
       .valid = 1,
-      .orientation = {0, 0, 0, 1},
       .reference_orientation = {0, 0, 0, 1},
   };
+  memcpy(state.orientation, g_orientation, sizeof g_orientation);
+  memcpy(state.position, g_position, sizeof g_position);
   state.time_ns = state.sample_time_ns = now_ns();
   publish(region + LATEST, &state, sizeof state, sizeof state);
 }
@@ -114,6 +124,38 @@ static void region_ready(void *context, void *memory) {
   g_region = region;
   pthread_mutex_unlock(&g_lock);
   LOG("head tracker region at %p", memory);
+}
+
+// Reads poses from one client at a time; the last one stays when it goes.
+static void *serve_poses(void *unused) {
+  (void)unused;
+  int server = socket(AF_INET, SOCK_STREAM, 0);
+  int on = 1;
+  setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+  struct sockaddr_in at = {.sin_family = AF_INET, .sin_port = htons(POSE_PORT), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  if (server < 0 || bind(server, (struct sockaddr *)&at, sizeof at) || listen(server, 1)) {
+    ERR("no pose port %d", POSE_PORT);
+    return NULL;
+  }
+  for (;;) {
+    int client = accept(server, NULL, NULL);
+    FILE *in = client >= 0 ? fdopen(client, "r") : NULL;
+    if (!in) continue;
+    LOG("pose client connected");
+    char line[256];
+    while (fgets(line, sizeof line, in)) {
+      float p[3], q[4];
+      if (sscanf(line, "%f %f %f %f %f %f %f", &p[0], &p[1], &p[2], &q[0], &q[1], &q[2], &q[3]) != 7) continue;
+      float norm = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+      if (!(norm > 0.5f && norm < 2)) continue;
+      pthread_mutex_lock(&g_lock);
+      memcpy(g_position, p, sizeof p);
+      for (int i = 0; i < 4; i++) g_orientation[i] = q[i] / norm;
+      pthread_mutex_unlock(&g_lock);
+    }
+    fclose(in);
+    LOG("pose client gone");
+  }
 }
 
 static void *open_symbol(const char *lib, const char *name) {
@@ -155,6 +197,8 @@ static int run_host(void) {
     ERR("can't register the head tracker region");
     return 1;
   }
+  pthread_t poses;
+  pthread_create(&poses, NULL, serve_poses, NULL);
   for (;;) {
     pthread_mutex_lock(&g_lock);
     if (g_region) publish_head(g_region);

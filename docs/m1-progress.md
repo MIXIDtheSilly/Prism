@@ -168,6 +168,13 @@ python tools\emulator.py status
 - **Known issue: the emulator sometimes dies silently** (no crash report), most often during a
   reboot. At those times Windows logs a LiveKernelEvent 141, a GPU engine timeout that it resets:
   host Vulkan work from the guest hung the GPU. Killing VrShell mid-frame alone doesn't do it.
+- **Panels don't show yet.** VrShell places panels (first-time setup, for one) but their content
+  never arrives. On a headset it comes from SurfaceFlinger itself: Horizon's SurfaceFlinger
+  (`libxrsurfaceflinger.so`) runs an OpenXR session against Meta's runtime and submits each panel
+  window's buffers as composition layers (`XR_METAI_buffer_composition`: graphic buffers, no
+  swapchains), placed at its volumetric window's aperture (`XR_METAX1_aperture`, by window token).
+  The emulator's SurfaceFlinger is stock, so Prism needs that OpenXR client of its own, fed with
+  the panel windows' contents (captures or mirrors of their layers).
 - **Next:** VrShell's panels and the Universal Menu, controller input, and
   the services still crash-looping: `com.oculus.os.cm` (it needs Meta's controller HAL,
   `vendor.oculus.hardware.sensors@1.0::IControllerProvider`; until Prism serves it, Meta's

@@ -8,13 +8,15 @@ What goes where:
   * Prism's JNI glue goes to /system/lib64; zygote preloads libprism_jni.so.
   * Prism's Vulkan driver goes to /vendor/lib64/hw (ro.hardware.vulkan=prism).
   * Prism's thermal HAL goes to /vendor/bin/hw, with its init script and VINTF declaration.
+  * Prism's tracking service goes to /system_ext/bin, with its init script; it hosts Meta's
+    MemoryBroker, whose VINTF declaration goes with it.
   * Horizon's device identity and Meta properties go into /product/etc/build.prop.
 
 Package manager state and compiled code are reset, since the platform signature changes.
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
     python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
-    python tools/thermal.py
+    python tools/thermal.py && python tools/tracking.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -122,7 +124,7 @@ DATA_ROOT = '/data/prism'
 # libndk_translation: Horizon is built with ARMv8.1 atomics that the stock translator lacks.
 # Meta's native daemons run as arm64 binaries (binfmt_misc). Their libraries are Horizon's own
 # arm64 ones, in GUEST_DIR, except for the translator's bionic and host-proxy libraries. They come
-# from /system, then /system_ext, then Horizon's APEXes (ICU for one), flattened.
+# from /system, then /system_ext, then Horizon's APEXes (ICU for one), then /odm, flattened.
 GUEST_DIR = '/system/lib64/arm64/prism'  # also in tools/compat.py
 GUEST_SKIP_APEXES = {
     'com.android.runtime',  # bionic: the translator's
@@ -174,6 +176,32 @@ THERMAL_VINTF = '''<manifest version="1.0" type="device">
 </manifest>
 '''
 DAEMON_SECLABEL = 'u:r:su:s0'  # stock policy has no domains for Meta's daemons (SELinux is permissive)
+# Prism's tracking service (tools/tracking.py): Meta's MemoryBroker, which system_server hosts on a
+# headset, and the head tracker's shared memory, which trackingservice fills there. Two processes:
+# the broker refuses a host in its own process.
+TRACKING = 'prism_tracking'
+TRACKING_RC = f'''service prism_memorybroker /system_ext/bin/{TRACKING} broker
+    class main
+    user system
+    group system
+    seclabel {DAEMON_SECLABEL}
+
+service prism_tracking /system_ext/bin/{TRACKING} host
+    class main
+    user system
+    group system
+    seclabel {DAEMON_SECLABEL}
+'''
+# Horizon's declaration, without the native instance (trackingservice's own, which nothing serves
+# here: a declared service nobody serves makes clients wait for it).
+MEMORYBROKER_VINTF = '''<manifest version="1.0" type="framework">
+    <hal format="aidl" optional="true">
+        <name>oculus.internal.tracking</name>
+        <version>2</version>
+        <fqname>IMemoryBrokerService/default</fqname>
+    </hal>
+</manifest>
+'''
 
 
 def device_path(partition, path):
@@ -295,6 +323,9 @@ def build(args):
     thermal = os.path.join(args.thermal, THERMAL_HAL)
     if not os.path.exists(thermal):
         sys.exit(f'no thermal HAL in {args.thermal}; run: python tools/thermal.py')
+    tracking = os.path.join(args.tracking, TRACKING)
+    if not os.path.exists(tracking):
+        sys.exit(f'no tracking service in {args.tracking}; run: python tools/tracking.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -367,6 +398,7 @@ def build(args):
             except FileNotFoundError:
                 continue
             sources.append((fs, '/lib64'))
+    sources.append((odm, '/lib64'))  # Meta's tracking and sensor libraries
     taken = set(GUEST_TRANSLATOR)
     for fs, src in sources:  # the first source with a library wins
         data.add_tree(fs, src, f'{DATA_ROOT}/guest', taken, flat=True)
@@ -415,6 +447,13 @@ def build(args):
         overlay.add(f'/vendor/bin/hw/{THERMAL_HAL}', 'f', 0o755, gid=2000, data=f.read())
     overlay.add(f'/vendor/etc/init/{THERMAL_HAL}.rc', 'f', 0o644, data=THERMAL_RC.encode())
     overlay.add(f'/vendor/etc/vintf/manifest/{THERMAL_HAL}.xml', 'f', 0o644, data=THERMAL_VINTF.encode())
+
+    # Prism's tracking service.
+    with open(tracking, 'rb') as f:
+        overlay.add(f'/system_ext/bin/{TRACKING}', 'f', 0o755, gid=2000, data=f.read())
+    overlay.add(f'/system_ext/etc/init/{TRACKING}.rc', 'f', 0o644, data=TRACKING_RC.encode())
+    overlay.add('/system_ext/etc/vintf/manifest/memorybroker_manifest.xml', 'f', 0o644,
+                data=MEMORYBROKER_VINTF.encode())
 
     # zygote preloads libprism_jni.so.
     rc = stock['system'].read(stock['system'].lookup(ZYGOTE_RC)).decode()
@@ -550,6 +589,7 @@ def main():
     ap.add_argument('--translator', default=os.path.join('work', 'build', 'translator'))
     ap.add_argument('--vulkan', default=os.path.join('work', 'build', 'vulkan'))
     ap.add_argument('--thermal', default=os.path.join('work', 'build', 'thermal'))
+    ap.add_argument('--tracking', default=os.path.join('work', 'build', 'tracking'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')

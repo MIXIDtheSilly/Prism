@@ -11,6 +11,7 @@ python tools\compat.py                     # bridged framework.jar
 python tools\translator.py                 # Digitalis ARM64 translator, adapted to Android 14
 python tools\vulkan.py                     # Prism's Vulkan driver (opaque-fd memory for the compositor)
 python tools\thermal.py                    # Prism's thermal HAL (stable-AIDL IThermal, for vrdevice)
+python tools\tracking.py                   # Prism's tracking service (MemoryBroker, the head pose)
 python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot
 python tools\emulator.py status
 ```
@@ -101,6 +102,14 @@ python tools\emulator.py status
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
+- **Tracking** ([native/tracking_prism](../native/tracking_prism/tracking_prism.c)). Tracking data
+  reaches Meta's software as shared memory regions handed out by Meta's MemoryBroker, which
+  system_server hosts on a headset from an arm64 JNI library; a headset's trackingservice fills
+  them from its cameras and IMU. Prism's tracking service, an arm64 daemon, hosts the broker
+  (`memorybroker::registerService()`) and, in a second process, registers as the head tracker's
+  host and keeps a headset sitting still at the origin in that region (a mode in which readers
+  take the latest pose as of the time they ask). The compositor and VrShell read it with Meta's
+  own client code.
 - **Wearing the headset.** VrPowerManagerService (declared in VINTF so servicemanager registers it)
   puts Horizon to sleep 15 s after boot unless the headset is worn; `prism.rc` sets its virtual
   proximity sensor to "close" once boot completes.

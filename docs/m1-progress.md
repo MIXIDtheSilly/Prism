@@ -240,6 +240,24 @@ python tools\emulator.py status
   for the compositor's output covers that display, and input drops touches to a window another
   app's layer covers, so Prism makes it a trusted overlay. With no controllers, the pointer is your
   head (`tools/head.py`); first-time setup's hover reaches it.
+- **The headset is tracked.** A HeadState carries tracking flags (at 4, as a controller's pose
+  sample does) besides its valid byte; without them the runtime located the headset as valid but
+  not tracked, and Guardian, which wants both tracked bits of the view's location, put up
+  "tracking lost" (`GUARDIAN_TRACKING_LOST`, "Continue without tracking") as soon as setup ended.
+  With them an app locates its view and stage at 0xf.
+- **Past first-time setup.** NuxOta's own skip (`am startservice -n
+  com.oculus.nux.ota/.NuxOtaIntentService -a nux.ota.SKIP_NUX --ez REBOOT false`, as root) marks
+  setup, health and safety and Guardian setup done; VrShell then leaves setup for its home (an
+  environment's floor and the Store's window bar show). Until it's done, VrShell holds any other
+  immersive app back for Guardian setup (its "setup active" comes from Guardian's state, not from
+  Android's provisioning settings).
+- **xrprobe** (`python tools/xrprobe.py --install`, then `--start`, `adb logcat -s XrProbe`): an
+  OpenXR app, bound to the controllers as VrShell is, that logs its session states, each hand's
+  interaction profile and the controllers' and headset's locations. It's a system app (Meta's
+  loader is a private system library), declares itself boundaryless and asks to see the runtime's
+  package. With the headset tracked its session focuses and syncs, the runtime has both controllers
+  (`REMOTE: Hand=1/2`), yet neither hand gets an interaction profile, so their poses don't locate:
+  that's why VrShell doesn't show them.
 - **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
   starts all its roles and stays up, with no controllers paired.
 - **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the

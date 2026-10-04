@@ -27,9 +27,11 @@
  *   0x0148  a sequence word and a history of 32 HeadStates, for interpolating past poses
  *   0x1588  a mode word (two copies); in mode 1 a reader returns the latest state as of the time
  *           it asks for, unextrapolated
- * HeadState (0xa0 bytes) holds a valid flag, the orientation (a quaternion, x y z w) and
+ * HeadState (0xa0 bytes) holds a valid flag, its tracking flags (at 4, as a pose sample's: what a
+ * reader reports, the low four bits and 0x80), the orientation (a quaternion, x y z w) and
  * position, and its time (ns, CLOCK_MONOTONIC); a second quaternion at 0x80 must be a unit one
- * too for the state to count as valid.
+ * too for the state to count as valid. Without the flags the headset is valid but not tracked:
+ * Guardian takes its tracking for lost, and a controller located relative to it isn't located.
  *
  * Controllers (two, Touch Plus: left and right). Each is in three regions, which InputHub (in
  * libtrackingserviceclients, which the runtime reads them with) finds through the input map:
@@ -101,7 +103,9 @@ struct region_info {
 
 struct head_state {
   uint8_t valid;
-  uint8_t reserved0[15];
+  uint8_t reserved0[3];
+  uint32_t flags;  // POSE_TRACKED
+  uint8_t reserved4[8];
   float orientation[4];  // x y z w
   float position[3];
   uint8_t reserved1[0x34];
@@ -223,6 +227,7 @@ static void seed(uint8_t *at, const void *value, size_t size, size_t stride) {
 static void publish_head(uint8_t *region) {
   struct head_state state = {
       .valid = 1,
+      .flags = POSE_TRACKED,
       .reference_orientation = {0, 0, 0, 1},
   };
   memcpy(state.orientation, g_orientation, sizeof g_orientation);

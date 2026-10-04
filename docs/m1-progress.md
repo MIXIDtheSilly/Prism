@@ -283,8 +283,7 @@ python tools\emulator.py status
   Meta's controller input source; released within 500 ms it's VrShell's system button press. Stock
   input has no such source, so Prism's tracking service hands VrShell that press through the intent
   VrShell also takes it from (`QUIT_TO_HOME` to `AndroidIntentsRelayActivity`): the Navigator opens
-  (`InvokeNavigator showReason: hardware-button-click`). Its panel is a placeholder strip, as the
-  Store's body is (see Next).
+  (`InvokeNavigator showReason: hardware-button-click`); its panels draw (see Panels' bodies).
 - **The emulator freezing** when a VR process dies (system_server, the runtime service): qemu's
   main loop and first vCPU stop, and its hang detector kills it 15 s later (minidump: "detected a
   hanging thread 'QEMU2 main loop'"). A gfxstream render thread was in NVIDIA's driver, waiting
@@ -296,7 +295,9 @@ python tools\emulator.py status
   `berberis::InstallTranslated`): the bundle's block chaining keeps per-thread state in a
   `thread_local` vector, which bionic destroys before running pthread key destructors; an arm64
   key destructor reaching untranslated code then reused it. VrShell and the runtime service died
-  of it every so often. `tools/translator.py` drops the vector's destructor (keep_chain_sites).
+  of it every so often. `tools/translator.py` makes the vector's destructor return at once
+  (keep_chain_sites): two places register it, the accessor and its copy inlined in
+  InstallTranslated.
 - **adb losing the emulator.** An adb server started after the emulator scans for emulators only up
   to port 5585, and Prism's is 5590; `tools/emulator.py` tells the server about it again
   (`host:emulator:5591`), as the emulator does when it starts.
@@ -312,12 +313,17 @@ python tools\emulator.py status
   right-drag looks around, WASD and R/F move. The compositor draws each half from the head's
   center (not the eye's), the middle of the FOV apps render, undistorted; the runtime's aim pose is
   the published pose turned 5° in and moved 9 mm (xrprobe), which the viewer undoes.
-- **Panels' bodies.** The Store's body and the Navigator's are solid green: VrShell gives their
-  volumetric windows single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a
-  headset's SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers
-  (`libxrsurfaceflinger.so`); stock SurfaceFlinger doesn't. With single-pass off
-  (`persist.debug.vw.spc_disable all`) VrShell gives multi-layer panels compositor-side surfaces
-  instead (`CreateAndroidSurfaceSwapChain`), and the runtime service dies in its arm64 libbinder
-  passing them on; `debug.sf.disable_openxr true` kills it too. Both are left unset.
-- **Next:** panels' bodies (single-pass layers, or compositor-side surfaces across the translator),
-  and system_server's deaths by SIGPIPE (twice, soon after an app's window was placed).
+- **Panels' bodies.** VrShell gave the Store's and the Universal Menu's volumetric windows
+  single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a headset's
+  SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers
+  (`libxrsurfaceflinger.so`); stock SurfaceFlinger doesn't, and their bodies stayed solid green.
+  With single-pass off (`persist.debug.vw.spc_disable all`, which deploy sets) VrShell draws them
+  into surfaces the compositor makes (`xrCreateSwapchainAndroidSurfaceKHR`): the runtime's are
+  ImageReader windows, x86_64 objects, which Meta's arm64 RuntimeIpcManager took for arm64 Surfaces
+  to hand their producer to the app (and died), and the app's arm64 Surface would have gone to the
+  host's `ANativeWindow_toSurface` as it was. The binder bridge now moves the producer binder in
+  both directions (Java Surface parcels on the host side, the relay in between), and the Store's
+  body draws ("Token fetch rejected by server": no Meta account), as does the Universal Menu:
+  its system bar, clock and the library's tiles.
+- **Next:** the library's tiles are empty, and system_server's deaths by SIGPIPE (twice, soon after
+  an app's window was placed; none since).

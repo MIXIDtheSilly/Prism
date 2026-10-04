@@ -373,6 +373,11 @@ def prism_props(images):
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
     props['ro.hw_timeout_multiplier'] = '8'
     props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
+    # A headset's SurfaceFlinger hands panel windows' buffers to the runtime as OpenXR layers
+    # (single-pass composition); stock SurfaceFlinger can't, and their bodies stayed green. Without
+    # it VrShell draws them into surfaces the compositor makes, which Prism's binder bridge
+    # (native/binder_relay/guest_bridge.c) carries between the runtime and the app.
+    props['persist.debug.vw.spc_disable'] = 'all'
     return props
 
 

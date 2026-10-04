@@ -5,7 +5,7 @@ libraries lack (see native/berberis_compat). This builds that shim (libpcx.so), 
 bundle to work/build/translator/, points each host binary's DT_NEEDED "libc++.so" at the shim
 (same length, so the change is in place), and checks that every host import then resolves
 against the stock image. It also disables the guest libdl's CFI slow path (see disable_guest_cfi)
-and keeps block chaining's per-thread state alive through thread exit (see keep_chain_sites).
+and keeps block chaining's per-thread state usable through thread exit (see keep_chain_sites).
 
     python tools/translator.py [--ndk PATH]
 """
@@ -148,15 +148,19 @@ def disable_guest_cfi(out_dir):
         f.write(elf.data)
 
 
-# The bundle's block chaining (prebuilts/digitalis/MANIFEST.txt) keeps the chainable jumps of the code just installed in a thread_local
-# vector (berberis::LastInstalledChainSites). bionic destroys a thread's thread_locals before it
-# runs its pthread key destructors, and an arm64 key destructor can reach code not yet translated:
-# InstallTranslated then reuses the destroyed vector, and growing it frees its old buffer a second
-# time (scudo: "invalid chunk state when deallocating"; VrShell and the runtime service died of it).
-# Prism drops the vector's destructor registration (a call to __cxa_thread_atexit), so the vector
-# stays usable to the end of the thread; its buffer is left behind when the thread ends.
+# The bundle's block chaining (prebuilts/digitalis/MANIFEST.txt) keeps the chainable jumps of the
+# code just installed in a thread_local vector (berberis::LastInstalledChainSites). bionic destroys
+# a thread's thread_locals before it runs its pthread key destructors, and an arm64 key destructor
+# can reach code not yet translated: InstallTranslated then reuses the destroyed vector, and growing
+# it frees its old buffer a second time (scudo: "invalid chunk state when deallocating"; VrShell,
+# the runtime service and others died of it). The destructor frees the buffer but leaves the vector
+# pointing at it. Two places register it (the accessor, and its copy inlined in InstallTranslated),
+# so Prism makes the destructor itself return at once: the vector stays usable to the end of the
+# thread, and its buffer is left behind when the thread ends.
 CHAIN_SITES = '_ZN8berberis23LastInstalledChainSitesEv'
-X86_NOP5 = bytes.fromhex('0f1f440000')
+CHAIN_SITES_DTOR = bytes.fromhex('4889f8488b3f4885ff')  # mov rax, rdi; mov rdi, [rdi]; test rdi, rdi
+X86_RET = bytes.fromhex('c3')
+X86_LEA_RDI = bytes.fromhex('488d3d')  # lea rdi, [rip + d]
 
 
 def keep_chain_sites(out_dir):
@@ -164,30 +168,25 @@ def keep_chain_sites(out_dir):
     with open(path, 'rb') as f:
         elf = Elf(f.read())
     data = bytes(elf.data)
-    shoff, = struct.unpack_from('<Q', data, 0x28)
-    shentsize, shnum = struct.unpack_from('<HH', data, 0x3A)
-    sections = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
-    dynsym = next(s for s in sections if s[1] == 11)
-    dynstr = sections[dynsym[6]]
-    name_of = lambda i: data[dynstr[4] + struct.unpack_from('<I', data, dynsym[4] + i * 24)[0]:].split(b'\0')[0]
-    slots = {r_offset for s in sections if s[1] == 4 and s[6] == sections.index(dynsym)
-             for r_offset, r_info, _ in (struct.unpack_from('<QQq', data, s[4] + j) for j in range(0, s[5], 24))
-             if name_of(r_info >> 32) == b'__cxa_thread_atexit'}
-    if CHAIN_SITES not in symbol_values(data) or not slots:
+    values = symbol_values(data)
+    if CHAIN_SITES not in values:
         return False  # a build without block chaining
-    start = symbol_values(data)[CHAIN_SITES]
-    calls = []
+    start = values[CHAIN_SITES]
+    # The accessor passes the destructor to __cxa_thread_atexit in rdi; it's the only rip-relative
+    # lea into rdi there that points just past the accessor (the other is its TLS descriptor).
+    dtors = set()
     for at in range(start, start + 0x60):
-        if data[elf.offset(at)] != 0xE8:
-            continue
-        target = at + 5 + struct.unpack_from('<i', data, elf.offset(at) + 1)[0]
-        stub = elf.offset(target)
-        if data[stub:stub + 2] == b'\xff\x25' and target + 6 + struct.unpack_from('<i', data, stub + 2)[0] in slots:
-            calls.append(at)
-    if len(calls) != 1:
-        sys.exit(f'libberberis_arm64.so: expected one __cxa_thread_atexit call in {CHAIN_SITES}, found {len(calls)}')
-    at = elf.offset(calls[0])
-    elf.data[at:at + 5] = X86_NOP5
+        o = elf.offset(at)
+        if data[o:o + 3] == X86_LEA_RDI:
+            target = at + 7 + struct.unpack_from('<i', data, o + 3)[0]
+            if start < target < start + 0x100:
+                dtors.add(target)
+    if len(dtors) != 1:
+        sys.exit(f'libberberis_arm64.so: expected one destructor in {CHAIN_SITES}, found {len(dtors)}')
+    at = elf.offset(dtors.pop())
+    if data[at:at + len(CHAIN_SITES_DTOR)] != CHAIN_SITES_DTOR:
+        sys.exit('libberberis_arm64.so: the chain sites destructor is not as expected')
+    elf.data[at:at + 1] = X86_RET
     with open(path, 'wb') as f:
         f.write(elf.data)
     return True

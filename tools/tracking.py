@@ -1,5 +1,6 @@
 """Build Prism's tracking service (native/tracking_prism): hosts Meta's MemoryBroker and keeps the
-head tracker's shared memory, which a headset's trackingservice fills from its cameras and IMU.
+head tracker's and controllers' shared memory, which a headset's trackingservice fills from its
+cameras and IMUs, and serves CMSHeadset's controller tracking service.
 An arm64 binary: it loads Meta's arm64 libraries, and runs through the translator.
 
     work/build/tracking/prism_tracking   installed in /system_ext/bin
@@ -16,7 +17,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import API, find_ndk  # noqa: E402
 
-SOURCE = os.path.join(ROOT, 'native', 'tracking_prism', 'tracking_prism.c')
+SOURCES = [os.path.join(ROOT, 'native', 'tracking_prism', name) for name in ('tracking_prism.c', 'controller_tracking.c')]
 BINARY = 'prism_tracking'
 
 
@@ -31,7 +32,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     out = os.path.join(args.out, BINARY)
     subprocess.run([clang, f'--target=aarch64-linux-android{API}', '-fPIE', '-pie', '-O2', '-std=c11', '-Wall',
-                    SOURCE, '-o', out, '-llog', '-ldl', '-lm', '-Wl,--build-id=sha1'], check=True)
+                    *SOURCES, '-o', out, '-lbinder_ndk', '-llog', '-ldl', '-lm', '-Wl,--build-id=sha1'], check=True)
     print(f'built {out}')
 
 

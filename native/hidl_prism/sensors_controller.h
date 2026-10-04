@@ -52,11 +52,12 @@ struct PairedControllerInfo {
   char model[64];
   char hardware_rev[64];
   char expected_firmware[64];
-  uint32_t unknown;
+  uint32_t flags;  // HANDED, RIGHT_HAND (libremotedeviceutils' getDeviceHandedness)
   uint8_t extra[5][0x60];  // not known; zero
   uint32_t mcnt;
 };
 static_assert(sizeof(PairedControllerInfo) == 0x310, "as Meta's stubs copy it");
+enum : uint32_t { RIGHT_HAND = 0x10, HANDED = 0x40 };
 struct AdvertisingControllerInfo { uint8_t opaque; };  // likewise
 struct ControllerWirelessFreqBlocklist { uint8_t opaque[4]; };
 struct ControllerWirelessFreqBlocklists { hidl_vec<uint32_t> blocklists; };  // 4-byte elements

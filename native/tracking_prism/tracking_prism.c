@@ -46,6 +46,9 @@
  *   two hand snapshots (0x7c8 apart, at 8) and two hand configurations (0x68 apart, at 0x1308),
  *   whose times, -1, mean no sample yet. Without a host, their clients ask the broker again and again.
  *
+ * The host also serves CMSHeadset's controller tracking service (controller_tracking.c): the
+ * controllers are tracked and in hand.
+ *
  * The binder thread-pool calls are platform APIs the NDK doesn't declare, so they're looked up.
  */
 #include <android/log.h>
@@ -62,6 +65,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+int serve_controller_tracking(void);  // controller_tracking.c
 
 #define TAG "PrismTracking"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -536,6 +541,7 @@ static int run_host(void) {
   };
   for (size_t i = 0; i < sizeof others / sizeof *others; i++)
     if (!register_region(host, &others[i])) ERR("can't register region type %u/%u", others[i].type, others[i].specifier);
+  serve_controller_tracking();  // CMSHeadset's: whether the controllers are tracked
   pthread_t poses;
   pthread_create(&poses, NULL, serve_poses, NULL);
   for (;;) {

@@ -228,8 +228,12 @@ python tools\emulator.py status
   right one, its right button pulls the trigger). Their pairing is the controller HAL's: it lists
   them and writes their states (`PairedControllerInfo`, 0x310 bytes) into the state stream CMSHeadset
   prepares, which then reports them paired and active through OVRRemoteService (`dumpsys
-  OVRRemoteService`), once each has a calibration. CMSHeadset doesn't know their hands or tracking
-  yet (a headset's trackingservice tells it, as events), and VrShell doesn't show them yet.
+  OVRRemoteService`), once each has a calibration; a flags word in it gives each one's hand. Whether
+  they're tracked CMSHeadset learns from the controller tracking service (trackingservice's, on a
+  headset), which Prism's tracking host serves: CMSHeadset hands it a socket per controller, and it
+  writes "tracked in 6DoF" and "in hand" events into it (TrackingStatus POSITION). So far the right
+  controller gets that far; CMSHeadset drops the left one as it starts, and VrShell doesn't show
+  either yet.
 - **Pointing at panels.** VrShell sends the panel window you point at touches (hover, and taps),
   through Android's input on the default display, where the panels' windows are. Prism's layer
   for the compositor's output covers that display, and input drops touches to a window another

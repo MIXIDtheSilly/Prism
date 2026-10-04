@@ -25,6 +25,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <time.h>
 #include <vector>
 
 #include "sensors_controller.h"
@@ -51,11 +53,12 @@ namespace {
 constexpr uint32_t RUBYPRQ = 6;  // ControllerType: Touch Plus
 constexpr uint64_t LEFT_ID = 1, RIGHT_ID = 2;
 
-PairedControllerInfo controller(uint64_t id, const char *serial) {
+PairedControllerInfo controller(uint64_t id, bool right, const char *serial, bool connected) {
   PairedControllerInfo c{};
   c.type = RUBYPRQ;
+  c.flags = HANDED | (right ? RIGHT_HAND : 0);
   c.addr = id;
-  c.connected = true;
+  c.connected = connected;
   c.battery = 100;
   strncpy(c.serial, serial, sizeof c.serial - 1);
   strcpy(c.firmware, "206.3.0");
@@ -64,8 +67,19 @@ PairedControllerInfo controller(uint64_t id, const char *serial) {
   return c;
 }
 
+// Paired, and connected a moment after a client prepares its state stream: CMSHeadset connects a
+// controller as its state says so, reading its calibration through its streaming client, and drops
+// a controller that's connected before that client is there (as it is when it first lists the
+// paired ones, just after preparing the stream).
+std::atomic<int64_t> g_stream_prepared;  // CLOCK_MONOTONIC seconds
+int64_t now_s() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
 std::vector<PairedControllerInfo> controllers() {
-  return {controller(LEFT_ID, "PRISM0LEFT"), controller(RIGHT_ID, "PRISM0RIGHT")};
+  bool connected = now_s() - g_stream_prepared >= 3;
+  return {controller(RIGHT_ID, true, "PRISM0RIGHT", connected), controller(LEFT_ID, false, "PRISM0LEFT", connected)};
 }
 
 // A client's queue of controllers' states: each state change is an entry, and the client is woken
@@ -84,6 +98,18 @@ void send_states(StateStream &stream) {
   if (stream.flag) stream.flag->wake(stream.bits);
 }
 
+// The controllers connect a few seconds in, and their states go again now and then, as a headset's
+// HAL repeats them.
+void repeat_states() {
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      std::lock_guard<std::mutex> lock(g_streams_lock);
+      for (auto &stream : g_streams) send_states(*stream);
+    }
+  }).detach();
+}
+
 // Logs a request the first time it comes.
 #define ONCE(what)                     \
   do {                                 \
@@ -96,8 +122,11 @@ struct StreamingClient : IControllerStreamingClient {
     ONCE("streaming client disposed");
     return Void();
   }
-  Return<void> getCalibrationData(const ControllerAddr &, CalibrationCachePolicy,
+  Return<void> getCalibrationData(const ControllerAddr &addr, CalibrationCachePolicy,
                                   std::function<void(const ControllerCalibrationData &)> cb) override {
+    uint64_t id;
+    memcpy(&id, &addr, sizeof id);
+    LOG("calibration of %016llx", (unsigned long long)id);
     // CMSHeadset blocks a controller whose calibration is empty. A headset's trackingservice reads
     // it (the controller's LEDs and IMU); Prism's tracking is its own, so this one is nominal.
     ControllerCalibrationData data{};
@@ -199,6 +228,7 @@ struct Provider : IControllerProvider {
   }
   Return<Result> prepareStateStream(const MQDescriptorSync<PairedControllerInfo> &desc, const sp<ISensorClient> &,
                                     const FmqConfig &config) override {
+    g_stream_prepared = now_s();
     auto stream = std::make_unique<StateStream>();
     stream->queue.reset(new MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>(desc, false));
     const native_handle_t *handle = config.flag.getNativeHandle();
@@ -272,6 +302,7 @@ int main() {
     return 1;
   }
   LOG("%s/default registered: two controllers paired", IControllerProvider::descriptor);
+  repeat_states();
   ::android::hardware::joinRpcThreadpool();
   return 1;
 }

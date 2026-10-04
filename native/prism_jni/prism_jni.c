@@ -231,10 +231,15 @@ static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
 
 // ---- x86_64 functions arm64 code calls. The translator binds each one (eglCreateWindowSurface,
 // ANativeWindow_acquire, ...) with dlsym on the real library, so Prism wraps the translator's own
-// dlsym import and swaps in its replacements (prism_window_function).
+// dlsym import and swaps in its replacements (prism_window_function, prism_media_function).
 typedef void *(*LoaderDlsym)(void *, const char *, const void *);
 static void *(*g_dlsym)(void *, const char *);
 static LoaderDlsym g_loader_dlsym;
+
+static void *own_function(const char *name, void *real) {
+  void *own = prism_window_function(name, real);
+  return own ? own : prism_media_function(name, real);
+}
 
 static int hook_proxy_tables(struct dl_phdr_info *info, size_t size, void *data);
 
@@ -243,7 +248,7 @@ static void *translator_dlsym(void *handle, const char *name) {
   if (name && !strcmp(name, "InitProxyLibrary")) dl_iterate_phdr(hook_proxy_tables, NULL);
   // dlsym looks RTLD_DEFAULT and RTLD_NEXT up from its caller; keep that the translator.
   void *symbol = g_loader_dlsym ? g_loader_dlsym(handle, name, __builtin_return_address(0)) : g_dlsym(handle, name);
-  void *own = symbol && name ? prism_window_function(name, symbol) : NULL;
+  void *own = symbol && name ? own_function(name, symbol) : NULL;
   return own ? own : symbol;
 }
 
@@ -284,10 +289,16 @@ static int write_slot(void **slot, void *value) {
 // before the first namespace is created, as zygote would have, and starts that libbinder's thread
 // pool: on a headset the app's one ProcessState is the runtime's, whose pool the runtime starts.
 // Prism's bridge (native/binder_relay/guest_bridge.c) follows: it hands that libbinder's objects to
-// Java and back.
+// Java and back. Prism's arm64 media functions (native/guest_media) are global, for dlsym.
 #define GUEST_DIR "/system/lib64/arm64/prism"  // also in tools/deploy.py
-static const char *const kGuestPreload[] = {"libbinder_ndk.so", "libbinder.so", "libhidlbase.so",
-                                            "libprism_binder_bridge.so"};
+static const struct {
+  const char *name;
+  int flags;
+} kGuestPreload[] = {{"libbinder_ndk.so", RTLD_NOW},
+                     {"libbinder.so", RTLD_NOW},
+                     {"libhidlbase.so", RTLD_NOW},
+                     {"libprism_binder_bridge.so", RTLD_NOW},
+                     {"libprism_guest_media.so", RTLD_NOW | RTLD_GLOBAL}};
 typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
 static CreateNamespaceFn g_create_namespace;
 
@@ -299,9 +310,9 @@ static void *bridge_create_namespace(const char *name, const char *ld_path, cons
     void *binder_ndk = NULL;
     for (size_t i = 0; i < sizeof kGuestPreload / sizeof *kGuestPreload; i++) {
       char path[128];
-      snprintf(path, sizeof path, GUEST_DIR "/%s", kGuestPreload[i]);
-      void *handle = load(path, RTLD_NOW);
-      if (!handle) LOGW("arm64 %s: not preloaded", kGuestPreload[i]);
+      snprintf(path, sizeof path, GUEST_DIR "/%s", kGuestPreload[i].name);
+      void *handle = load(path, kGuestPreload[i].flags);
+      if (!handle) LOGW("arm64 %s: not preloaded", kGuestPreload[i].name);
       if (i == 0) binder_ndk = handle;
     }
     void (*start_pool)(void) =

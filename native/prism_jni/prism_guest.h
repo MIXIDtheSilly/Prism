@@ -11,3 +11,6 @@ void *prism_guest_function(void *fn, const char *shorty);
 // Prism's replacement for the x86_64 function name (real) that the translator binds for arm64
 // callers, or NULL to keep real (guest_window.c).
 void *prism_window_function(const char *name, void *real);
+
+// The same, for AImageReader_new (guest_media.c).
+void *prism_media_function(const char *name, void *real);

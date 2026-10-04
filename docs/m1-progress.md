@@ -12,6 +12,8 @@ python tools\translator.py                 # Digitalis ARM64 translator, adapted
 python tools\vulkan.py                     # Prism's Vulkan driver (opaque-fd memory for the compositor)
 python tools\thermal.py                    # Prism's thermal HAL (stable-AIDL IThermal, for vrdevice)
 python tools\tracking.py                   # Prism's tracking service (MemoryBroker, the head pose)
+python tools\spaces.py                     # Prism's space service (Meta's space manager, for system_server)
+python tools\guest_media.py                # Prism's arm64 media functions (panels' surface sizes)
 python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot
 python tools\emulator.py status
 ```
@@ -53,9 +55,15 @@ python tools\emulator.py status
   `getTrampolineForFunctionPointer`).
 - **HLE** (high-level emulation): natives Prism implements rather than stubs, declared with
   `PRISM_HLE` ([prism_hle.h](../native/prism_jni/prism_hle.h)) in `native/prism_jni/hle_*.c`.
-  The first is `SpaceManagerClient` ([hle_spaces.c](../native/prism_jni/hle_spaces.c)): a tree of
-  reference, virtual and window spaces with poses, bounds, alpha and update tokens, kept in
-  system_server's process.
+  The first is `SpaceManagerClient` ([hle_spaces.c](../native/prism_jni/hle_spaces.c)), the
+  spaces volumetric windows are placed in.
+- **Spaces** ([native/spaces_prism](../native/spaces_prism)). Meta's space manager (xrservice's)
+  keeps reference, virtual and window spaces, shared between processes by UUID: system_server
+  creates a window space per volumetric window and moves it, and VrShell acquires it to place the
+  window's panel. Its client library is arm64, which system_server can't load, so Prism's space
+  service, an arm64 daemon, calls it (its C API, `Hzu*`, reconstructed in `hzu_spaces.h`) and
+  system_server's `SpaceManagerClient` natives call the service over binder (`prism.spaces`).
+  Spaces go when the process that made them dies.
 - **Java-side compatibility** ([tools/compat.py](../tools/compat.py)). Stock native code looks up
   `InputDevice.<init>` and two `FullBackupDataOutput` members by their stock signatures. Prism
   adds bridge methods with those signatures that call Meta's versions. Meta's
@@ -110,6 +118,16 @@ python tools\emulator.py status
   the layout its descriptors name; that image is bound to memory of its own instead and gets the
   mirror the imported buffer holds. `setprop debug.prism.vk.dump N` (read live) writes every Nth
   copied image, its layers one under another, to `/data/local/tmp/prism_*.rgba`.
+- **Panels' surfaces.** VrShell draws each panel window through an Android surface (a mirror of
+  the window, made by system_server's `VolumetricWindow`, on a virtual display), which it gets from
+  `xrCreateSwapchainAndroidSurfaceKHR` as an `AImageReader`'s window, and sizes it to the panel with
+  `AImageReader_setDefaultBufferSize` before binding it; SurfaceFlinger sizes the display from it.
+  Meta's libmediandk has that function and Android's doesn't. Prism's arm64
+  `libprism_guest_media.so` ([native/guest_media](../native/guest_media)), preloaded globally,
+  defines it; arm64 code reaches x86_64 only through the translator's proxies, so it calls the
+  proxy's `AImageReader_new` with a format reserved for this, and libprism_jni's replacement of
+  that function ([guest_media.c](../native/prism_jni/guest_media.c)) sets the reader's consumer's
+  default buffer size, as `AImageReader::init` does.
 - **Multiview.** VrShell's renderer draws both eyes in one multiview pass only if the device lists
   `VK_KHR_multiview`; otherwise it draws one view, into the left eye's layer. Multiview is core
   since Vulkan 1.1 and gfxstream doesn't list it, so Prism's driver does (and other extensions
@@ -187,15 +205,14 @@ python tools\emulator.py status
 - **Known issue: the emulator sometimes dies silently** (no crash report), most often during a
   reboot. At those times Windows logs a LiveKernelEvent 141, a GPU engine timeout that it resets:
   host Vulkan work from the guest hung the GPU. Killing VrShell mid-frame alone doesn't do it.
-- **Panels don't show yet.** VrShell places panels (first-time setup, for one) but their content
-  never arrives. On a headset it comes from SurfaceFlinger itself: Horizon's SurfaceFlinger
-  (`libxrsurfaceflinger.so`) runs an OpenXR session against Meta's runtime and submits each panel
-  window's buffers as composition layers (`XR_METAI_buffer_composition`: graphic buffers, no
-  swapchains), placed at its volumetric window's aperture (`XR_METAX1_aperture`, by window token).
-  The emulator's SurfaceFlinger is stock, so Prism needs that OpenXR client of its own, fed with
-  the panel windows' contents (captures or mirrors of their layers).
+- **Panels show.** VrShell places panel windows in their window spaces and draws their contents,
+  mirrored into its panel surfaces: first-time setup's panel (the controller-batteries step) shows
+  in the emulator window, in front of passthrough, which is black here (no cameras). This is the
+  mirror path; a headset's SurfaceFlinger can also submit panels to the runtime itself, as OpenXR
+  layers (`libxrsurfaceflinger.so`, single-pass composition), which Horizon uses when a window
+  isn't given a surface.
 - **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
   starts all its roles and stays up, with no controllers paired.
 - **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the
   binder relay, and its native threads find its classes. No process crash-loops after boot.
-- **Next:** VrShell's panels and the Universal Menu, and controller input.
+- **Next:** controller input (pointing at and clicking panels), and the Universal Menu.

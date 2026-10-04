@@ -25,6 +25,10 @@
 // gfxstream also leaves out the names of some extensions that later Vulkan versions made core
 // (VK_KHR_16bit_storage, ...), which Meta's apps still ask for by name. Prism lists those the
 // device's version covers (kPromoted), and drops them again when a device is created.
+//
+// Images go to the PC's driver as gfxstream gets them, and NVIDIA's crashes (the whole emulator) on
+// one it doesn't support. Meta's code makes some a Quest's GPU has and the PC's doesn't (R8G8_SRGB):
+// Prism widens those to 32 bits (kNarrow), and fails any other unsupported or invalid image.
 // Dispatchable handles are the driver's own, so the loader's dispatch works as it does with gfxstream
 // alone; Prism only intercepts functions by name.
 
@@ -98,6 +102,7 @@ static struct {
   PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
   PFN_vkCreateDevice CreateDevice;
   PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
+  PFN_vkGetPhysicalDeviceImageFormatProperties GetPhysicalDeviceImageFormatProperties;
   PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
   PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
   PFN_vkGetPhysicalDeviceImageFormatProperties2KHR GetPhysicalDeviceImageFormatProperties2KHR;
@@ -146,6 +151,9 @@ static struct {
   PFN_vkCmdBlitImage CmdBlitImage;
   PFN_vkCmdResolveImage CmdResolveImage;
   PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+  PFN_vkCmdCopyBufferToImage2 CmdCopyBufferToImage2;
+  PFN_vkCmdCopyBufferToImage2KHR CmdCopyBufferToImage2KHR;
+  PFN_vkCmdCopyBuffer CmdCopyBuffer;
   PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
   PFN_vkCmdExecuteCommands CmdExecuteCommands;
   PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
@@ -421,6 +429,30 @@ static void VKAPI_CALL prism_GetPhysicalDeviceExternalBufferPropertiesKHR(VkPhys
   external_buffer_properties(next.GetPhysicalDeviceExternalBufferPropertiesKHR, pd, info, props);
 }
 
+// Each device's physical device, for the image checks in prism_CreateImage.
+#define MAX_DEVICES 8
+static struct {
+  VkDevice device;
+  VkPhysicalDevice pd;
+} g_devices[MAX_DEVICES];
+
+static void remember_device(VkDevice device, VkPhysicalDevice pd) {
+  for (int i = 0; i < MAX_DEVICES; i++) {
+    VkDevice none = VK_NULL_HANDLE;
+    if (__atomic_compare_exchange_n(&g_devices[i].device, &none, device, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&g_devices[i].pd, pd, __ATOMIC_RELEASE);
+      return;
+    }
+  }
+}
+
+static VkPhysicalDevice physical_device_of(VkDevice device) {
+  for (int i = 0; i < MAX_DEVICES; i++)
+    if (__atomic_load_n(&g_devices[i].device, __ATOMIC_ACQUIRE) == device)
+      return __atomic_load_n(&g_devices[i].pd, __ATOMIC_ACQUIRE);
+  return VK_NULL_HANDLE;
+}
+
 // The opaque-fd extension isn't the driver's: it is dropped, and the AHardwareBuffer extension
 // that implements it is enabled instead.
 static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info,
@@ -475,11 +507,14 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
     NEED(WaitForFences);
     NEED(CreateBuffer);
     NEED(CmdCopyImageToBuffer);
+    NEED(CmdCopyBufferToImage);
+    NEED(CmdCopyBuffer);
     NEED(GetBufferMemoryRequirements);
     NEED(BindBufferMemory);
     NEED(MapMemory);
     NEED(DestroyBuffer);
     if (next.GetPhysicalDeviceMemoryProperties) next.GetPhysicalDeviceMemoryProperties(pd, &g_memory_properties);
+    remember_device(*device, pd);
     char images[PROP_VALUE_MAX] = "";
     __system_property_get("debug.prism.vk.images", images);
     g_trace_images = atoi(images);
@@ -739,8 +774,262 @@ static int panel_fit(VkCommandBuffer cb, uint32_t count, const VkViewport *viewp
   return fit;
 }
 
+// --- narrow images -------------------------------------------------------------------------------
+
+// Meta's compositor makes textures in formats a Quest's GPU samples and the PC's may not: R8G8_SRGB
+// (its volume indicator's), and NVIDIA's driver crashes on one in vkCreateImage. Prism makes such an
+// image 32-bit instead (kNarrow), and its views read the channels it lacks as 0 and alpha as 1. A
+// copy from a buffer into it goes through a buffer of Prism's: each texel's bytes are copied to four
+// (one region each, on the GPU, so it reads the data whenever the copy runs), and the image is filled
+// from that. Other ways into such an image (copies from images, rendering) aren't followed.
+#define MAX_WIDE 64
+#define MAX_SPREAD (512 * 512)  // texels one copy may spread: a region each
+static VkImage g_wide[MAX_WIDE];
+static VkDevice g_wide_device[MAX_WIDE];
+static uint32_t g_wide_bytes[MAX_WIDE];  // its own format's texels' size
+static unsigned g_wide_count;  // read without the lock: with no such images there's nothing to do
+typedef struct {
+  VkCommandBuffer cb;  // the command buffer that copies from it: released when that's begun again or freed
+  VkDevice device;
+  VkBuffer buffer;
+  VkDeviceMemory memory;
+} Spread;
+static Spread *g_spreads;
+static uint32_t g_spread_count, g_spread_capacity;
+static pthread_mutex_t g_wide_lock = PTHREAD_MUTEX_INITIALIZER;  // the two above
+
+// Formats Prism widens, when the device has no image of them: their texels' size and channels.
+static const struct {
+  VkFormat narrow, wide;
+  uint32_t bytes;  // channels too: one byte each
+} kNarrow[] = {
+    {VK_FORMAT_R8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, 1},
+    {VK_FORMAT_R8G8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, 2},
+#define NARROW_RGB(type) {VK_FORMAT_R8G8B8_##type, VK_FORMAT_R8G8B8A8_##type, 3}, \
+                         {VK_FORMAT_B8G8R8_##type, VK_FORMAT_B8G8R8A8_##type, 3}
+    NARROW_RGB(UNORM), NARROW_RGB(SNORM), NARROW_RGB(USCALED), NARROW_RGB(SSCALED), NARROW_RGB(UINT),
+    NARROW_RGB(SINT), NARROW_RGB(SRGB),
+#undef NARROW_RGB
+};
+
+// The bytes of a format's texels, if Prism widens it; 0 if not.
+static uint32_t narrow_bytes(VkFormat format) {
+  for (size_t i = 0; i < sizeof kNarrow / sizeof *kNarrow; i++)
+    if (kNarrow[i].narrow == format) return kNarrow[i].bytes;
+  return 0;
+}
+static int narrow_format(VkFormat format) { return narrow_bytes(format) != 0; }
+static VkFormat wide_format(VkFormat format) {
+  for (size_t i = 0; i < sizeof kNarrow / sizeof *kNarrow; i++)
+    if (kNarrow[i].narrow == format) return kNarrow[i].wide;
+  return format;
+}
+
+static int format_supported(VkDevice device, const VkImageCreateInfo *info, VkFormat format) {
+  VkPhysicalDevice pd = physical_device_of(device);
+  VkImageFormatProperties props;
+  return pd && next.GetPhysicalDeviceImageFormatProperties &&
+         next.GetPhysicalDeviceImageFormatProperties(pd, format, info->imageType, info->tiling, info->usage,
+                                                     info->flags, &props) == VK_SUCCESS;
+}
+
+// The device of a widened image, or VK_NULL_HANDLE; and the size of the texels it was made for.
+static VkDevice wide_device(VkImage image, uint32_t *bytes) {
+  if (image == VK_NULL_HANDLE || !__atomic_load_n(&g_wide_count, __ATOMIC_RELAXED)) return VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  pthread_mutex_lock(&g_wide_lock);
+  for (int i = 0; i < MAX_WIDE && device == VK_NULL_HANDLE; i++)
+    if (g_wide[i] == image) {
+      device = g_wide_device[i];
+      if (bytes) *bytes = g_wide_bytes[i];
+    }
+  pthread_mutex_unlock(&g_wide_lock);
+  return device;
+}
+
+static void forget_wide(VkImage image) {
+  if (!wide_device(image, NULL)) return;
+  pthread_mutex_lock(&g_wide_lock);
+  for (int i = 0; i < MAX_WIDE; i++)
+    if (g_wide[i] == image) g_wide[i] = VK_NULL_HANDLE, g_wide_count--;
+  pthread_mutex_unlock(&g_wide_lock);
+}
+
+// Makes an image of a kNarrow format the device has no images of 32-bit instead;
+// VK_ERROR_FORMAT_NOT_SUPPORTED if it isn't one.
+static VkResult create_wide(VkDevice device, const VkImageCreateInfo *info, const VkAllocationCallbacks *allocator,
+                            VkImage *image) {
+  if (!narrow_format(info->format) || find_in(info, NATIVE_BUFFER_ANDROID) ||
+      find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
+      find_in(info, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) || format_supported(device, info, info->format) ||
+      !format_supported(device, info, wide_format(info->format)))
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  VkImageCreateInfo copy = *info;
+  copy.format = wide_format(info->format);
+  VkResult result = next.CreateImage(device, &copy, allocator, image);
+  if (result != VK_SUCCESS) return result;
+  pthread_mutex_lock(&g_wide_lock);
+  int i = 0;
+  while (i < MAX_WIDE && g_wide[i] != VK_NULL_HANDLE) i++;
+  if (i < MAX_WIDE)
+    g_wide[i] = *image, g_wide_device[i] = device, g_wide_bytes[i] = narrow_bytes(info->format), g_wide_count++;
+  pthread_mutex_unlock(&g_wide_lock);
+  if (i == MAX_WIDE) LOGE("image %p: more than %d widened images; copies into it go wrong", (void *)*image, MAX_WIDE);
+  static unsigned logged;
+  if (within(&logged, 16))
+    LOGI("image %p: %ux%u, format %d made %d (the device has no images of it)", (void *)*image, info->extent.width,
+         info->extent.height, info->format, copy.format);
+  return result;
+}
+
+static uint32_t device_local_type(uint32_t types) {
+  for (uint32_t i = 0; i < g_memory_properties.memoryTypeCount; i++)
+    if ((types >> i & 1) && (g_memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+      return i;
+  for (uint32_t i = 0; i < 32; i++)
+    if (types >> i & 1) return i;
+  return 0;
+}
+
+// A copy from a buffer of narrow texels (bytes each) into a widened image: spread into a buffer of
+// Prism's first.
+static void copy_into_wide(VkCommandBuffer cb, VkDevice device, uint32_t bytes, VkBuffer src, VkImage dst,
+                           VkImageLayout layout, uint32_t count, const VkBufferImageCopy *regions) {
+  uint64_t texels = 0;
+  for (uint32_t i = 0; i < count; i++)
+    texels += (uint64_t)regions[i].imageExtent.width * regions[i].imageExtent.height * regions[i].imageExtent.depth *
+              regions[i].imageSubresource.layerCount;
+  if (!texels) return;
+  if (texels > MAX_SPREAD) {
+    LOGE("image %p: a copy of %llu narrow texels into it, more than Prism spreads (%d); not copied", (void *)dst,
+         (unsigned long long)texels, MAX_SPREAD);
+    return;
+  }
+  VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, texels * 4,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+  Spread spread = {cb, device, VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkMemoryRequirements req;
+  VkBufferCopy *texel_copies = malloc(texels * sizeof *texel_copies);
+  VkBufferImageCopy *wide = malloc(count * sizeof *wide);
+  int ok = texel_copies && wide && next.CreateBuffer(device, &info, NULL, &spread.buffer) == VK_SUCCESS;
+  if (ok) {
+    next.GetBufferMemoryRequirements(device, spread.buffer, &req);
+    VkMemoryAllocateInfo alloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
+                                  device_local_type(req.memoryTypeBits)};
+    ok = next.AllocateMemory(device, &alloc, NULL, &spread.memory) == VK_SUCCESS &&
+         next.BindBufferMemory(device, spread.buffer, spread.memory, 0) == VK_SUCCESS;
+  }
+  if (!ok) {
+    LOGE("image %p: no buffer to spread a copy into it through; not copied", (void *)dst);
+    if (spread.buffer != VK_NULL_HANDLE) next.DestroyBuffer(device, spread.buffer, NULL);
+    if (spread.memory != VK_NULL_HANDLE) next.FreeMemory(device, spread.memory, NULL);
+    free(texel_copies);
+    free(wide);
+    return;
+  }
+  VkDeviceSize base = 0;
+  size_t k = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const VkBufferImageCopy *r = &regions[i];
+    uint32_t w = r->imageExtent.width, h = r->imageExtent.height;
+    uint32_t slices = r->imageExtent.depth * r->imageSubresource.layerCount;  // depth or layers, one of them 1
+    VkDeviceSize row = r->bufferRowLength ? r->bufferRowLength : w;
+    VkDeviceSize height = r->bufferImageHeight ? r->bufferImageHeight : h;
+    for (uint32_t z = 0; z < slices; z++)
+      for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+          texel_copies[k++] = (VkBufferCopy){r->bufferOffset + ((z * height + y) * row + x) * bytes,
+                                             base + (((VkDeviceSize)z * h + y) * w + x) * 4, bytes};
+    wide[i] = *r;
+    wide[i].bufferOffset = base;
+    wide[i].bufferRowLength = 0;
+    wide[i].bufferImageHeight = 0;
+    base += (VkDeviceSize)w * h * slices * 4;
+  }
+  next.CmdCopyBuffer(cb, src, spread.buffer, (uint32_t)k, texel_copies);
+  VkBufferMemoryBarrier spread_done = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                       spread.buffer, 0, VK_WHOLE_SIZE};
+  next.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
+                          &spread_done, 0, NULL);
+  next.CmdCopyBufferToImage(cb, spread.buffer, dst, layout, count, wide);
+  free(texel_copies);
+  free(wide);
+  pthread_mutex_lock(&g_wide_lock);
+  if (ROOM(g_spreads, g_spread_count, g_spread_capacity)) g_spreads[g_spread_count++] = spread;
+  else LOGE("buffer %p: not kept; leaked", (void *)spread.buffer);
+  pthread_mutex_unlock(&g_wide_lock);
+  static unsigned logged;
+  if (within(&logged, 16))
+    LOGI("image %p: %llu texels of %u bytes copied into it, spread to 4", (void *)dst, (unsigned long long)texels,
+         bytes);
+}
+
+// A command buffer that isn't pending (begun again, reset or freed) no longer reads its spreads.
+static void release_spreads(VkCommandBuffer cb) {
+  if (!__atomic_load_n(&g_spread_count, __ATOMIC_RELAXED)) return;
+  pthread_mutex_lock(&g_wide_lock);
+  for (uint32_t i = g_spread_count; i-- > 0;) {
+    if (g_spreads[i].cb != cb) continue;
+    next.DestroyBuffer(g_spreads[i].device, g_spreads[i].buffer, NULL);
+    next.FreeMemory(g_spreads[i].device, g_spreads[i].memory, NULL);
+    g_spreads[i] = g_spreads[--g_spread_count];
+  }
+  pthread_mutex_unlock(&g_wide_lock);
+}
+
+// Whether an image is one the spec allows (VUID-VkImageCreateInfo-extent-00944 and on), and, for a
+// plain image (no external memory), one the device supports (VUID-VkImageCreateInfo-imageCreateMaxMipLevels-02251
+// and on): Meta's code was written for a Quest's GPU and makes images of formats only that has
+// (ASTC, ETC2). gfxstream passes images to the PC's driver as they come, and NVIDIA's divides by
+// zero on such an image, taking the whole emulator down; here the call fails instead.
+static const char *image_invalid(VkDevice device, const VkImageCreateInfo *info) {
+  uint32_t largest = info->extent.width > info->extent.height ? info->extent.width : info->extent.height;
+  if (info->extent.depth > largest) largest = info->extent.depth;
+  uint32_t levels = 0;
+  while (largest >> levels) levels++;  // floor(log2(largest)) + 1
+  if (!info->extent.width || !info->extent.height || !info->extent.depth || !info->mipLevels ||
+      info->mipLevels > levels || !info->arrayLayers || !info->samples || (info->samples & (info->samples - 1)))
+    return "invalid";
+  if (info->format == VK_FORMAT_UNDEFINED)
+    return find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID) ? NULL : "invalid";
+  if (find_in(info, NATIVE_BUFFER_ANDROID) || find_in(info, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO))
+    return NULL;  // its support depends on the memory: asked with vkGetPhysicalDeviceImageFormatProperties2
+  VkPhysicalDevice pd = physical_device_of(device);
+  if (!pd || !next.GetPhysicalDeviceImageFormatProperties) return NULL;
+  VkImageFormatProperties props;
+  if (next.GetPhysicalDeviceImageFormatProperties(pd, info->format, info->imageType, info->tiling, info->usage,
+                                                  info->flags, &props) != VK_SUCCESS)
+    return "unsupported";
+  if (info->extent.width > props.maxExtent.width || info->extent.height > props.maxExtent.height ||
+      info->extent.depth > props.maxExtent.depth || info->mipLevels > props.maxMipLevels ||
+      info->arrayLayers > props.maxArrayLayers || !(info->samples & props.sampleCounts))
+    return "beyond the device's limits";
+  return NULL;
+}
+
 static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreateInfo *info,
                                              const VkAllocationCallbacks *allocator, VkImage *image) {
+  static unsigned announced;
+  int compressed = info->format >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK && info->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+  if ((compressed || __atomic_load_n(&g_trace_images, __ATOMIC_RELAXED)) && within(&announced, 4096))
+    LOGI("creating image: type %d, %ux%ux%u, %u levels, %u layers, format %d, %u samples, tiling %d, usage %#x, "
+         "flags %#x, pNext %d", info->imageType, info->extent.width, info->extent.height, info->extent.depth,
+         info->mipLevels, info->arrayLayers, info->format, info->samples, info->tiling, info->usage, info->flags,
+         info->pNext ? ((const VkBaseInStructure *)info->pNext)->sType : 0);
+  VkResult widened = create_wide(device, info, allocator, image);
+  if (widened != VK_ERROR_FORMAT_NOT_SUPPORTED) return widened;
+  const char *wrong = image_invalid(device, info);
+  if (wrong) {
+    static unsigned logged;
+    if (within(&logged, 64))
+      LOGE("vkCreateImage: %s image, failed here rather than passed to the host: type %d, %ux%ux%u, %u levels, "
+         "%u layers, format %d, %u samples, usage %#x, flags %#x", wrong, info->imageType, info->extent.width,
+         info->extent.height, info->extent.depth, info->mipLevels, info->arrayLayers, info->format, info->samples,
+         info->usage, info->flags);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  }
   if (find_in(info, NATIVE_BUFFER_ANDROID)) {
     VkResult result = next.CreateImage(device, info, allocator, image);
     unsigned n = __atomic_fetch_add(&g_swapchain_count, 1, __ATOMIC_RELAXED);
@@ -889,6 +1178,7 @@ static void use(VkCommandBuffer cb, VkImage image, VkImageLayout layout, int wri
 }
 
 static void VKAPI_CALL prism_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *allocator) {
+  forget_wide(image);
   if (image != VK_NULL_HANDLE && tracking()) {
     pthread_mutex_lock(&g_lock);
     Backed *b = backed_image(image);
@@ -907,6 +1197,20 @@ static void VKAPI_CALL prism_DestroyImage(VkDevice device, VkImage image, const 
 
 static VkResult VKAPI_CALL prism_CreateImageView(VkDevice device, const VkImageViewCreateInfo *info,
                                                  const VkAllocationCallbacks *allocator, VkImageView *view) {
+  VkImageViewCreateInfo wide;
+  uint32_t channels = narrow_bytes(info->format);
+  if (channels && wide_device(info->image, NULL)) {
+    // Each component reads what it would from the narrow format: the channels it lacks are 0, alpha 1.
+    wide = *info;
+    wide.format = wide_format(info->format);
+    VkComponentSwizzle *c[4] = {&wide.components.r, &wide.components.g, &wide.components.b, &wide.components.a};
+    for (int i = 0; i < 4; i++) {
+      if (*c[i] == VK_COMPONENT_SWIZZLE_IDENTITY) *c[i] = (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + i);
+      if (*c[i] >= VK_COMPONENT_SWIZZLE_R && *c[i] - VK_COMPONENT_SWIZZLE_R >= (int)channels)
+        *c[i] = *c[i] == VK_COMPONENT_SWIZZLE_A ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
+    }
+    info = &wide;
+  }
   VkResult result = next.CreateImageView(device, info, allocator, view);
   for (unsigned i = 0; result == VK_SUCCESS && i < MAX_SWAPCHAIN; i++) {
     if (g_swapchain[i] == VK_NULL_HANDLE || g_swapchain[i] != info->image) continue;
@@ -1183,17 +1487,21 @@ static void forget(VkCommandBuffer cb, int free_it) {
 }
 
 static VkResult VKAPI_CALL prism_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *info) {
+  release_spreads(cb);
   if (__atomic_load_n(&g_record_count, __ATOMIC_RELAXED)) forget(cb, 0);
   return next.BeginCommandBuffer(cb, info);
 }
 
 static VkResult VKAPI_CALL prism_ResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags flags) {
+  release_spreads(cb);
   if (__atomic_load_n(&g_record_count, __ATOMIC_RELAXED)) forget(cb, 0);
   return next.ResetCommandBuffer(cb, flags);
 }
 
 static void VKAPI_CALL prism_FreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
                                                 const VkCommandBuffer *cbs) {
+  for (uint32_t i = 0; i < count; i++)
+    if (cbs[i]) release_spreads(cbs[i]);
   for (uint32_t i = 0; i < count && __atomic_load_n(&g_record_count, __ATOMIC_RELAXED); i++)
     if (cbs[i]) forget(cbs[i], 1);
   next.FreeCommandBuffers(device, pool, count, cbs);
@@ -1323,7 +1631,34 @@ static void VKAPI_CALL prism_CmdResolveImage(VkCommandBuffer cb, VkImage src, Vk
 static void VKAPI_CALL prism_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout layout,
                                                   uint32_t count, const VkBufferImageCopy *regions) {
   use_transfer(cb, VK_NULL_HANDLE, dst);
-  next.CmdCopyBufferToImage(cb, src, dst, layout, count, regions);
+  uint32_t bytes = 0;
+  VkDevice device = wide_device(dst, &bytes);
+  if (device) copy_into_wide(cb, device, bytes, src, dst, layout, count, regions);
+  else next.CmdCopyBufferToImage(cb, src, dst, layout, count, regions);
+}
+
+static void copy_buffer_to_image2(PFN_vkCmdCopyBufferToImage2 down, VkCommandBuffer cb,
+                                  const VkCopyBufferToImageInfo2 *info) {
+  if (!wide_device(info->dstImage, NULL)) {
+    use_transfer(cb, VK_NULL_HANDLE, info->dstImage);
+    down(cb, info);
+    return;
+  }
+  VkBufferImageCopy regions[info->regionCount ? info->regionCount : 1];
+  for (uint32_t i = 0; i < info->regionCount; i++) {
+    const VkBufferImageCopy2 *r = &info->pRegions[i];
+    regions[i] = (VkBufferImageCopy){r->bufferOffset, r->bufferRowLength, r->bufferImageHeight,
+                                     r->imageSubresource, r->imageOffset, r->imageExtent};
+  }
+  prism_CmdCopyBufferToImage(cb, info->srcBuffer, info->dstImage, info->dstImageLayout, info->regionCount, regions);
+}
+
+static void VKAPI_CALL prism_CmdCopyBufferToImage2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *info) {
+  copy_buffer_to_image2(next.CmdCopyBufferToImage2, cb, info);
+}
+
+static void VKAPI_CALL prism_CmdCopyBufferToImage2KHR(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *info) {
+  copy_buffer_to_image2(next.CmdCopyBufferToImage2KHR, cb, info);
 }
 
 static void VKAPI_CALL prism_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout layout, VkBuffer dst,
@@ -2291,6 +2626,8 @@ static const Hook kHooks[] = {
     HOOK(CmdBlitImage),
     HOOK(CmdResolveImage),
     HOOK(CmdCopyBufferToImage),
+    HOOK(CmdCopyBufferToImage2),
+    HOOK(CmdCopyBufferToImage2KHR),
     HOOK(CmdCopyImageToBuffer),
     HOOK(CmdExecuteCommands),
     HOOK(CmdBindDescriptorSets),
@@ -2351,6 +2688,8 @@ static VkResult VKAPI_CALL prism_CreateInstance(const VkInstanceCreateInfo *info
         (PFN_vkGetPhysicalDeviceFeatures2)next.GetInstanceProcAddr(*instance, "vkGetPhysicalDeviceFeatures2");
     next.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)next.GetInstanceProcAddr(
         *instance, "vkGetPhysicalDeviceMemoryProperties");
+    next.GetPhysicalDeviceImageFormatProperties = (PFN_vkGetPhysicalDeviceImageFormatProperties)
+        next.GetInstanceProcAddr(*instance, "vkGetPhysicalDeviceImageFormatProperties");
   }
   return result;
 }

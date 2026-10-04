@@ -128,6 +128,13 @@ python tools\emulator.py status
   proxy's `AImageReader_new` with a format reserved for this, and libprism_jni's replacement of
   that function ([guest_media.c](../native/prism_jni/guest_media.c)) sets the reader's consumer's
   default buffer size, as `AImageReader::init` does.
+- **Images the PC's GPU doesn't have.** gfxstream passes images to the PC's Vulkan driver as they
+  come, and NVIDIA's crashes on one it doesn't support (a divide by zero in `vkCreateImage`), which
+  takes the whole emulator down. Meta's compositor makes its volume indicator R8G8_SRGB, a format
+  a Quest's GPU samples and the PC's doesn't. Prism's Vulkan driver makes such images (8-bit
+  formats of one to three channels) R8G8B8A8 instead, has their views read the missing channels as
+  0 and alpha as 1, and spreads copies from buffers into them to 4 bytes a texel on the GPU (a
+  region per texel). It fails any other image the device doesn't support, or the spec forbids.
 - **Multiview.** VrShell's renderer draws both eyes in one multiview pass only if the device lists
   `VK_KHR_multiview`; otherwise it draws one view, into the left eye's layer. Multiview is core
   since Vulkan 1.1 and gfxstream doesn't list it, so Prism's driver does (and other extensions
@@ -202,9 +209,12 @@ python tools\emulator.py status
 - **Home in the window.** The compositor composites VrShell's frames: its home environment shows
   in the emulator window in stereo, both eyes side by side, and `python tools\head.py` looks and
   moves around it with the mouse and keyboard.
-- **Known issue: the emulator sometimes dies silently** (no crash report), most often during a
-  reboot. At those times Windows logs a LiveKernelEvent 141, a GPU engine timeout that it resets:
-  host Vulkan work from the guest hung the GPU. Killing VrShell mid-frame alone doesn't do it.
+- **The emulator dying.** It writes a minidump for each of these (in
+  `%LOCALAPPDATA%\Temp\AndroidEmulator\emu-crash-*.db\reports`; `cdb -z <dump> -c ".ecxr; kn"`).
+  Pressing a volume key crashed it in NVIDIA's driver (an image the PC's GPU doesn't have, see
+  above), now fixed. A guest reboot (`adb reboot`) can crash qemu itself: restart the emulator
+  instead (`tools/emulator.py stop`, then `start`). Earlier deaths also coincided with a
+  LiveKernelEvent 141, a GPU engine timeout that Windows resets.
 - **Panels show.** VrShell places panel windows in their window spaces and draws their contents,
   mirrored into its panel surfaces: first-time setup's panel (the controller-batteries step) shows
   in the emulator window, in front of passthrough, which is black here (no cameras). This is the

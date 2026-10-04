@@ -117,6 +117,15 @@ python tools\emulator.py status
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
+- **HIDL services** ([native/hidl_prism](../native/hidl_prism)). Arm64 daemons that derive from the
+  interfaces in Horizon's own generated HIDL libraries, built against AOSP's headers
+  (`tools/hidl.py`). Meta's controller HAL (`vendor.oculus.hardware.sensors@1.0::IControllerProvider`,
+  Meta's sensors HAL on a headset) has no controllers paired; its interface was recovered from that
+  library's vtables and stubs, which abort the service if a method doesn't call its callback, so
+  each one answers. The HIDL system suspend (`android.system.suspend@1.0`), which Meta's
+  libnativewakelock uses, passes wakelocks to the AIDL service. Stock's manifest declares it only up
+  to FCM level 6, below the emulator's, so deploy drops that limit; a second declaration would
+  conflict, and a framework manifest that doesn't assemble stops every HAL lookup, and the boot.
 - **Tracking** ([native/tracking_prism](../native/tracking_prism/tracking_prism.c)). Tracking data
   reaches Meta's software as shared memory regions handed out by Meta's MemoryBroker, which
   system_server hosts on a headset from an arm64 JNI library; a headset's trackingservice fills
@@ -175,8 +184,9 @@ python tools\emulator.py status
   swapchains), placed at its volumetric window's aperture (`XR_METAX1_aperture`, by window token).
   The emulator's SurfaceFlinger is stock, so Prism needs that OpenXR client of its own, fed with
   the panel windows' contents (captures or mirrors of their layers).
+- **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
+  starts all its roles and stays up, with no controllers paired.
 - **Next:** VrShell's panels and the Universal Menu, controller input, and
-  the services still crash-looping: `com.oculus.os.cm` (it needs Meta's controller HAL,
-  `vendor.oculus.hardware.sensors@1.0::IControllerProvider`; until Prism serves it, Meta's
-  `persist.ovr.tracking.wifi_test` starts only its Wi-Fi role) and
-  `com.oculus.presence` (`ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions`).
+  `com.oculus.presence`, still crash-looping: its `onBind` asserts that the native ID anonymizer
+  isn't null (the `ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions` follows, from
+  a native thread reporting it).

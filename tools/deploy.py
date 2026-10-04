@@ -10,13 +10,15 @@ What goes where:
   * Prism's thermal HAL goes to /vendor/bin/hw, with its init script and VINTF declaration.
   * Prism's tracking service goes to /system_ext/bin, with its init script; it hosts Meta's
     MemoryBroker, whose VINTF declaration goes with it.
+  * Prism's HIDL services (Meta's controller HAL, the HIDL system suspend) go to /system_ext/bin/hw,
+    with their init scripts (and the controller HAL's VINTF declaration).
   * Horizon's device identity and Meta properties go into /product/etc/build.prop.
 
 Package manager state and compiled code are reset, since the platform signature changes.
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
     python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
-    python tools/thermal.py && python tools/tracking.py
+    python tools/thermal.py && python tools/tracking.py && python tools/hidl.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -192,6 +194,39 @@ service prism_tracking /system_ext/bin/{TRACKING} host
     group system
     seclabel {DAEMON_SECLABEL}
 '''
+# Prism's HIDL services (tools/hidl.py), arm64 daemons; hwservicemanager only takes declared ones.
+# Meta's controller HAL: Meta's sensors HAL serves it on a headset; CMSHeadset's controller service
+# needs it. A device HAL, so its declaration is the vendor partition's.
+CONTROLLER_HAL = 'prism_controller'
+CONTROLLER_RC = f'''service vendor.prism-controller /system_ext/bin/hw/{CONTROLLER_HAL}
+    interface vendor.oculus.hardware.sensors@1.0::IControllerProvider default
+    class hal
+    user system
+    group system
+    seclabel {DAEMON_SECLABEL}
+'''
+CONTROLLER_VINTF = '''<manifest version="1.0" type="device">
+    <hal format="hidl">
+        <name>vendor.oculus.hardware.sensors</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.0::IControllerProvider/default</fqname>
+    </hal>
+</manifest>
+'''
+# The HIDL system suspend, which Horizon's suspend service still serves beside the AIDL one; Meta's
+# libnativewakelock takes wakelocks through it. Stock's suspend manifest still declares it, though its
+# service serves only the AIDL one, but up to FCM level 6 only (max-level), below the emulator's 7, so
+# hwservicemanager won't register it. That declaration is kept, without its limit: a second one would
+# conflict, and a framework manifest that doesn't assemble stops every HAL lookup.
+SUSPEND_HAL = 'prism_suspend'
+SUSPEND_VINTF = '/system/etc/vintf/manifest/android.system.suspend-service.xml'
+SUSPEND_RC = f'''service prism_suspend /system_ext/bin/hw/{SUSPEND_HAL}
+    interface android.system.suspend@1.0::ISystemSuspend default
+    class hal
+    user system
+    group system
+    seclabel {DAEMON_SECLABEL}
+'''
 # Horizon's declaration, without the native instance (trackingservice's own, which nothing serves
 # here: a declared service nobody serves makes clients wait for it).
 MEMORYBROKER_VINTF = '''<manifest version="1.0" type="framework">
@@ -310,10 +345,6 @@ def prism_props(images):
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
     props['ro.hw_timeout_multiplier'] = '8'
     props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
-    # Until Prism serves the controller HAL (vendor.oculus.hardware.sensors@1.0::IControllerProvider,
-    # Meta's sensors HAL on a headset), CMSHeadset's controller service aborts at start, every few
-    # seconds. Meta's Wi-Fi test switch starts only its Wi-Fi role, which still publishes cm_wifi.
-    props['persist.ovr.tracking.wifi_test'] = 'true'
     return props
 
 
@@ -340,6 +371,9 @@ def build(args):
     tracking = os.path.join(args.tracking, TRACKING)
     if not os.path.exists(tracking):
         sys.exit(f'no tracking service in {args.tracking}; run: python tools/tracking.py')
+    for hal in (CONTROLLER_HAL, SUSPEND_HAL):
+        if not os.path.exists(os.path.join(args.hidl, hal)):
+            sys.exit(f'no {hal} in {args.hidl}; run: python tools/hidl.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -468,6 +502,17 @@ def build(args):
     overlay.add(f'/system_ext/etc/init/{TRACKING}.rc', 'f', 0o644, data=TRACKING_RC.encode())
     overlay.add('/system_ext/etc/vintf/manifest/memorybroker_manifest.xml', 'f', 0o644,
                 data=MEMORYBROKER_VINTF.encode())
+
+    # Prism's HIDL services.
+    for hal, rc in ((CONTROLLER_HAL, CONTROLLER_RC), (SUSPEND_HAL, SUSPEND_RC)):
+        with open(os.path.join(args.hidl, hal), 'rb') as f:
+            overlay.add(f'/system_ext/bin/hw/{hal}', 'f', 0o755, gid=2000, data=f.read())
+        overlay.add(f'/system_ext/etc/init/{hal}.rc', 'f', 0o644, data=rc.encode())
+    overlay.add(f'/vendor/etc/vintf/manifest/{CONTROLLER_HAL}.xml', 'f', 0o644, data=CONTROLLER_VINTF.encode())
+    manifest = stock['system'].read(stock['system'].lookup(SUSPEND_VINTF)).decode()
+    if 'max-level="6"' not in manifest:
+        sys.exit(f'{SUSPEND_VINTF} no longer limits the HIDL system suspend; check its declaration')
+    overlay.add(SUSPEND_VINTF, 'f', 0o644, data=manifest.replace(' max-level="6"', '').encode())
 
     # zygote preloads libprism_jni.so.
     rc = stock['system'].read(stock['system'].lookup(ZYGOTE_RC)).decode()
@@ -604,6 +649,7 @@ def main():
     ap.add_argument('--vulkan', default=os.path.join('work', 'build', 'vulkan'))
     ap.add_argument('--thermal', default=os.path.join('work', 'build', 'thermal'))
     ap.add_argument('--tracking', default=os.path.join('work', 'build', 'tracking'))
+    ap.add_argument('--hidl', default=os.path.join('work', 'build', 'hidl'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')

@@ -283,8 +283,11 @@ static int write_slot(void **slot, void *value) {
 // nobody starts never answer. Prism loads the binder libraries into the default arm64 namespace
 // before the first namespace is created, as zygote would have, and starts that libbinder's thread
 // pool: on a headset the app's one ProcessState is the runtime's, whose pool the runtime starts.
+// Prism's bridge (native/binder_relay/guest_bridge.c) follows: it hands that libbinder's objects to
+// Java and back.
 #define GUEST_DIR "/system/lib64/arm64/prism"  // also in tools/deploy.py
-static const char *const kGuestPreload[] = {"libbinder_ndk.so", "libbinder.so", "libhidlbase.so"};
+static const char *const kGuestPreload[] = {"libbinder_ndk.so", "libbinder.so", "libhidlbase.so",
+                                            "libprism_binder_bridge.so"};
 typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
 static CreateNamespaceFn g_create_namespace;
 
@@ -547,8 +550,67 @@ static jint register_host_natives(JNIEnv *env, jclass clazz, const JNINativeMeth
   return JNI_OK;
 }
 
+// ---- FindClass from threads without Java frames. ART looks a class up there with the system class
+// loader, which has none of an app's classes, so a native thread that attached itself finds them
+// only through references taken earlier on a Java thread. Meta's apps take theirs as they start, and
+// on a headset that's done before their native threads ask; translated, those threads can come
+// first (Presence's simplejni looks up its CoreFunctions from one). When a lookup fails, Prism tries
+// the class loaders whose classes have registered natives in this process: the app's, mostly.
+#include <pthread.h>
+#define MAX_LOADERS 16
+static jobject g_loaders[MAX_LOADERS];  // global references
+static int g_loader_count;
+static pthread_mutex_t g_loaders_lock = PTHREAD_MUTEX_INITIALIZER;
+static jmethodID g_class_get_loader, g_class_for_name;
+static jclass g_class_class, g_class_not_found;
+typedef jclass (*FindClassFn)(JNIEnv *, const char *);
+static FindClassFn g_find_class;
+
+static void remember_loader(JNIEnv *env, jclass clazz) {
+  if (!g_class_get_loader) return;
+  jobject loader = (*env)->CallObjectMethod(env, clazz, g_class_get_loader);
+  if (!loader) {  // the boot class path's
+    clear_exception(env);
+    return;
+  }
+  pthread_mutex_lock(&g_loaders_lock);
+  int known = 0;
+  for (int i = 0; i < g_loader_count && !known; i++) known = (*env)->IsSameObject(env, g_loaders[i], loader);
+  if (!known && g_loader_count < MAX_LOADERS) g_loaders[g_loader_count++] = (*env)->NewGlobalRef(env, loader);
+  pthread_mutex_unlock(&g_loaders_lock);
+  (*env)->DeleteLocalRef(env, loader);
+}
+
+static jclass JNICALL prism_find_class(JNIEnv *env, const char *name) {
+  jclass found = g_find_class(env, name);
+  if (found || !g_class_for_name || !name || name[0] == '[') return found;
+  jthrowable failure = (*env)->ExceptionOccurred(env);
+  if (!failure || !(*env)->IsInstanceOf(env, failure, g_class_not_found)) {
+    if (failure) (*env)->DeleteLocalRef(env, failure);
+    return NULL;
+  }
+  (*env)->ExceptionClear(env);
+  char dotted[512];
+  size_t n = 0;
+  for (; name[n] && n + 1 < sizeof dotted; n++) dotted[n] = name[n] == '/' ? '.' : name[n];
+  dotted[n] = 0;
+  jstring java_name = (*env)->NewStringUTF(env, dotted);
+  pthread_mutex_lock(&g_loaders_lock);
+  int count = g_loader_count;
+  pthread_mutex_unlock(&g_loaders_lock);
+  for (int i = 0; java_name && !found && i < count; i++) {
+    found = (jclass)(*env)->CallStaticObjectMethod(env, g_class_class, g_class_for_name, java_name, JNI_TRUE, g_loaders[i]);
+    if (!found) (*env)->ExceptionClear(env);
+  }
+  if (java_name) (*env)->DeleteLocalRef(env, java_name);
+  if (!found) (*env)->Throw(env, failure);
+  (*env)->DeleteLocalRef(env, failure);
+  return found;
+}
+
 static jint JNICALL prism_register_natives(JNIEnv *env, jclass clazz, const JNINativeMethod *methods,
                                            jint count) {
+  remember_loader(env, clazz);
   const JNINativeMethod *host = host_methods(methods, count);
   jint result = register_host_natives(env, clazz, host, count);
   if (host != methods) free((void *)host);
@@ -610,10 +672,19 @@ static void install(JNIEnv *env) {
   }
   jclass class_class = (*env)->FindClass(env, "java/lang/Class");
   g_class_get_name = (*env)->GetMethodID(env, class_class, "getName", "()Ljava/lang/String;");
+  g_class_get_loader = (*env)->GetMethodID(env, class_class, "getClassLoader", "()Ljava/lang/ClassLoader;");
+  g_class_for_name = (*env)->GetStaticMethodID(env, class_class, "forName",
+                                               "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+  g_class_class = (jclass)(*env)->NewGlobalRef(env, class_class);
   (*env)->DeleteLocalRef(env, class_class);
+  jclass not_found = (*env)->FindClass(env, "java/lang/ClassNotFoundException");
+  g_class_not_found = (jclass)(*env)->NewGlobalRef(env, not_found);
+  (*env)->DeleteLocalRef(env, not_found);
   memcpy(&g_table, get_interface(), sizeof g_table);
   g_register = g_table.RegisterNatives;
   g_table.RegisterNatives = prism_register_natives;
+  g_find_class = g_table.FindClass;
+  g_table.FindClass = prism_find_class;
   set_override(&g_table);
   LOGI("JNI table override installed (%s)", info.dli_fname);
   dl_iterate_phdr(find_bridge, NULL);  // the translator is loaded with the VM; wrap its dlsym now

@@ -117,6 +117,16 @@ python tools\emulator.py status
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
   HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
+- **Binder objects between arm64 code and Java** ([native/binder_relay](../native/binder_relay)). An
+  app's arm64 libbinder is a /dev/binder connection of its own, separate from its Java binder's, so
+  Horizon's `AIBinder_toJavaBinder` and `AIBinder_fromJavaBinder` can't hand an object across.
+  Prism's arm64 bridge, preloaded after libbinder, takes them over: an object crosses as a
+  transaction through Prism's relay (`prism.binder_relay`), put in from one connection for a token
+  and taken out from the other.
+- **FindClass from native threads.** A thread that attached itself has no Java frames, so ART looks
+  classes up with the system class loader, which has none of the app's. Meta's apps take their class
+  references on Java threads first; translated, a native thread can get there before (Presence's
+  simplejni). When a lookup fails, Prism's JNI table tries the class loaders that registered natives.
 - **HIDL services** ([native/hidl_prism](../native/hidl_prism)). Arm64 daemons that derive from the
   interfaces in Horizon's own generated HIDL libraries, built against AOSP's headers
   (`tools/hidl.py`). Meta's controller HAL (`vendor.oculus.hardware.sensors@1.0::IControllerProvider`,
@@ -186,7 +196,6 @@ python tools\emulator.py status
   the panel windows' contents (captures or mirrors of their layers).
 - **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
   starts all its roles and stays up, with no controllers paired.
-- **Next:** VrShell's panels and the Universal Menu, controller input, and
-  `com.oculus.presence`, still crash-looping: its `onBind` asserts that the native ID anonymizer
-  isn't null (the `ClassNotFoundException` for `com.facebook.simplejni.CoreFunctions` follows, from
-  a native thread reporting it).
+- **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the
+  binder relay, and its native threads find its classes. No process crash-loops after boot.
+- **Next:** VrShell's panels and the Universal Menu, and controller input.

@@ -10,6 +10,8 @@ What goes where:
   * Prism's thermal HAL goes to /vendor/bin/hw, with its init script and VINTF declaration.
   * Prism's tracking service goes to /system_ext/bin, with its init script; it hosts Meta's
     MemoryBroker, whose VINTF declaration goes with it.
+  * Prism's binder relay goes to /system_ext/bin, with its init script; its arm64 client goes with
+    the guest libraries.
   * Prism's HIDL services (Meta's controller HAL, the HIDL system suspend) go to /system_ext/bin/hw,
     with their init scripts (and the controller HAL's VINTF declaration).
   * Horizon's device identity and Meta properties go into /product/etc/build.prop.
@@ -18,7 +20,7 @@ Package manager state and compiled code are reset, since the platform signature 
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
     python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
-    python tools/thermal.py && python tools/tracking.py && python tools/hidl.py
+    python tools/thermal.py && python tools/tracking.py && python tools/hidl.py && python tools/relay.py
     python tools/deploy.py [--no-reboot]
 """
 import argparse
@@ -189,6 +191,17 @@ TRACKING_RC = f'''service prism_memorybroker /system_ext/bin/{TRACKING} broker
     seclabel {DAEMON_SECLABEL}
 
 service prism_tracking /system_ext/bin/{TRACKING} host
+    class main
+    user system
+    group system
+    seclabel {DAEMON_SECLABEL}
+'''
+# Prism's binder relay (tools/relay.py): binder objects cross through it between an app's arm64
+# libbinder and its Java binder, separate /dev/binder connections. Its arm64 client goes with the
+# guest libraries, where libprism_jni preloads it into apps.
+RELAY = 'prism_binder_relay'
+RELAY_BRIDGE = 'libprism_binder_bridge.so'
+RELAY_RC = f'''service prism_binder_relay /system_ext/bin/{RELAY}
     class main
     user system
     group system
@@ -374,6 +387,9 @@ def build(args):
     for hal in (CONTROLLER_HAL, SUSPEND_HAL):
         if not os.path.exists(os.path.join(args.hidl, hal)):
             sys.exit(f'no {hal} in {args.hidl}; run: python tools/hidl.py')
+    for name in (RELAY, RELAY_BRIDGE):
+        if not os.path.exists(os.path.join(args.relay, name)):
+            sys.exit(f'no {name} in {args.relay}; run: python tools/relay.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
     data = Archive(os.path.join(args.out, 'data.tar'))
@@ -451,6 +467,8 @@ def build(args):
     for fs, src in sources:  # the first source with a library wins
         data.add_tree(fs, src, f'{DATA_ROOT}/guest', taken, flat=True)
         taken |= {name for name, _ in fs.listdir(fs.lookup(src))}
+    with open(os.path.join(args.relay, RELAY_BRIDGE), 'rb') as f:
+        data.add(f'{DATA_ROOT}/guest/{RELAY_BRIDGE}', 'f', 0o644, data=f.read())
     overlay.add(GUEST_DIR, 'd', 0o755)
     binds.append((f'{DATA_ROOT}/guest', GUEST_DIR))
     # Meta's code also dlopens its libraries by absolute path (/system_ext/lib64/libosndk...). Each
@@ -495,6 +513,11 @@ def build(args):
         overlay.add(f'/vendor/bin/hw/{THERMAL_HAL}', 'f', 0o755, gid=2000, data=f.read())
     overlay.add(f'/vendor/etc/init/{THERMAL_HAL}.rc', 'f', 0o644, data=THERMAL_RC.encode())
     overlay.add(f'/vendor/etc/vintf/manifest/{THERMAL_HAL}.xml', 'f', 0o644, data=THERMAL_VINTF.encode())
+
+    # Prism's binder relay.
+    with open(os.path.join(args.relay, RELAY), 'rb') as f:
+        overlay.add(f'/system_ext/bin/{RELAY}', 'f', 0o755, gid=2000, data=f.read())
+    overlay.add(f'/system_ext/etc/init/{RELAY}.rc', 'f', 0o644, data=RELAY_RC.encode())
 
     # Prism's tracking service.
     with open(tracking, 'rb') as f:
@@ -650,6 +673,7 @@ def main():
     ap.add_argument('--thermal', default=os.path.join('work', 'build', 'thermal'))
     ap.add_argument('--tracking', default=os.path.join('work', 'build', 'tracking'))
     ap.add_argument('--hidl', default=os.path.join('work', 'build', 'hidl'))
+    ap.add_argument('--relay', default=os.path.join('work', 'build', 'relay'))
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')

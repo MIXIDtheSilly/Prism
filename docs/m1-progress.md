@@ -304,5 +304,20 @@ python tools\emulator.py status
   starts all its roles and stays up, with no controllers paired.
 - **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the
   binder relay, and its native threads find its classes. No process crash-loops after boot.
-- **Next:** the Universal Menu (the Meta button does nothing yet), panels' bodies (the Store's),
+- **The viewer** (`python toolsiewer.py`): Horizon in a desktop window, one eye's half of the
+  display from the frames the emulator shares (`-share-vid`; mapping `SHM_videmulator5590`, a
+  VideoInfo then RGBA), so its own window can stay minimized. The right controller points where the
+  mouse is: its ray goes through the pixel under the mouse, within a pixel or two on panels at
+  VrShell's distance (1.08 m). The left button pulls the trigger, Tab presses the Meta button,
+  right-drag looks around, WASD and R/F move. The compositor draws each half from the head's
+  center (not the eye's), the middle of the FOV apps render, undistorted; the runtime's aim pose is
+  the published pose turned 5° in and moved 9 mm (xrprobe), which the viewer undoes.
+- **Panels' bodies.** The Store's body and the Navigator's are solid green: VrShell gives their
+  volumetric windows single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a
+  headset's SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers
+  (`libxrsurfaceflinger.so`); stock SurfaceFlinger doesn't. With single-pass off
+  (`persist.debug.vw.spc_disable all`) VrShell gives multi-layer panels compositor-side surfaces
+  instead (`CreateAndroidSurfaceSwapChain`), and the runtime service dies in its arm64 libbinder
+  passing them on; `debug.sf.disable_openxr true` kills it too. Both are left unset.
+- **Next:** panels' bodies (single-pass layers, or compositor-side surfaces across the translator),
   and system_server's deaths by SIGPIPE (twice, soon after an app's window was placed).

@@ -261,7 +261,7 @@ static void locate(const char *name, XrSpace space, XrSpace base, XrTime time) {
   XrResult r = xrLocateSpace(space, base, time, &location);
   const XrVector3f *p = &location.pose.position;
   const XrQuaternionf *q = &location.pose.orientation;
-  LOG("  %-10s %s flags %#llx  p %.2f %.2f %.2f  q %.2f %.2f %.2f %.2f", name, result(r), (unsigned long long)location.locationFlags,
+  LOG("  %-10s %s flags %#llx  p %.3f %.3f %.3f  q %.4f %.4f %.4f %.4f", name, result(r), (unsigned long long)location.locationFlags,
       p->x, p->y, p->z, q->x, q->y, q->z, q->w);
 }
 

@@ -117,7 +117,8 @@ def start(args):
     log = open(os.path.join(LOG_DIR, 'emulator.log'), 'w')
     command = [os.path.join(sdk_root(), 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator'),
                '-avd', AVD, '-port', str(PORT), '-writable-system', '-selinux', 'permissive', '-no-snapshot',
-               '-no-boot-anim', '-gpu', 'host', '-crash-report-mode', 'never']
+               '-no-boot-anim', '-gpu', 'host', '-crash-report-mode', 'never',
+               '-share-vid']  # the display's frames in shared memory, for tools/viewer.py
     if args.headless:
         command.append('-no-window')
     if args.wipe:

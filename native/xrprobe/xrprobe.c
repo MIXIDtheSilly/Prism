@@ -17,6 +17,7 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <link.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -41,7 +42,7 @@ static XrInstance instance;
   F(xrCreateReferenceSpace) F(xrCreateActionSpace) F(xrLocateSpace) F(xrStringToPath) F(xrPathToString)     \
   F(xrCreateActionSet) F(xrCreateAction) F(xrSuggestInteractionProfileBindings) F(xrAttachSessionActionSets) \
   F(xrSyncActions) F(xrGetActionStateFloat) F(xrGetActionStatePose) F(xrGetCurrentInteractionProfile)       \
-  F(xrResultToString) F(xrGetOpenGLESGraphicsRequirementsKHR)
+  F(xrResultToString) F(xrGetOpenGLESGraphicsRequirementsKHR) F(xrLocateViews)
 
 #define DECLARE(name) static PFN_##name name;
 XR_FUNCTIONS(DECLARE)
@@ -481,6 +482,15 @@ static void report(XrTime time) {
   dump_session();
   locate("view", view, local, time);
   if (stage) locate("stage", stage, local, time);
+  XrViewLocateInfo views_at = {XR_TYPE_VIEW_LOCATE_INFO, NULL, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, time, view};
+  XrViewState view_state = {XR_TYPE_VIEW_STATE};
+  XrView eyes[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+  uint32_t eye_count = 0;
+  if (xrLocateViews(session, &views_at, &view_state, 2, &eye_count, eyes) == XR_SUCCESS)
+    for (uint32_t i = 0; i < eye_count; i++)
+      LOG("  eye %u: fov tangents left %.4f right %.4f up %.4f down %.4f, at %.3f %.3f %.3f", i,
+          tanf(eyes[i].fov.angleLeft), tanf(eyes[i].fov.angleRight), tanf(eyes[i].fov.angleUp),
+          tanf(eyes[i].fov.angleDown), eyes[i].pose.position.x, eyes[i].pose.position.y, eyes[i].pose.position.z);
   for (int h = 0; h < 2; h++) {
     XrInteractionProfileState profile = {XR_TYPE_INTERACTION_PROFILE_STATE};
     XrResult r = xrGetCurrentInteractionProfile(session, hands[h], &profile);

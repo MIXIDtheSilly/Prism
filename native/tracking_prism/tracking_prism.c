@@ -9,14 +9,16 @@
  * In a second process (`prism_tracking host`) it registers with the broker as the host of the
  * tracking regions, as trackingservice does, and keeps them up to date.
  *
- * Poses and input come from a client on the PC (tools/head.py, through `adb forward` to POSE_PORT),
+ * Poses and input come from a client on the PC (tools/viewer.py or tools/head.py, through `adb
+ * forward` to POSE_PORT),
  * as lines of text, in OpenXR's axes (Y up, -Z ahead), meters and quaternions (x y z w):
  *   px py pz qx qy qz qw                the headset's pose
  *   hand l|r px py pz qx qy qz qw       a controller's pose; until one comes it follows the head,
  *                                       held ahead of it and pointing where it looks
  *   follow l|r                          the controller follows the head again
  *   input l|r buttons trigger grip      its buttons (a mask of BUTTON_*) and its analog triggers (0-1)
- * The last of each stays when the client goes.
+ * The last of each stays when the client goes. A short press of the right Meta button also goes to
+ * VrShell as its system button press (see system_button).
  *
  * Most regions hold snapshots as two copies behind two counters, started (+0) and completed (+4):
  * a writer counts the write started, writes the copy readers aren't taking and counts it done, and
@@ -59,12 +61,14 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -195,6 +199,7 @@ struct controller {
   uint32_t buttons;
   float trigger, grip;
   uint64_t counters[BUTTONS];
+  int64_t system_down_ns;  // when the Meta button went down
   int input_changed;
   uint8_t *input, *tracking;  // their regions, once allocated
 };
@@ -446,6 +451,43 @@ static int unit(float q[4]) {
   return 1;
 }
 
+// The Meta button. A headset's trackingservice also reports it as a key, KEY_FORWARD from an input
+// device of its own, which VrShell's SystemButtonHandler takes only from Meta's controller input
+// source: released within 500 ms, it's VrShell's system button press (the Universal Menu opens or
+// closes). Stock Android's input has no such source, so Prism hands VrShell that press through the
+// intent VrShell also takes it from: QUIT_TO_HOME, to its AndroidIntentsRelayActivity.
+#define SHORT_PRESS_NS 500000000LL
+
+static void *press_system_button(void *unused) {
+  (void)unused;
+  char *argv[] = {"/system/bin/am", "start", "-n", "com.oculus.vrshell/.intents.AndroidIntentsRelayActivity",
+                  "-a", "com.oculus.vrshell.intent.action.QUIT_TO_HOME", NULL};
+  pid_t pid;
+  int error = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+  if (error) {
+    ERR("the Meta button's press: posix_spawn: %d", error);
+    return NULL;
+  }
+  waitpid(pid, NULL, 0);
+  LOG("Meta button pressed");
+  return NULL;
+}
+
+static void system_button(struct controller *c, uint32_t buttons) {
+  int down = (buttons & BUTTON_SYSTEM) != 0, was = (c->buttons & BUTTON_SYSTEM) != 0;
+  if (c->hand != RIGHT || down == was) return;
+  if (down) {
+    c->system_down_ns = now_ns();
+  } else if (now_ns() - c->system_down_ns <= SHORT_PRESS_NS) {
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, press_system_button, NULL)) ERR("the Meta button's press: no thread");
+    pthread_attr_destroy(&attr);
+  }
+}
+
 static void take_line(const char *line) {
   char name[8];
   float p[3], q[4], trigger, grip;
@@ -460,6 +502,7 @@ static void take_line(const char *line) {
     if ((c = controller_named(name))) c->follow = 1;
   } else if (sscanf(line, "input %7s %i %f %f", name, (int *)&buttons, &trigger, &grip) == 4) {
     if (!(c = controller_named(name))) return;
+    system_button(c, buttons);
     c->buttons = buttons & ALL_BUTTONS;
     c->trigger = trigger;
     c->grip = grip;

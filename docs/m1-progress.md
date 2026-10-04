@@ -278,6 +278,13 @@ python tools\emulator.py status
   the right trigger closes the Store's window from its bar's ✕. Behind that window is the home
   environment's sky and floor; the solid green that filled the view was the Store window's body,
   which isn't drawn. Prism publishes a controller's aim pose (the runtime pitches the grip from it).
+- **The Universal Menu.** A headset's trackingservice also reports the Meta button as a key
+  (KEY_FORWARD, from its own input device), and VrShell's SystemButtonHandler takes it only from
+  Meta's controller input source; released within 500 ms it's VrShell's system button press. Stock
+  input has no such source, so Prism's tracking service hands VrShell that press through the intent
+  VrShell also takes it from (`QUIT_TO_HOME` to `AndroidIntentsRelayActivity`): the Navigator opens
+  (`InvokeNavigator showReason: hardware-button-click`). Its panel is a placeholder strip, as the
+  Store's body is (see Next).
 - **The emulator freezing** when a VR process dies (system_server, the runtime service): qemu's
   main loop and first vCPU stop, and its hang detector kills it 15 s later (minidump: "detected a
   hanging thread 'QEMU2 main loop'"). A gfxstream render thread was in NVIDIA's driver, waiting

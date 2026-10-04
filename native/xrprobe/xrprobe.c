@@ -3,8 +3,10 @@
  * controllers aren't there. It binds the controllers as VrShell does (grip and aim poses, the
  * trigger's value, for Touch Plus and Touch), runs a session, and logs (tag XrProbe) every event
  * and, once a second: xrSyncActions's result, each hand's current interaction profile, the grip
- * and aim locations' flags in LOCAL space, the trigger, and the headset's own location. Once
- * focused, it also lists what the runtime's VrApi input functions report for each input device.
+ * and aim locations' flags in LOCAL space, the trigger, and the headset's own location. The runtime
+ * runs in this process, so it also reads the runtime's own state (libvrapiimpl.so's, by address):
+ * which way sync went, the controller snapshot it built, the session's selected profiles, each
+ * input device's in-hand flag, and what the tracking client reads as in hand.
  *
  * It loads Meta's OpenXR loader (libopenxr_loader.so, from the image), renders nothing and submits
  * no layers.
@@ -262,18 +264,18 @@ static void locate(const char *name, XrSpace space, XrSpace base, XrTime time) {
       p->x, p->y, p->z, q->x, q->y, q->z, q->w);
 }
 
-// The runtime's VrApi input functions, which read the same input devices its actions do: found in
-// libvrapiimpl.so, in this process since the instance was made, through its dynamic symbols (its
-// symbol table runs up to its string table).
 struct lookup {
   const char *name;
   void *found;
 };
 
+static uintptr_t runtime;  // libvrapiimpl.so's load address
+
 static int find_in(struct dl_phdr_info *info, size_t size, void *data) {
   (void)size;
   struct lookup *lookup = data;
   if (!info->dlpi_name || !strstr(info->dlpi_name, "libvrapiimpl.so")) return 0;
+  runtime = info->dlpi_addr;
   for (int i = 0; i < info->dlpi_phnum; i++) {
     if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) continue;
     const ElfW(Dyn) *dyn = (const ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
@@ -294,57 +296,181 @@ static int find_in(struct dl_phdr_info *info, size_t size, void *data) {
   return 0;
 }
 
-static void *runtime_symbol(const char *name) {
-  struct lookup lookup = {name, NULL};
-  dl_iterate_phdr(find_in, &lookup);
-  if (!lookup.found) ERR("no %s in the runtime", name);
-  return lookup.found;
+// The runtime's own state for this session, read from inside it (it runs in this process): which
+// way xrSyncActions goes, and the controller snapshot it builds for its interaction profiles. The
+// addresses are libvrapiimpl.so's (Horizon v76): xrSyncActions (0x7b80f4) finds the session object
+// through the client state's handle manager, takes a fast path (0x7b82dc) when a gatekeeper and
+// the session's byte +0x46c8 allow, and otherwise converts the input devices (0x7c4c00) into the
+// snapshot at +0x1e28.
+static uintptr_t runtime_base(void) {
+  struct lookup lookup = {"vrapi_EnumerateInputDevices", NULL};
+  if (!dl_iterate_phdr(find_in, &lookup)) return 0;
+  return runtime;
 }
 
-// What the runtime's input manager has: each device, its capabilities, its input state and its
-// tracking state, with VrApi's result codes. The session argument is checked only for a set first
-// byte, so a zeroed stand-in does.
-static void dump_input_devices(void) {
-  typedef int (*enumerate_fn)(void *, uint32_t, void *);
-  typedef int (*capabilities_fn)(void *, void *);
-  typedef int (*state_fn)(void *, uint32_t, void *);
-  typedef int (*tracking_fn)(void *, uint32_t, double, void *);
-  enumerate_fn enumerate = (enumerate_fn)runtime_symbol("vrapi_EnumerateInputDevices");
-  capabilities_fn capabilities = (capabilities_fn)runtime_symbol("vrapi_GetInputDeviceCapabilities");
-  state_fn input_state = (state_fn)runtime_symbol("vrapi_GetCurrentInputState");
-  tracking_fn tracking = (tracking_fn)runtime_symbol("vrapi_GetInputTrackingState");
-  if (!enumerate || !capabilities || !input_state || !tracking) return;
-  static uint8_t mobile[64];
-  for (uint32_t i = 0; i < 8; i++) {
-    uint32_t header[4] = {0};  // {type, device id}
-    int r = enumerate(mobile, i, header);
-    if (r) {
-      LOG("vrapi device %u: %d", i, r);
-      break;
-    }
-    LOG("vrapi device %u: type %u, id %u", i, header[0], header[1]);
-    static uint8_t buffer[1024];
-    memset(buffer, 0, sizeof buffer);
-    memcpy(buffer, header, 8);
-    r = capabilities(mobile, buffer);
-    const uint32_t *caps = (const uint32_t *)buffer;
-    LOG("  capabilities %d: %08x %08x %08x %08x %08x %08x %08x %08x", r, caps[2], caps[3], caps[4], caps[5], caps[6], caps[7], caps[8], caps[9]);
-    memset(buffer, 0, sizeof buffer);
-    memcpy(buffer, &header[0], 4);
-    r = input_state(mobile, header[1], buffer);
-    LOG("  input state %d: time %.3f, %08x %08x %08x %08x", r, *(const double *)(buffer + 8), caps[4], caps[5], caps[6], caps[7]);
-    memset(buffer, 0, sizeof buffer);
-    r = tracking(mobile, header[1], 0, buffer);
-    LOG("  tracking %d: status %08x, q %.2f %.2f %.2f %.2f, p %.2f %.2f %.2f", r, caps[0], *(const float *)(buffer + 8),
-        *(const float *)(buffer + 12), *(const float *)(buffer + 16), *(const float *)(buffer + 20), *(const float *)(buffer + 24),
-        *(const float *)(buffer + 28), *(const float *)(buffer + 32));
+static void hex(const char *name, const uint8_t *p, size_t n) {
+  char text[3 * 64 + 1];
+  size_t i;
+  for (i = 0; i < n && i < 64; i++) snprintf(text + 3 * i, 4, "%02x ", p[i]);
+  text[3 * i] = 0;
+  LOG("  %-12s %s", name, text);
+}
+
+static uint8_t *session_object(void) {
+  static uint8_t *object;
+  if (object) return object;
+  uintptr_t base = runtime_base();
+  if (!base) return NULL;
+  void *client = *(void **)(base + 0x949960);
+  void **table = *(void ***)(base + 0x949968);
+  if (!client || !table) {
+    ERR("no client state");
+    return NULL;
   }
+  void *manager = ((void *(*)(void *))table[0])(client);
+  XrSession handle = session;
+  object = ((void *(*)(void *, void *, int))(*(void ***)manager)[0x30 / 8])(manager, &handle, 2);
+  if (!object) ERR("no session object");
+  return object;
+}
+
+// The snapshot's four device variants (left: +0x1f8, +0x398; right: +0x538, +0x6d8; each with its
+// variant index at +0x190 and engaged flag at +0x198) and the two hands' input slots (+0xab8,
+// +0xb70; their first word is the input type, 4, which a successful input read writes).
+static const uint32_t device_offsets[4] = {0x1f8, 0x398, 0x538, 0x6d8};
+static const uint32_t slot_offsets[2] = {0xab8, 0xb70};
+static int frames, engaged[4], read_ok[2];
+
+static void before_sync(void) {
+  uint8_t *o = session_object();
+  if (!o) return;
+  for (int h = 0; h < 2; h++) *(uint32_t *)(o + 0x1e28 + slot_offsets[h]) = 0xeeeeeeee;
+}
+
+static void after_sync(void) {
+  uint8_t *o = session_object();
+  if (!o) return;
+  const uint8_t *snapshot = o + 0x1e28;
+  frames++;
+  for (int i = 0; i < 4; i++) engaged[i] += snapshot[device_offsets[i] + 0x198] == 1;
+  for (int h = 0; h < 2; h++) read_ok[h] += *(const uint32_t *)(snapshot + slot_offsets[h]) != 0xeeeeeeee;
+}
+
+// Calls fn(a0, a1) for a result returned through x8 (a C++ object returned by value).
+static void call_x8(void *fn, void *a0, uint64_t a1, void *result) {
+  register void *x0 __asm__("x0") = a0;
+  register uint64_t x1 __asm__("x1") = a1;
+  register void *x8 __asm__("x8") = result;
+  register void *x16 __asm__("x16") = fn;
+  __asm__ volatile("blr x16"
+                   : "+r"(x0), "+r"(x1), "+r"(x8), "+r"(x16)
+                   :
+                   : "x2", "x3", "x4", "x5", "x6", "x7", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x17", "x18", "x30",
+                     "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+                     "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory", "cc");
+}
+
+// The session's action state, which xrGetCurrentInteractionProfile reads (0x559214 -> 0x58ba1c): in
+// the action system (the client state's function table, slot 4), its map at +0x90 by session handle
+// (0x5629f8). Its byte +0xc8 is set once action sets are attached; +0x130 heads the list of selected
+// profiles (+0x138 counts them), each node's +0x18 a profile object: +0x10 the selected profile path,
+// +0x18 the top-level path, +0x20 the device type, +0x28 the device id.
+static uint8_t *action_state(void) {
+  static uint8_t *state;
+  if (state) return state;
+  uintptr_t base = runtime_base();
+  void *client = *(void **)(base + 0x949960);
+  void **table = *(void ***)(base + 0x949968);
+  uint8_t *actions = ((void *(*)(void *))table[4])(client);
+  void *found[2] = {0};  // a shared pointer, kept (one reference leaked)
+  call_x8((void *)(base + 0x5629f8), actions + 0x90, (uint64_t)session, found);
+  state = found[0];
+  if (!state) ERR("no action state");
+  return state;
+}
+
+static void dump_profiles(void) {
+  uint8_t *state = action_state();
+  if (!state) return;
+  LOG(" action state %p: attached %d, profiles %llu", state, state[0xc8], (unsigned long long)*(uint64_t *)(state + 0x138));
+  for (uint8_t **node = *(uint8_t ***)(state + 0x130); node; node = (uint8_t **)node[0]) {
+    uint8_t *profile = node[3];
+    if (!profile) continue;
+    LOG("  profile %s for %s, device type %u, id %#llx", path_text(*(XrPath *)(profile + 0x10)), path_text(*(XrPath *)(profile + 0x18)),
+        *(uint32_t *)(profile + 0x20), (unsigned long long)*(uint64_t *)(profile + 0x28));
+  }
+}
+
+// The runtime's input manager, as the sync's controller conversion (0x7c4c00) gets it from its
+// context {vtable 0x91ec48, session}; for each device (0x4f9588: {type, id}), whether the runtime
+// takes a controller (type 4) as held in a hand (0x4fa284), which decides whether an app without
+// XR_META_detached_controllers sees it.
+static void dump_in_hand(void) {
+  uint8_t *o = session_object();
+  if (!o) return;
+  void *context[2] = {(void *)(runtime + 0x91ec48), o};
+  void *manager = ((void *(*)(void *))(*(void ***)context)[2])(context);
+  for (uint32_t i = 0; i < 8; i++) {
+    uint32_t header[2] = {0};
+    if (((int (*)(void *, uint32_t, void *))(runtime + 0x4f9588))(manager, i, header)) break;
+    uint8_t in_hand = 0xee;
+    int r = header[0] == 4 ? ((int (*)(void *, uint32_t, void *))(runtime + 0x4fa284))(manager, header[1], &in_hand) : -1;
+    LOG("  input device %u: type %u, id %#x, in hand %d (%d)", i, header[0], header[1], in_hand, r);
+  }
+}
+
+// What Horizon's tracking client says about each controller's in-hand flag: the controller input
+// interface the runtime service queries (v8, 0x3f0), its method +0x10 for a device id: {u8 value, u8
+// has a value, ...} packed in a u64.
+static void dump_client_in_hand(void) {
+  static void *input;
+  if (!input) {
+    void *lib = dlopen("libtrackingserviceclients.so", RTLD_NOW);
+    void *(*create)(long) = lib ? (void *(*)(long))dlsym(lib, "createControllerInputFbs") : NULL;
+    input = create ? create(0x3f0) : NULL;
+    if (!input) {
+      ERR("no controller input: %s", lib ? "create failed" : dlerror());
+      return;
+    }
+  }
+  uint64_t (*in_hand)(void *, uint64_t) = (uint64_t (*)(void *, uint64_t))(*(void ***)input)[2];
+  static const uint64_t ids[] = {0, 1, 2, 3, 0x20000002, 0x20000003};
+  for (size_t i = 0; i < sizeof ids / sizeof *ids; i++)
+    LOG("  client in hand(%#llx): %#llx", (unsigned long long)ids[i], (unsigned long long)in_hand(input, ids[i]));
+}
+
+static void dump_session(void) {
+  uint8_t *o = session_object();
+  if (!o) return;
+  void *system = ((void *(*)(void *))(*(void ***)o)[0x208 / 8])(o);
+  void *features = ((void *(*)(void *))(*(void ***)system)[0x38 / 8])(system);
+  bool (*feature)(void *, int, int) = (bool (*)(void *, int, int))(*(void ***)features)[0x10 / 8];
+  bool fast = feature(features, 0x100, 1);
+  LOG(" features object %p (vtable +%#lx, query +%#lx)", features, (unsigned long)(*(uintptr_t *)features - runtime),
+      (unsigned long)((uintptr_t)feature - runtime));
+  for (int i = 0; i < 0x140; i += 64) hex("levels", (const uint8_t *)features + 8 + i, 64);
+  LOG(" features: 0x7b %d, 0xac %d, 0x63 %d, 0x100 %d", feature(features, 0x7b, 1), feature(features, 0xac, 1), feature(features, 0x63, 1),
+      fast);
+  LOG(" session %p: fast path %d/%d; of %d frames, input read L %d R %d; engaged %d %d | %d %d", o, fast, o[0x46c8], frames,
+      read_ok[0], read_ok[1], engaged[0], engaged[1], engaged[2], engaged[3]);
+  const uint8_t *snapshot = o + 0x1e28;
+  for (int i = 0; i < 4; i++) {
+    LOG("  device +%#x: engaged %d, index %d", device_offsets[i], snapshot[device_offsets[i] + 0x198],
+        *(const int32_t *)(snapshot + device_offsets[i] + 0x190));
+    hex("", snapshot + device_offsets[i], 32);
+  }
+  dump_profiles();
+  dump_in_hand();
+  dump_client_in_hand();
+  frames = engaged[0] = engaged[1] = engaged[2] = engaged[3] = read_ok[0] = read_ok[1] = 0;
 }
 
 static void report(XrTime time) {
   XrActiveActionSet active = {set, XR_NULL_PATH};
   XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO, NULL, 1, &active};
+  before_sync();
   XrResult synced = xrSyncActions(session, &sync);
+  after_sync();
   static int64_t last;
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -352,11 +478,7 @@ static void report(XrTime time) {
   if (now - last < 1000) return;
   last = now;
   LOG("state %d, xrSyncActions: %s", state, result(synced));
-  static bool dumped;
-  if (state == XR_SESSION_STATE_FOCUSED && !dumped) {
-    dumped = true;
-    dump_input_devices();
-  }
+  dump_session();
   locate("view", view, local, time);
   if (stage) locate("stage", stage, local, time);
   for (int h = 0; h < 2; h++) {

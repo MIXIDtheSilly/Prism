@@ -38,7 +38,7 @@
  *   INPUT_TYPE_MAP (0xc8 bytes): the input devices, as (device id, specifier) pairs sorted by id,
  *     their count and a generation (two copies at 8, 0x60 each)
  *   CONTROLLER, left and right (0x7f8 bytes): its capabilities (0x000), live input (0x040),
- *     thumbstick (0x250), descriptor (0x3d0: device id, model, firmware, handedness, strings) and
+ *     in hand (0x250), descriptor (0x3d0: device id, model, firmware, handedness, strings) and
  *     battery (0x4a0). Buttons are counters of transitions, odd while down.
  *   CONTROLLER_TRACKING, left and right (0xe48 bytes): the latest pose sample (two copies of 0x78
  *     at 8), and a history of 32 (a sequence word at 0xf8, odd while a slot is written; slots at
@@ -150,7 +150,7 @@ enum {
 #define INPUT 0x040
 #define INPUT_STRIDE 0xc8
 #define INPUT_SIZE 0xc4
-#define STICK 0x250
+#define IN_HAND 0x250  // {u8 in hand, u8 has a value, 5 more}: read for the runtime service's in-hand flag
 #define DESCRIPTOR 0x3d0
 #define DESCRIPTOR_SIZE 0x64
 #define BATTERY 0x4a0
@@ -188,6 +188,9 @@ struct controller {
   int hand;  // LEFT or RIGHT
   int follow;
   float position[3], orientation[4];
+  float velocity[3], angular_velocity[3];  // from the last poses, smoothed
+  float last_position[3], last_orientation[4];
+  int64_t last_ns;
   uint32_t buttons;
   float trigger, grip;
   uint64_t counters[BUTTONS];
@@ -270,7 +273,31 @@ static struct pose_sample controller_sample(const struct controller *c, int64_t 
   struct pose_sample s = {.valid = 1, .flags = POSE_TRACKED, .time_ns = time_ns, .predicted_ns = -1};
   memcpy(s.orientation, c->orientation, sizeof s.orientation);
   memcpy(s.position, c->position, sizeof s.position);
+  memcpy(s.linear_velocity, c->velocity, sizeof s.linear_velocity);
+  memcpy(s.angular_velocity, c->angular_velocity, sizeof s.angular_velocity);
   return s;
+}
+
+// The controller's velocities from its last pose: linear, and angular from the rotation between the
+// two orientations (twice the vector part of q * conj(last), for small turns), each smoothed.
+static void update_velocity(struct controller *c, int64_t now) {
+  float dt = c->last_ns ? (float)(now - c->last_ns) * 1e-9f : 0;
+  if (dt > 0.001f && dt < 0.5f) {
+    const float *q = c->orientation, *l = c->last_orientation;
+    float lw = l[3], lx = -l[0], ly = -l[1], lz = -l[2];  // conj(last)
+    float dw = q[3] * lw - q[0] * lx - q[1] * ly - q[2] * lz;
+    float d[3] = {q[3] * lx + q[0] * lw + q[1] * lz - q[2] * ly, q[3] * ly - q[0] * lz + q[1] * lw + q[2] * lx,
+                  q[3] * lz + q[0] * ly - q[1] * lx + q[2] * lw};
+    float sign = dw < 0 ? -1.0f : 1.0f;
+    for (int i = 0; i < 3; i++) {
+      float v = (c->position[i] - c->last_position[i]) / dt, w = 2 * sign * d[i] / dt;
+      c->velocity[i] = 0.5f * c->velocity[i] + 0.5f * v;
+      c->angular_velocity[i] = 0.5f * c->angular_velocity[i] + 0.5f * w;
+    }
+  }
+  memcpy(c->last_position, c->position, sizeof c->last_position);
+  memcpy(c->last_orientation, c->orientation, sizeof c->last_orientation);
+  c->last_ns = now;
 }
 
 static void append_history(uint8_t *region, const struct pose_sample *s) {
@@ -283,7 +310,9 @@ static void append_history(uint8_t *region, const struct pose_sample *s) {
 
 static void publish_pose(struct controller *c) {
   if (c->follow) follow_head(c);
-  struct latest_pose latest = {.sample = controller_sample(c, now_ns()), .present = 1};
+  int64_t now = now_ns();
+  update_velocity(c, now);
+  struct latest_pose latest = {.sample = controller_sample(c, now), .present = 1};
   publish(c->tracking, &latest, sizeof latest, sizeof latest);
   append_history(c->tracking, &latest.sample);
 }
@@ -312,8 +341,10 @@ static void controller_ready(void *context, void *memory) {
   // Thumbstick range and size, the buttons it has, and two fields not known.
   const uint32_t capabilities[7] = {65535, 65535, 1, 1, ALL_BUTTONS, 0, 0};
   seed(region + CAPABILITIES, capabilities, sizeof capabilities, sizeof capabilities);
-  const uint8_t stick[7] = {0, 0, 0xff, 0x7f, 0xff, 0x7f, 1};  // not touched, centered, valid
-  seed(region + STICK, stick, sizeof stick, 8);
+  // Held: with hand tracking off, the runtime service takes a controller's in-hand flag from here, and
+  // an app sees only controllers in hand (the others are detached controllers, an extension's).
+  const uint8_t in_hand[7] = {1, 1};
+  seed(region + IN_HAND, in_hand, sizeof in_hand, 8);
   uint8_t descriptor[DESCRIPTOR_SIZE] = {0};
   uint64_t id = device_id(c);
   uint32_t model = DEVICE_MODEL, firmware = 0, hand = c->hand;

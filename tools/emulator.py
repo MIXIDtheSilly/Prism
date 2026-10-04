@@ -153,6 +153,7 @@ def status(args):
 
 def stop(_args):
     if running():
+        adb('shell', 'sync', check=False, timeout=30)  # a kill drops what's still in the guest's page cache
         adb('emu', 'kill', check=False)
         print('stopped')
 

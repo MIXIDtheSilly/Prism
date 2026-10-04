@@ -231,9 +231,10 @@ python tools\emulator.py status
   OVRRemoteService`), once each has a calibration; a flags word in it gives each one's hand. Whether
   they're tracked CMSHeadset learns from the controller tracking service (trackingservice's, on a
   headset), which Prism's tracking host serves: CMSHeadset hands it a socket per controller, and it
-  writes "tracked in 6DoF" and "in hand" events into it (TrackingStatus POSITION). So far the right
-  controller gets that far; CMSHeadset drops the left one as it starts, and VrShell doesn't show
-  either yet.
+  writes "tracked in 6DoF" and "in hand" events into it. Both are then as a Quest 3S's are: Left and
+  Right, Active, CONNECTED_ACTIVE, TrackingStatus POSITION (a controller's slot needs its flags to
+  name its hand: 0x60 left, 0x50 right). First-time setup moves on to its controller check; VrShell
+  doesn't show the controllers yet.
 - **Pointing at panels.** VrShell sends the panel window you point at touches (hover, and taps),
   through Android's input on the default display, where the panels' windows are. Prism's layer
   for the compositor's output covers that display, and input drops touches to a window another

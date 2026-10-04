@@ -373,10 +373,6 @@ def prism_props(images):
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
     props['ro.hw_timeout_multiplier'] = '8'
     props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
-    # CMSHeadset blocks a paired controller whose calibration doesn't load. Prism's controllers
-    # (native/hidl_prism) have a nominal one, and CMSHeadset sometimes asks before the HAL's
-    # streaming client is up; Meta's switch keeps the controller instead.
-    props['persist.ovr.ignorectrlcalfail'] = 'true'
     return props
 
 

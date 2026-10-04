@@ -56,7 +56,7 @@ constexpr uint64_t LEFT_ID = 1, RIGHT_ID = 2;
 PairedControllerInfo controller(uint64_t id, bool right, const char *serial, bool connected) {
   PairedControllerInfo c{};
   c.type = RUBYPRQ;
-  c.flags = HANDED | (right ? RIGHT_HAND : 0);
+  c.flags = HANDED | (right ? RIGHT_HAND : LEFT_HAND);
   c.addr = id;
   c.connected = connected;
   c.battery = 100;
@@ -67,10 +67,9 @@ PairedControllerInfo controller(uint64_t id, bool right, const char *serial, boo
   return c;
 }
 
-// Paired, and connected a moment after a client prepares its state stream: CMSHeadset connects a
-// controller as its state says so, reading its calibration through its streaming client, and drops
-// a controller that's connected before that client is there (as it is when it first lists the
-// paired ones, just after preparing the stream).
+// Paired, and connected a moment after a client prepares its state stream, as a headset's
+// controllers connect after it starts: CMSHeadset connects a controller as its state says so,
+// reading its calibration through the streaming client it gets after listing the paired ones.
 std::atomic<int64_t> g_stream_prepared;  // CLOCK_MONOTONIC seconds
 int64_t now_s() {
   struct timespec ts;

@@ -13,6 +13,7 @@ Prism uses its own AVD (prism-api34) on its own port, so it never touches other 
 import argparse
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -83,9 +84,29 @@ def create(args):
     print(f'created {AVD} in {content}')
 
 
-def running():
+def listed():
     out = subprocess.run([adb_path(), 'devices'], capture_output=True, text=True).stdout
     return any(line.startswith(SERIAL) for line in out.splitlines())
+
+
+def running():
+    """Whether the emulator is up. An adb server started after the emulator finds emulators only on
+    ports up to 5585, so it's told about this one, as the emulator itself does when it starts."""
+    if listed():
+        return True
+    try:
+        socket.create_connection(('127.0.0.1', PORT + 1), timeout=1).close()
+    except OSError:
+        return False
+    try:
+        with socket.create_connection(('127.0.0.1', 5037), timeout=5) as s:
+            request = f'host:emulator:{PORT + 1}'.encode()
+            s.sendall(b'%04x' % len(request) + request)
+            s.recv(16)
+    except OSError:
+        return False
+    time.sleep(1)
+    return listed()
 
 
 def start(args):

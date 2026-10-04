@@ -274,8 +274,28 @@ python tools\emulator.py status
   `access_token` (placeholders; Meta's servers reject the token, and Horizon doesn't log out for
   that), then Horizon adds the `com.oculus` account itself. With an account but no token, VrShell
   holds every app back behind "You've been logged out" instead.
+- **Clicking panels.** A controller's ray hovers a panel's controls and its trigger presses them:
+  the right trigger closes the Store's window from its bar's ✕. Behind that window is the home
+  environment's sky and floor; the solid green that filled the view was the Store window's body,
+  which isn't drawn. Prism publishes a controller's aim pose (the runtime pitches the grip from it).
+- **The emulator freezing** when a VR process dies (system_server, the runtime service): qemu's
+  main loop and first vCPU stop, and its hang detector kills it 15 s later (minidump: "detected a
+  hanging thread 'QEMU2 main loop'"). A gfxstream render thread was in NVIDIA's driver, waiting
+  without end on a sync object for a guest Vulkan wait (`vkWaitSemaphores`, by its decoder case)
+  whose signaller had died, and ending that process's connection waits for that thread. Prism's
+  Vulkan driver now hands the PC waits of at most 100 ms (fences and semaphores) and waits out the
+  rest in the guest; killing the runtime service no longer stops the emulator.
+- **Translator aborts** (scudo: "invalid chunk state when deallocating", in
+  `berberis::InstallTranslated`): the bundle's block chaining keeps per-thread state in a
+  `thread_local` vector, which bionic destroys before running pthread key destructors; an arm64
+  key destructor reaching untranslated code then reused it. VrShell and the runtime service died
+  of it every so often. `tools/translator.py` drops the vector's destructor (keep_chain_sites).
+- **adb losing the emulator.** An adb server started after the emulator scans for emulators only up
+  to port 5585, and Prism's is 5590; `tools/emulator.py` tells the server about it again
+  (`host:emulator:5591`), as the emulator does when it starts.
 - **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
   starts all its roles and stays up, with no controllers paired.
 - **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the
   binder relay, and its native threads find its classes. No process crash-loops after boot.
-- **Next:** controller input (pointing at and clicking panels), and the Universal Menu.
+- **Next:** the Universal Menu (the Meta button does nothing yet), panels' bodies (the Store's),
+  and system_server's deaths by SIGPIPE (twice, soon after an app's window was placed).

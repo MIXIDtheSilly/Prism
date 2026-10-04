@@ -29,6 +29,8 @@
 // Images go to the PC's driver as gfxstream gets them, and NVIDIA's crashes (the whole emulator) on
 // one it doesn't support. Meta's code makes some a Quest's GPU has and the PC's doesn't (R8G8_SRGB):
 // Prism widens those to 32 bits (kNarrow), and fails any other unsupported or invalid image.
+// A wait on a fence or semaphore goes to the PC in slices of 100 ms (see "waits"): a wait there
+// that never ends stops the whole emulator.
 // Dispatchable handles are the driver's own, so the loader's dispatch works as it does with gfxstream
 // alone; Prism only intercepts functions by name.
 
@@ -164,6 +166,8 @@ static struct {
   PFN_vkResetFences ResetFences;
   PFN_vkGetFenceStatus GetFenceStatus;
   PFN_vkWaitForFences WaitForFences;
+  PFN_vkWaitSemaphores WaitSemaphores;
+  PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
   // debug.prism.vk.dump
   PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
   PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
@@ -2566,6 +2570,67 @@ static VkResult VKAPI_CALL prism_GetMemoryFdPropertiesKHR(VkDevice device, VkExt
   return VK_ERROR_INVALID_EXTERNAL_HANDLE;  // only for dma-bufs, which Prism doesn't offer
 }
 
+// --- waits ---------------------------------------------------------------------------------------
+
+// gfxstream makes a wait on the PC, as asked, on the render thread of the waiting process's
+// connection. One that never ends (on a fence or semaphore that a process which died was to
+// signal) holds that thread in the PC's driver for good, and the emulator ends a connection only
+// once its render thread is free, holding its global lock meanwhile: the whole emulator stops, and
+// its hang detector kills it 15 s later. So the PC waits WAIT_SLICE_NS at most, and longer waits
+// are made of such slices here.
+#define WAIT_SLICE_NS 100000000ull
+
+static uint64_t now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+// The time left until deadline (0: none, the first slice is all there is), as the next slice.
+static uint64_t next_slice(uint64_t deadline, uint64_t timeout, uint64_t *left) {
+  if (deadline) {
+    uint64_t now = now_ns();
+    timeout = now < deadline ? deadline - now : 0;
+  }
+  *left = timeout;
+  return timeout < WAIT_SLICE_NS ? timeout : WAIT_SLICE_NS;
+}
+
+static uint64_t deadline_of(uint64_t timeout) {
+  if (timeout <= WAIT_SLICE_NS) return 0;
+  uint64_t now = now_ns();
+  return timeout > UINT64_MAX - now ? UINT64_MAX : now + timeout;
+}
+
+static VkResult VKAPI_CALL prism_WaitForFences(VkDevice device, uint32_t count, const VkFence *fences,
+                                               VkBool32 all, uint64_t timeout) {
+  uint64_t deadline = deadline_of(timeout), left, slice;
+  for (;;) {
+    slice = next_slice(deadline, timeout, &left);
+    VkResult result = next.WaitForFences(device, count, fences, all, slice);
+    if (result != VK_TIMEOUT || slice == left) return result;
+  }
+}
+
+static VkResult wait_semaphores(PFN_vkWaitSemaphores down, VkDevice device, const VkSemaphoreWaitInfo *info,
+                                uint64_t timeout) {
+  uint64_t deadline = deadline_of(timeout), left, slice;
+  for (;;) {
+    slice = next_slice(deadline, timeout, &left);
+    VkResult result = down(device, info, slice);
+    if (result != VK_TIMEOUT || slice == left) return result;
+  }
+}
+
+static VkResult VKAPI_CALL prism_WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *info, uint64_t timeout) {
+  return wait_semaphores(next.WaitSemaphores, device, info, timeout);
+}
+
+static VkResult VKAPI_CALL prism_WaitSemaphoresKHR(VkDevice device, const VkSemaphoreWaitInfo *info,
+                                                   uint64_t timeout) {
+  return wait_semaphores(next.WaitSemaphoresKHR, device, info, timeout);
+}
+
 // --- dispatch ------------------------------------------------------------------------------------
 
 typedef struct {
@@ -2644,6 +2709,9 @@ static const Hook kHooks[] = {
     HOOK(CmdEndRenderPass2),
     HOOK(CmdEndRenderPass2KHR),
     HOOK(QueueSignalReleaseImageANDROID),
+    HOOK(WaitForFences),
+    HOOK(WaitSemaphores),
+    HOOK(WaitSemaphoresKHR),
     OWN(GetMemoryFdKHR),
     OWN(GetMemoryFdPropertiesKHR),
 };

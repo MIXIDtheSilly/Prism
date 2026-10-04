@@ -2,7 +2,7 @@
 stock image doesn't serve.
 
     work/build/hidl/prism_controller   vendor.oculus.hardware.sensors@1.0::IControllerProvider, Meta's
-                                       controller HAL, with no controllers paired
+                                       controller HAL, with two controllers paired
     work/build/hidl/prism_suspend      android.system.suspend@1.0::ISystemSuspend, backed by the AIDL
                                        system suspend service
     both installed in /system_ext/bin/hw
@@ -55,7 +55,8 @@ INCLUDES = [
 COMMON = ['system/system/lib64/libhidlbase.so', 'system/system/lib64/libutils.so', 'system/system/lib64/libcutils.so',
           'system/system/lib64/liblog.so', 'system/system/lib64/libc++.so']  # Horizon's arm64 builds
 BINARIES = {
-    'prism_controller': ('controller.cpp', ['odm/lib64/vendor.oculus.hardware.sensors@1.0.so']),
+    'prism_controller': ('controller.cpp', ['odm/lib64/vendor.oculus.hardware.sensors@1.0.so',
+                                            'system/system/lib64/libfmq.so']),
     'prism_suspend': ('suspend.cpp', ['system/system/lib64/android.system.suspend@1.0.so',
                                       'system/system/lib64/libbinder_ndk.so']),
 }

@@ -31,8 +31,32 @@ enum class ControllerType : uint32_t {};
 enum class CalibrationCachePolicy : uint32_t {};
 
 struct ControllerAddr;
-struct FmqConfig;
-struct PairedControllerInfo { uint8_t opaque; };  // only ever passed as an empty vector
+// A stream's notifications: the client's event flag word (a handle to its memory), and two bits
+// (FmqConfig is read as a handle and 8 more bytes).
+struct FmqConfig {
+  ::android::hardware::hidl_handle flag;
+  uint32_t bits[2];
+};
+static_assert(sizeof(FmqConfig) == 0x18, "as Meta's stub reads it");
+// A paired controller, as libsensorscommon's ControllerProviderEndpoint copies it into the HIDL
+// struct and CMSHeadset's ControllerGlue prints it ([PairedControllerInfo <type> <addr> connected
+// detached ... sn= fwver= model= rev= expectedfwver= mcnt=]).
+struct PairedControllerInfo {
+  uint32_t type;  // ControllerType
+  uint32_t reserved0;
+  uint64_t addr;  // the controller's id
+  bool connected, attached, update_required, asleep;
+  float battery;  // percent
+  char serial[16];
+  char firmware[64];
+  char model[64];
+  char hardware_rev[64];
+  char expected_firmware[64];
+  uint32_t unknown;
+  uint8_t extra[5][0x60];  // not known; zero
+  uint32_t mcnt;
+};
+static_assert(sizeof(PairedControllerInfo) == 0x310, "as Meta's stubs copy it");
 struct AdvertisingControllerInfo { uint8_t opaque; };  // likewise
 struct ControllerWirelessFreqBlocklist { uint8_t opaque[4]; };
 struct ControllerWirelessFreqBlocklists { hidl_vec<uint32_t> blocklists; };  // 4-byte elements

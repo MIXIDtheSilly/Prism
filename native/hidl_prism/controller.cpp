@@ -3,16 +3,29 @@
  * Meta's sensors HAL serves on a headset (talking to the controllers over the headset's radio).
  * CMSHeadset's controller service asks for it as it starts, and stops without it.
  *
- * Here no controllers are paired: the provider lists none, accepts the queues clients prepare for
- * each stream (it would write controller data into them), and its streaming and management clients
- * answer every request with "no", or with an empty answer: Meta's stubs abort the service when a
- * method doesn't call its callback. An arm64 daemon, run by the translator: its interfaces derive
- * from those in Horizon's vendor.oculus.hardware.sensors@1.0.so, whose stubs serve them.
+ * Here two Touch Plus controllers are paired and connected, the ones Prism's tracking service
+ * tracks (native/tracking_prism, the same ids). The provider lists them, and writes their states into
+ * the state stream CMSHeadset prepares (one PairedControllerInfo each), waking it through the event
+ * flag its FmqConfig shares, as a headset's sensors HAL does; CMSHeadset's ControllerGlue then
+ * reports them paired and active (OVRRemoteService, which first-time setup asks). It reads each one's
+ * calibration, and blocks a controller whose calibration is empty. The other streams' queues are
+ * accepted and left unwritten (Prism's tracking regions carry the controllers' input and poses),
+ * and the streaming and management clients answer everything else with "no", or with an empty
+ * answer: Meta's stubs abort the service when a method doesn't call its callback. An arm64 daemon,
+ * run by the translator: its interfaces derive from those in Horizon's
+ * vendor.oculus.hardware.sensors@1.0.so, whose stubs serve them.
  */
 #include <android/log.h>
+#include <fmq/EventFlag.h>
+#include <fmq/MessageQueue.h>
 #include <hidl/HidlTransportSupport.h>
+#include <sys/mman.h>
 
 #include <atomic>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "sensors_controller.h"
 
@@ -24,11 +37,52 @@ using namespace vendor::oculus::hardware::sensors::V1_0;
 using ::android::sp;
 using ::android::hardware::hidl_array;
 using ::android::hardware::hidl_vec;
+using ::android::hardware::EventFlag;
+using ::android::hardware::kSynchronizedReadWrite;
+using ::android::hardware::MessageQueue;
 using ::android::hardware::MQDescriptorSync;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
 
 namespace {
+
+// The controllers: two Touch Plus (Quest 3's), paired and connected, as a headset's HAL reports
+// them. Their ids are the ones Prism's tracking service gives them (native/tracking_prism).
+constexpr uint32_t RUBYPRQ = 6;  // ControllerType: Touch Plus
+constexpr uint64_t LEFT_ID = 1, RIGHT_ID = 2;
+
+PairedControllerInfo controller(uint64_t id, const char *serial) {
+  PairedControllerInfo c{};
+  c.type = RUBYPRQ;
+  c.addr = id;
+  c.connected = true;
+  c.battery = 100;
+  strncpy(c.serial, serial, sizeof c.serial - 1);
+  strcpy(c.firmware, "206.3.0");
+  strcpy(c.model, "ICM42686");  // its IMU
+  strcpy(c.hardware_rev, "0x9a");
+  return c;
+}
+
+std::vector<PairedControllerInfo> controllers() {
+  return {controller(LEFT_ID, "PRISM0LEFT"), controller(RIGHT_ID, "PRISM0RIGHT")};
+}
+
+// A client's queue of controllers' states: each state change is an entry, and the client is woken
+// through the event flag its FmqConfig shares.
+struct StateStream {
+  std::unique_ptr<MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>> queue;
+  EventFlag *flag = nullptr;
+  uint32_t bits = 0;
+};
+std::mutex g_streams_lock;
+std::vector<std::unique_ptr<StateStream>> g_streams;
+
+void send_states(StateStream &stream) {
+  for (const PairedControllerInfo &c : controllers())
+    if (!stream.queue->write(&c)) ERR("state stream full");
+  if (stream.flag) stream.flag->wake(stream.bits);
+}
 
 // Logs a request the first time it comes.
 #define ONCE(what)                     \
@@ -44,7 +98,11 @@ struct StreamingClient : IControllerStreamingClient {
   }
   Return<void> getCalibrationData(const ControllerAddr &, CalibrationCachePolicy,
                                   std::function<void(const ControllerCalibrationData &)> cb) override {
-    cb({});  // no controller: empty
+    // CMSHeadset blocks a controller whose calibration is empty. A headset's trackingservice reads
+    // it (the controller's LEDs and IMU); Prism's tracking is its own, so this one is nominal.
+    ControllerCalibrationData data{};
+    data.data = "{}";
+    cb(data);
     return Void();
   }
   Return<void> getAttachmentInfo(const ControllerAddr &, std::function<void(const ControllerAttachmentInfo &)> cb) override {
@@ -134,9 +192,32 @@ struct ManagementClient : IControllerManagementClient {
 
 struct Provider : IControllerProvider {
   Return<void> getPairedControllers(std::function<void(const hidl_vec<PairedControllerInfo> &)> cb) override {
-    ONCE("paired controllers: none");
-    cb({});
+    ONCE("paired controllers: two");
+    hidl_vec<PairedControllerInfo> paired(controllers());
+    cb(paired);
     return Void();
+  }
+  Return<Result> prepareStateStream(const MQDescriptorSync<PairedControllerInfo> &desc, const sp<ISensorClient> &,
+                                    const FmqConfig &config) override {
+    auto stream = std::make_unique<StateStream>();
+    stream->queue.reset(new MessageQueue<PairedControllerInfo, kSynchronizedReadWrite>(desc, false));
+    const native_handle_t *handle = config.flag.getNativeHandle();
+    LOG("state stream: queue %s, quantum %zu, %zu bytes; flag handle %d fds %d ints; bits %#x %#x",
+        stream->queue->isValid() ? "valid" : "invalid", desc.getQuantum(), desc.getSize(),
+        handle ? handle->numFds : -1, handle ? handle->numInts : -1, config.bits[0], config.bits[1]);
+    if (!stream->queue->isValid()) return Result::NOT_OK;
+    if (handle && handle->numFds > 0) {
+      void *word = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, handle->data[0], 0);
+      if (word == MAP_FAILED || EventFlag::createEventFlag(static_cast<std::atomic<uint32_t> *>(word), &stream->flag) != ::android::OK)
+        ERR("state stream: no event flag");
+    } else if (stream->queue->getEventFlagWord()) {
+      EventFlag::createEventFlag(stream->queue->getEventFlagWord(), &stream->flag);
+    }
+    stream->bits = config.bits[0] | config.bits[1];
+    send_states(*stream);
+    std::lock_guard<std::mutex> lock(g_streams_lock);
+    g_streams.push_back(std::move(stream));
+    return Result::OK;
   }
   Return<bool> setWirelessFreqBlocklist(const ControllerWirelessFreqBlocklist &) override { return true; }
   // Blocklists are accepted and dropped: there's no radio to keep them from.
@@ -165,7 +246,6 @@ struct Provider : IControllerProvider {
     ONCE("streaming client");
     return sp<IControllerStreamingClient>(new StreamingClient);
   }
-  STREAM(prepareStateStream, PairedControllerInfo)
   STREAM(prepareCurlStream, CurlData)
   STREAM(prepareImuStream, ControllerImuData)
   STREAM(prepareInputStream, ButtonData)
@@ -191,7 +271,7 @@ int main() {
     ERR("can't register %s/default: %d", IControllerProvider::descriptor, status);
     return 1;
   }
-  LOG("%s/default registered: no controllers paired", IControllerProvider::descriptor);
+  LOG("%s/default registered: two controllers paired", IControllerProvider::descriptor);
   ::android::hardware::joinRpcThreadpool();
   return 1;
 }

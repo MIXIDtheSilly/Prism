@@ -155,9 +155,9 @@ python tools\emulator.py status
 - **HIDL services** ([native/hidl_prism](../native/hidl_prism)). Arm64 daemons that derive from the
   interfaces in Horizon's own generated HIDL libraries, built against AOSP's headers
   (`tools/hidl.py`). Meta's controller HAL (`vendor.oculus.hardware.sensors@1.0::IControllerProvider`,
-  Meta's sensors HAL on a headset) has no controllers paired; its interface was recovered from that
-  library's vtables and stubs, which abort the service if a method doesn't call its callback, so
-  each one answers. The HIDL system suspend (`android.system.suspend@1.0`), which Meta's
+  Meta's sensors HAL on a headset) has two Touch Plus controllers paired and connected; its
+  interface was recovered from that library's vtables and stubs, which abort the service if a method
+  doesn't call its callback, so each one answers. The HIDL system suspend (`android.system.suspend@1.0`), which Meta's
   libnativewakelock uses, passes wakelocks to the AIDL service. Stock's manifest declares it only up
   to FCM level 6, below the emulator's, so deploy drops that limit; a second declaration would
   conflict, and a framework manifest that doesn't assemble stops every HAL lookup, and the boot.
@@ -221,6 +221,15 @@ python tools\emulator.py status
   mirror path; a headset's SurfaceFlinger can also submit panels to the runtime itself, as OpenXR
   layers (`libxrsurfaceflinger.so`, single-pass composition), which Horizon uses when a window
   isn't given a surface.
+- **Controllers.** Two Touch Plus controllers, in two places, as on a headset. Their tracking and
+  input are regions Prism's tracking service hosts (CONTROLLER and CONTROLLER_TRACKING, left and
+  right, listed in the input map), which the runtime and VrShell read: a controller follows the head,
+  pointing where it looks, or takes the pose and buttons `tools/head.py` sends (the mouse aims the
+  right one, its right button pulls the trigger). Their pairing is the controller HAL's: it lists
+  them and writes their states (`PairedControllerInfo`, 0x310 bytes) into the state stream CMSHeadset
+  prepares, which then reports them paired and active through OVRRemoteService (`dumpsys
+  OVRRemoteService`), once each has a calibration. CMSHeadset doesn't know their hands or tracking
+  yet (a headset's trackingservice tells it, as events), and VrShell doesn't show them yet.
 - **Pointing at panels.** VrShell sends the panel window you point at touches (hover, and taps),
   through Android's input on the default display, where the panels' windows are. Prism's layer
   for the compositor's output covers that display, and input drops touches to a window another

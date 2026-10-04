@@ -221,6 +221,11 @@ python tools\emulator.py status
   mirror path; a headset's SurfaceFlinger can also submit panels to the runtime itself, as OpenXR
   layers (`libxrsurfaceflinger.so`, single-pass composition), which Horizon uses when a window
   isn't given a surface.
+- **Pointing at panels.** VrShell sends the panel window you point at touches (hover, and taps),
+  through Android's input on the default display, where the panels' windows are. Prism's layer
+  for the compositor's output covers that display, and input drops touches to a window another
+  app's layer covers, so Prism makes it a trusted overlay. With no controllers, the pointer is your
+  head (`tools/head.py`); first-time setup's hover reaches it.
 - **CMSHeadset runs** (`com.oculus.os.cm`): with Prism's controller HAL and HIDL system suspend it
   starts all its roles and stays up, with no controllers paired.
 - **Presence runs** (`com.oculus.presence`): its native ID anonymizer reaches Java through the

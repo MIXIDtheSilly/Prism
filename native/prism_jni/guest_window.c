@@ -100,6 +100,15 @@ static ANativeWindow *create_host_window(JNIEnv *env, const char *name, int widt
   (*env)->CallObjectMethod(env, tx, (*env)->GetMethodID(env, tx_class, "setVisibility", sig), control, JNI_TRUE);
   (*env)->CallVoidMethod(env, tx, (*env)->GetMethodID(env, tx_class, "apply", "()V"));
   if (failed(env, "SurfaceControl.Transaction")) return NULL;
+  // On a headset no layer covers the panels' windows, which VrShell sends touches to (where you
+  // point). Input drops touches to a window that another app's layer covers, unless that layer is
+  // a trusted overlay (the compositor holds ACCESS_SURFACE_FLINGER).
+  jmethodID trusted = (*env)->GetMethodID(env, tx_class, "setTrustedOverlay", sig);
+  if (!failed(env, "SurfaceControl.Transaction.setTrustedOverlay")) {
+    (*env)->CallObjectMethod(env, tx, trusted, control, JNI_TRUE);
+    (*env)->CallVoidMethod(env, tx, (*env)->GetMethodID(env, tx_class, "apply", "()V"));
+    if (!failed(env, "trusted overlay")) LOGI("host window %s: a trusted overlay", name);
+  }
 
   jobject surface = (*env)->NewObject(
       env, surface_class, (*env)->GetMethodID(env, surface_class, "<init>", "(Landroid/view/SurfaceControl;)V"), control);

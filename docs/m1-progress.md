@@ -259,14 +259,14 @@ python tools\emulator.py status
   (`REMOTE: Hand=1/2`), yet neither hand gets an interaction profile, so their poses don't locate:
   that's why VrShell doesn't show them. It also reads the runtime's own state from inside the app
   (the session object, its controller snapshot, the selected profiles, each device's in-hand flag).
-- **Why no profile: the controllers aren't in hand.** xrSyncActions converts both Touch Plus every
-  frame, but a controller the runtime service doesn't take as held goes to the detached-controller
-  slot, which only apps enabling `XR_META_detached_controllers` see; sync drops it for everyone
-  else before picking profiles. With hand tracking off (`hand_tracking_opt_in` false), the service
-  takes in-hand from the controller itself: the tracking client reads it from the CONTROLLER
-  region at 0x250 (`{u8 in hand, u8 has a value}`, which Prism had taken for the thumbstick).
-  Prism now publishes it held, and the client reads it so (`0x101`), but the service's records
-  still say not in hand: the next thing to find.
+- **Controllers in hand.** A controller the runtime service doesn't take as held is a detached
+  controller, which only apps enabling `XR_META_detached_controllers` see; xrSyncActions drops it
+  for everyone else before picking interaction profiles. With hand tracking off
+  (`hand_tracking_opt_in` false) the service takes in-hand from the tracking client, which reads
+  it from the CONTROLLER_TRACKING region at 0xe38 (a snapshot of a u16: in hand, and known).
+  Prism publishes the controllers held, so each hand gets `meta/touch_controller_plus`, grip and
+  aim locate, and VrShell draws both Touch Plus with their pointer rays. (The 0x250 field in
+  CONTROLLER that looked like a candidate is the thumbstick.)
 - **A signed-in user.** Without a Meta account, the Library panel's system bar busy-waits for a
   user id (`ActiveImmersiveRepositoryImpl`): about 40,000 `getDefaultAccount` calls a second, until
   system_server runs out of memory and dies, and qemu with it (5-15 minutes after setup). An

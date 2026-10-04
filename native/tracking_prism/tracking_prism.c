@@ -38,12 +38,12 @@
  *   INPUT_TYPE_MAP (0xc8 bytes): the input devices, as (device id, specifier) pairs sorted by id,
  *     their count and a generation (two copies at 8, 0x60 each)
  *   CONTROLLER, left and right (0x7f8 bytes): its capabilities (0x000), live input (0x040),
- *     in hand (0x250), descriptor (0x3d0: device id, model, firmware, handedness, strings) and
+ *     thumbstick (0x250), descriptor (0x3d0: device id, model, firmware, handedness, strings) and
  *     battery (0x4a0). Buttons are counters of transitions, odd while down.
  *   CONTROLLER_TRACKING, left and right (0xe48 bytes): the latest pose sample (two copies of 0x78
  *     at 8), and a history of 32 (a sequence word at 0xf8, odd while a slot is written; slots at
  *     0x100). A sample is valid with its flag set, a nonzero quaternion and a time, and readers
- *     extrapolate it at most 0.2 s.
+ *     extrapolate it at most 0.2 s. At 0xe38, whether the controller is in a hand.
  * Hands, as a headset's are before any sample: HAND_TRACKER, left and right (0x13e8 bytes each):
  *   two hand snapshots (0x7c8 apart, at 8) and two hand configurations (0x68 apart, at 0x1308),
  *   whose times, -1, mean no sample yet. Without a host, their clients ask the broker again and again.
@@ -150,7 +150,7 @@ enum {
 #define INPUT 0x040
 #define INPUT_STRIDE 0xc8
 #define INPUT_SIZE 0xc4
-#define IN_HAND 0x250  // {u8 in hand, u8 has a value, 5 more}: read for the runtime service's in-hand flag
+#define STICK 0x250
 #define DESCRIPTOR 0x3d0
 #define DESCRIPTOR_SIZE 0x64
 #define BATTERY 0x4a0
@@ -183,6 +183,7 @@ _Static_assert(sizeof(struct latest_pose) == 0x78, "the latest pose's copies are
 #define HISTORY 0x100
 #define HISTORY_SLOTS 32
 #define TRACKING_EXTRA 0xe00  // a snapshot of {int64, double, double}: {-1, 0, 0} when there's none
+#define IN_HAND 0xe38         // a snapshot of a u16: in hand (low byte), and whether that's known (high)
 
 struct controller {
   int hand;  // LEFT or RIGHT
@@ -341,10 +342,8 @@ static void controller_ready(void *context, void *memory) {
   // Thumbstick range and size, the buttons it has, and two fields not known.
   const uint32_t capabilities[7] = {65535, 65535, 1, 1, ALL_BUTTONS, 0, 0};
   seed(region + CAPABILITIES, capabilities, sizeof capabilities, sizeof capabilities);
-  // Held: with hand tracking off, the runtime service takes a controller's in-hand flag from here, and
-  // an app sees only controllers in hand (the others are detached controllers, an extension's).
-  const uint8_t in_hand[7] = {1, 1};
-  seed(region + IN_HAND, in_hand, sizeof in_hand, 8);
+  const uint8_t stick[7] = {0, 0, 0xff, 0x7f, 0xff, 0x7f, 1};  // not touched, centered, valid
+  seed(region + STICK, stick, sizeof stick, 8);
   uint8_t descriptor[DESCRIPTOR_SIZE] = {0};
   uint64_t id = device_id(c);
   uint32_t model = DEVICE_MODEL, firmware = 0, hand = c->hand;
@@ -384,6 +383,11 @@ static void controller_tracking_ready(void *context, void *memory) {
     double a, b;
   } extra = {-1, 0, 0};
   seed(region + TRACKING_EXTRA, &extra, sizeof extra, sizeof extra);
+  // Held. With hand tracking off the runtime service takes this as the controller's in-hand flag, and
+  // an app sees only controllers in hand: the others are detached controllers, which only apps
+  // enabling XR_META_detached_controllers see.
+  const uint16_t in_hand = 0x0101;
+  seed(region + IN_HAND, &in_hand, sizeof in_hand, sizeof in_hand);
   c->tracking = region;
   pthread_mutex_unlock(&g_lock);
   LOG("%s controller tracking region at %p", c->hand == LEFT ? "left" : "right", memory);

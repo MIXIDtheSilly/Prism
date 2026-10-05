@@ -259,6 +259,9 @@ python tools\emulator.py status
   environment's floor and the Store's window bar show). Until it's done, VrShell holds any other
   immersive app back for Guardian setup (its "setup active" comes from Guardian's state, not from
   Android's provisioning settings).
+- **xrdemo** (`python tools/xrprobe.py xrdemo --install`, then `--start`, `adb logcat -s XrDemo`):
+  the smallest OpenXR app that draws, a moving grid in a stereo projection layer through Vulkan,
+  blue, or orange while a trigger is held. Built and installed like xrprobe.
 - **xrprobe** (`python tools/xrprobe.py --install`, then `--start`, `adb logcat -s XrProbe`): an
   OpenXR app, bound to the controllers as VrShell is, that logs its session states, each hand's
   interaction profile and the controllers' and headset's locations. It's a system app (Meta's
@@ -369,5 +372,18 @@ python tools\emulator.py status
   its windows onto a display of its own (`MirrorRoot for <token>`), where they're the only ones:
   Prism patches the service to send a panel's motion to that display. The system bar's Quick
   Settings opens (Quick Controls: volume, brightness, Wi-Fi, Bluetooth, boundary, Link).
-- **Next:** sideloaded apps in the library (Unknown Sources), then launching an OpenXR app from it;
-  system_server's deaths by SIGPIPE (twice, soon after an app's window was placed; none since).
+- **An immersive app.** xrdemo, an arm64 OpenXR app running through the translator, starts as
+  Horizon's immersive app (VrShell's immersive transition, the UI mode's immersive package), its
+  Vulkan session reaches FOCUSED and it submits 72 frames a second, which Meta's compositor shows
+  in place of Home; its trigger action follows the controller. The Meta button opens the
+  Universal Menu over it while it keeps rendering (VISIBLE), and the menu's Quit ends its session.
+  The running-app card says "App name unavailable": the library service has no record of a
+  system app it didn't install. OpenGL ES apps can't make swapchains yet: the runtime imports its
+  buffers into GL through `GL_EXT_memory_object_fd` or EGL dma-buf import, and the emulator's GLES
+  has neither (Vulkan apps, as most are, work).
+- **2D apps.** An ordinary Android app installed with adb opens as a Horizon panel, with its title
+  and window bar. The library service finds it as a sideloaded app at the next boot only (it
+  ignores the install itself).
+- **Next:** the library's tiles, drawn too close to the viewer and scattered (the side bar with
+  Unknown Sources isn't shown); GLES apps' swapchains; system_server's deaths by SIGPIPE (twice,
+  soon after an app's window was placed; none since).

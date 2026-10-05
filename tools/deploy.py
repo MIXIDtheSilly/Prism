@@ -7,6 +7,8 @@ What goes where:
     bind-mounts them over the stock directories in post-fs-data, before zygote starts.
   * Prism's JNI glue goes to /system/lib64; zygote preloads libprism_jni.so.
   * Prism's Vulkan driver goes to /vendor/lib64/hw (ro.hardware.vulkan=prism).
+  * Prism's GLES layer goes to /system_ext/lib64; prism.rc copies it to /data/local/debug/gles, the
+    one place Android's EGL loader takes layers from, and debug.gles.layers names it.
   * Prism's thermal and maintenance boot HALs go to /vendor/bin/hw, with their init scripts and
     VINTF declarations.
   * Prism's tracking service goes to /system_ext/bin, with its init script; it hosts Meta's
@@ -23,7 +25,7 @@ Package manager state and compiled code are reset, since the platform signature 
 
     python tools/emulator.py start --wait && python tools/emulator.py root   (once per AVD)
     python tools/jni/build.py && python tools/compat.py && python tools/translator.py && python tools/vulkan.py
-    python tools/thermal.py && python tools/tracking.py && python tools/hidl.py && python tools/relay.py
+    python tools/gles.py && python tools/thermal.py && python tools/tracking.py && python tools/hidl.py && python tools/relay.py
     python tools/spaces.py && python tools/guest_media.py
     python tools/deploy.py [--no-reboot]
 """
@@ -152,6 +154,9 @@ GUEST_LDCONFIG = '/system/etc/ld.config.arm64.txt'
 NATIVE_BRIDGE = 'libberberis_arm64.so'
 # Prism's Vulkan driver (tools/vulkan.py) wraps the emulator's; the loader picks vulkan.<this>.so.
 VULKAN_DRIVER = 'prism'
+# Prism's GLES layer (tools/gles.py): GL_EXT_memory_object_fd, for OpenGL ES apps' swapchains.
+GLES_LAYER = 'libgles_prism.so'
+GLES_LAYER_DIR = '/data/local/debug/gles'  # the EGL loader's one system layer directory
 # Meta daemons Prism runs: Horizon's init script for each, and the VINTF manifest fragments that
 # declare its stable-AIDL services (servicemanager refuses undeclared ones). Only these fragments
 # are installed: a declared service nobody serves makes clients wait for it forever.
@@ -377,6 +382,10 @@ def prism_props(images):
     props['ro.control_privapp_permissions'] = 'log'  # report missing allowlist entries, don't crash
     props['ro.dalvik.vm.native.bridge'] = NATIVE_BRIDGE
     props['ro.hardware.vulkan'] = VULKAN_DRIVER  # overrides /vendor/build.prop's: product loads last
+    # Meta's compositor on Vulkan, which shares clients' swapchains through Prism's Vulkan driver.
+    # On GL, VrShell aborts at its first surface swapchain: the compositor's surface reaches the
+    # binder bridge in a form it can't carry.
+    props['debug.oculus.compositorGpuApi'] = 'vk'
     # The compositor makes its GL contexts current without a surface, which the emulator's EGL
     # refuses (no EGL_KHR_surfaceless_context). Meta's switch gives each context a pbuffer instead.
     props['persist.oculus.forceGLESContextBuffer'] = 'true'
@@ -398,6 +407,10 @@ def prism_props(images):
     # it VrShell draws them into surfaces the compositor makes, which Prism's binder bridge
     # (native/binder_relay/guest_bridge.c) carries between the runtime and the app.
     props['persist.debug.vw.spc_disable'] = 'all'
+    # An OpenGL ES app's swapchain images are the compositor's memory, shared as file descriptors,
+    # which the runtime imports with GL_EXT_memory_object_fd; the emulator's GLES has none, and
+    # every GLES app's xrCreateSwapchain failed. Prism's GLES layer (native/gles_prism) adds it.
+    props['debug.gles.layers'] = GLES_LAYER
     return props
 
 
@@ -418,6 +431,9 @@ def build(args):
     vulkan = os.path.join(args.vulkan, f'vulkan.{VULKAN_DRIVER}.so')
     if not os.path.exists(vulkan):
         sys.exit(f'no Vulkan driver in {args.vulkan}; run: python tools/vulkan.py')
+    gles = os.path.join(args.gles, GLES_LAYER)
+    if not os.path.exists(gles):
+        sys.exit(f'no GLES layer in {args.gles}; run: python tools/gles.py')
     thermal = os.path.join(args.thermal, THERMAL_HAL)
     if not os.path.exists(thermal):
         sys.exit(f'no thermal HAL in {args.thermal}; run: python tools/thermal.py')
@@ -559,6 +575,10 @@ def build(args):
     with open(vulkan, 'rb') as f:
         overlay.add(f'/vendor/lib64/hw/vulkan.{VULKAN_DRIVER}.so', 'f', 0o644, data=f.read())
 
+    # Prism's GLES layer; prism.rc puts a copy where the EGL loader looks.
+    with open(gles, 'rb') as f:
+        overlay.add(f'/system_ext/lib64/{GLES_LAYER}', 'f', 0o644, data=f.read())
+
     # Prism's thermal HAL, beside the emulator's HIDL one (which the framework stops using).
     with open(thermal, 'rb') as f:
         overlay.add(f'/vendor/bin/hw/{THERMAL_HAL}', 'f', 0o755, gid=2000, data=f.read())
@@ -614,6 +634,11 @@ def build(args):
              '# Horizon directories kept on /data (system partitions are too small).',
              'on post-fs-data']
     lines += [f'    mount none {src} {dst} bind' for src, dst in binds]
+    lines += ["    # The EGL loader takes layers from /data only: Prism's GLES layer, copied there each boot.",
+              '    mkdir /data/local/debug 0755 root root',
+              f'    mkdir {GLES_LAYER_DIR} 0755 root root',
+              f'    copy /system_ext/lib64/{GLES_LAYER} {GLES_LAYER_DIR}/{GLES_LAYER}',
+              f'    chmod 0644 {GLES_LAYER_DIR}/{GLES_LAYER}']
     lines += ['',
               '# adb stays up whatever Horizon decides: Meta\'s software turns adb off (as a headset does',
               '# outside developer mode), and init then stops adbd. The emulator\'s adbd talks over a qemu',
@@ -730,6 +755,7 @@ def main():
     ap.add_argument('--compat', default=os.path.join('work', 'build', 'compat'))
     ap.add_argument('--translator', default=os.path.join('work', 'build', 'translator'))
     ap.add_argument('--vulkan', default=os.path.join('work', 'build', 'vulkan'))
+    ap.add_argument('--gles', default=os.path.join('work', 'build', 'gles'))
     ap.add_argument('--thermal', default=os.path.join('work', 'build', 'thermal'))
     ap.add_argument('--tracking', default=os.path.join('work', 'build', 'tracking'))
     ap.add_argument('--hidl', default=os.path.join('work', 'build', 'hidl'))

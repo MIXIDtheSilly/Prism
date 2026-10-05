@@ -5,15 +5,19 @@ run through the translator:
   hand's interaction profile, the controllers' locations). Renders nothing.
 - xrdemo (native/xrdemo): draws, a moving grid in a stereo projection layer, for seeing an
   immersive app's frames reach Horizon's compositor.
+- xrgame: xrdemo as a store app is: an ordinary app (installed with adb install) that bundles its
+  own OpenXR loader, Khronos's, which finds Horizon's runtime as a game's would.
 
-    work/build/<app>/<app>.apk   installed as /system_ext/app/<Dir>/<Dir>.apk
+    work/build/<app>/<app>.apk   xrprobe and xrdemo installed as /system_ext/app/<Dir>/<Dir>.apk
 
-    python tools/xrprobe.py [xrdemo] [--ndk PATH] [--install] [--start]   then: adb logcat -s XrProbe (XrDemo)
+    python tools/xrprobe.py [xrdemo|xrgame] [--ndk PATH] [--install] [--start]
+    then: adb logcat -s XrProbe (XrDemo)
 
-It loads Meta's OpenXR loader, a system library an app can't load, so it's a system app: --install
-puts it there (the emulator then needs a restart, for the package manager to find it) and --start
-starts it. The OpenXR headers are downloaded once, from Khronos, into
-work/build/xrprobe/include; the signing key is made once with openssl.
+xrprobe and xrdemo load Meta's OpenXR loader, a system library an app can't load, so they're system
+apps: --install puts them there (the emulator then needs a restart, for the package manager to find
+them). --start starts the app. The OpenXR headers are downloaded once, from Khronos, into
+work/build/<app>/include, and Khronos's loader is built once from the OpenXR SDK's source in
+work/build/openxr-sdk; the signing key is made once with openssl.
 """
 import argparse
 import glob
@@ -30,10 +34,12 @@ sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import find_ndk  # noqa: E402
 from emulator import SERIAL, adb_path  # noqa: E402
 
-APPS = {  # name: (package, system app directory, log tag, graphics libraries)
-    'xrprobe': ('com.prism.xrprobe', 'PrismXrProbe', 'XrProbe', ['-lEGL']),
-    'xrdemo': ('com.prism.xrdemo', 'PrismXrDemo', 'XrDemo', ['-lvulkan']),
+APPS = {  # name: (package, system app directory or None, source, log tag, graphics libraries)
+    'xrprobe': ('com.prism.xrprobe', 'PrismXrProbe', 'xrprobe', 'XrProbe', ['-lEGL']),
+    'xrdemo': ('com.prism.xrdemo', 'PrismXrDemo', 'xrdemo', 'XrDemo', ['-lvulkan']),
+    'xrgame': ('com.prism.xrgame', None, 'xrdemo', 'XrDemo', ['-lvulkan']),  # bundles Khronos's loader
 }
+LOADER = 'release-1.1.63'  # Khronos's OpenXR SDK, for xrgame's loader
 HEADERS = 'https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/'
 API = 29
 MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
@@ -42,14 +48,18 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
   <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
   <uses-feature android:name="com.oculus.feature.BOUNDARYLESS_APP" android:required="true" />  <!-- no boundary setup first -->
   <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+  <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+  <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
   <queries>
     <package android:name="com.oculus.systemdriver" />  <!-- the runtime, which the loader looks up -->
+    <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+    <intent><action android:name="org.khronos.openxr.OpenXRRuntimeService" /></intent>
   </queries>
   <application android:label="{name}" android:hasCode="false" android:extractNativeLibs="false">
     <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s|quest2|questpro" />
     <activity android:name="android.app.NativeActivity" android:exported="true" android:launchMode="singleTask"
         android:screenOrientation="landscape" android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
-      <meta-data android:name="android.app.lib_name" android:value="{name}" />
+      <meta-data android:name="android.app.lib_name" android:value="{source}" />
       <intent-filter>
         <action android:name="android.intent.action.MAIN" />
         <category android:name="android.intent.category.LAUNCHER" />
@@ -92,6 +102,33 @@ def signing_key(out):
     return key, cert
 
 
+def khronos_loader(ndk):
+    """Khronos's OpenXR loader for arm64 Android, built from the SDK's source (Apache 2.0)."""
+    top = os.path.join(ROOT, 'work', 'build', 'openxr-sdk')
+    lib = os.path.join(top, 'build-arm64', 'src', 'loader', 'libopenxr_loader.so')
+    if os.path.exists(lib):
+        return lib
+    source = os.path.join(top, f'OpenXR-SDK-{LOADER}')
+    if not os.path.isdir(source):
+        os.makedirs(top, exist_ok=True)
+        archive = os.path.join(top, 'sdk.tar.gz')
+        urllib.request.urlretrieve(f'https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/{LOADER}.tar.gz', archive)
+        import tarfile
+        with tarfile.open(archive) as t:
+            t.extractall(top)
+    sdk = os.path.dirname(os.path.dirname(adb_path()))
+    cmake_bin = os.path.join(sorted(glob.glob(os.path.join(sdk, 'cmake', '*')))[-1], 'bin')
+    exe = '.exe' if os.name == 'nt' else ''
+    cmake = os.path.join(cmake_bin, 'cmake' + exe)
+    build = os.path.join(top, 'build-arm64')
+    subprocess.run([cmake, '-S', source, '-B', build, '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM={os.path.join(cmake_bin, "ninja" + exe)}',
+                    f'-DCMAKE_TOOLCHAIN_FILE={os.path.join(ndk, "build", "cmake", "android.toolchain.cmake")}',
+                    '-DANDROID_ABI=arm64-v8a', f'-DANDROID_PLATFORM=android-{API}', '-DCMAKE_BUILD_TYPE=Release',
+                    '-DBUILD_TESTS=OFF', '-DBUILD_API_LAYERS=OFF', '-DDYNAMIC_LOADER=ON'], check=True)
+    subprocess.run([cmake, '--build', build, '--target', 'openxr_loader'], check=True)
+    return lib
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('app', nargs='?', choices=sorted(APPS), default='xrprobe')
@@ -101,7 +138,7 @@ def main():
     ap.add_argument('--start', action='store_true', help='start it')
     args = ap.parse_args()
     name = args.app
-    package, folder, tag, graphics = APPS[name]
+    package, folder, source, tag, graphics = APPS[name]
     system_dir = f'/system_ext/app/{folder}'
     out = os.path.abspath(args.out or os.path.join('work', 'build', name))
     os.makedirs(out, exist_ok=True)
@@ -110,21 +147,23 @@ def main():
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
     clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
     glue = os.path.join(ndk, 'sources', 'android', 'native_app_glue')
-    lib = os.path.join(out, f'lib{name}.so')
+    lib = os.path.join(out, f'lib{source}.so')
     subprocess.run([clang, f'--target=aarch64-linux-android{API}', '-shared', '-fPIC', '-O2', '-std=c11', '-Wall',
-                    '-I', headers(out), '-I', glue, os.path.join(ROOT, 'native', name, f'{name}.c'), os.path.join(glue, 'android_native_app_glue.c'),
+                    '-I', headers(out), '-I', glue, os.path.join(ROOT, 'native', source, f'{source}.c'), os.path.join(glue, 'android_native_app_glue.c'),
                     '-u', 'ANativeActivity_onCreate', '-o', lib, '-landroid', '-llog', *graphics, '-ldl'], check=True)
 
     tools, android_jar = build_tools()
     exe = '.exe' if os.name == 'nt' else ''
     manifest = os.path.join(out, 'AndroidManifest.xml')
     with open(manifest, 'w') as f:
-        f.write(MANIFEST.format(package=package, name=name))
+        f.write(MANIFEST.format(package=package, name=name, source=source))
     unsigned, aligned, apk = (os.path.join(out, name) for name in ('unsigned.apk', 'aligned.apk', f'{name}.apk'))
     subprocess.run([os.path.join(tools, 'aapt2' + exe), 'link', '-o', unsigned, '--manifest', manifest, '-I', android_jar,
                     '--min-sdk-version', str(API), '--target-sdk-version', '32'], check=True)
     with zipfile.ZipFile(unsigned, 'a', zipfile.ZIP_STORED) as z:  # loaded from the APK, page-aligned
-        z.write(lib, f'lib/arm64-v8a/lib{name}.so')
+        z.write(lib, f'lib/arm64-v8a/lib{source}.so')
+        if not folder:
+            z.write(khronos_loader(ndk), 'lib/arm64-v8a/libopenxr_loader.so')
     subprocess.run([os.path.join(tools, 'zipalign' + exe), '-f', '-p', '4', unsigned, aligned], check=True)
     key, cert = signing_key(out)
     apksigner = os.path.join(tools, 'apksigner' + ('.bat' if os.name == 'nt' else ''))
@@ -132,7 +171,10 @@ def main():
     print(f'built {apk}')
 
     adb = [adb_path(), '-s', SERIAL]
-    if args.install:
+    if args.install and not folder:
+        subprocess.run(adb + ['install', '-r', apk], check=True)
+        print('installed')
+    elif args.install:
         subprocess.run(adb + ['root'], check=True, capture_output=True)
         subprocess.run(adb + ['wait-for-device'], check=True)
         installed = subprocess.run(adb + ['shell', 'pm', 'path', package], capture_output=True, text=True).stdout

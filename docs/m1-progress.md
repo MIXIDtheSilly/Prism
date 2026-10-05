@@ -261,7 +261,9 @@ python tools\emulator.py status
   Android's provisioning settings).
 - **xrdemo** (`python tools/xrprobe.py xrdemo --install`, then `--start`, `adb logcat -s XrDemo`):
   the smallest OpenXR app that draws, a moving grid in a stereo projection layer through Vulkan,
-  blue, or orange while a trigger is held. Built and installed like xrprobe.
+  blue, or orange while a trigger is held. Built and installed like xrprobe. `xrgame` is the same
+  app as a store game is: an ordinary app (`adb install`) bundling its own loader, Khronos's, built
+  from the OpenXR SDK's source into `work/build/openxr-sdk`.
 - **xrprobe** (`python tools/xrprobe.py --install`, then `--start`, `adb logcat -s XrProbe`): an
   OpenXR app, bound to the controllers as VrShell is, that logs its session states, each hand's
   interaction profile and the controllers' and headset's locations. It's a system app (Meta's
@@ -377,6 +379,9 @@ python tools\emulator.py status
   Vulkan session reaches FOCUSED and it submits 72 frames a second, which Meta's compositor shows
   in place of Home; its trigger action follows the controller. The Meta button opens the
   Universal Menu over it while it keeps rendering (VISIBLE), and the menu's Quit ends its session.
+  xrgame runs the same way: Horizon's runtime brokers are disabled stubs (stock: they return no
+  cursor), so its loader takes `/product/etc/openxr/1/active_runtime.aarch64.json` and loads the
+  runtime from VrDriver's APK, as a game's loader does on a headset.
   The running-app card says "App name unavailable": the library service has no record of a
   system app it didn't install. OpenGL ES apps can't make swapchains yet: the runtime imports its
   buffers into GL through `GL_EXT_memory_object_fd` or EGL dma-buf import, and the emulator's GLES

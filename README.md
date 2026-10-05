@@ -1,4 +1,4 @@
-# Prism
+![Prism](img/prism_banner.png)
 
 Prism is an experimental Horizon OS emulator for Windows PCs. It aims to run Meta's own Horizon
 OS system software (the home environment, system UI, panels and apps) on a PC, in a desktop window

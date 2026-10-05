@@ -316,6 +316,34 @@ static const struct {
 typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
 static CreateNamespaceFn g_create_namespace;
 
+// An app zygote (Chrome's browser_zygote, webview_zygote) preloads the app's libraries, so it makes
+// the first namespace, but it forks only once it is down to one thread: ZygoteHooks.preFork lists
+// /proc/self/task until then, and pool threads never exit. libbinder's ProcessState also can't be
+// used in a child of the process that made it. So in a zygote Prism only preloads, and each child
+// starts its own pool at its next namespace or library.
+static void (*g_start_pool)(void);
+static atomic_int g_pool_pid;  // the process whose pool Prism started: a fork's child has none
+
+// By name: app zygotes are "<process>_zygote" (webview_zygote too). Not by SELinux domain: system
+// apps with no seapp_contexts entry stay in zygote's.
+static int in_zygote(void) {
+  char name[256] = {0};
+  FILE *cmdline = fopen("/proc/self/cmdline", "re");
+  if (!cmdline) return 0;
+  fread(name, 1, sizeof name - 1, cmdline);
+  fclose(cmdline);
+  size_t n = strlen(name);
+  return !strcmp(name, "zygote") || !strcmp(name, "zygote64") || (n >= 7 && !strcmp(name + n - 7, "_zygote"));
+}
+
+static void start_guest_pool(const char *when) {
+  int pid = getpid();
+  if (!g_start_pool || atomic_load(&g_pool_pid) == pid || in_zygote()) return;
+  if (atomic_exchange(&g_pool_pid, pid) == pid) return;
+  g_start_pool();
+  LOGI("arm64 binder thread pool started (%s)", when);
+}
+
 static void *bridge_create_namespace(const char *name, const char *ld_path, const char *default_path, uint64_t type,
                                      const char *permitted, void *parent) {
   static atomic_int preloaded;
@@ -329,14 +357,14 @@ static void *bridge_create_namespace(const char *name, const char *ld_path, cons
       if (!handle) LOGW("arm64 %s: not preloaded", kGuestPreload[i].name);
       if (i == 0) binder_ndk = handle;
     }
-    void (*start_pool)(void) =
+    g_start_pool =
         binder_ndk ? (void (*)(void))g_bridge->get_trampoline_with_jni_call_type(binder_ndk, "ABinderProcess_startThreadPool",
                                                                                  "V", 1, kJNICallTypeCriticalNative)
                    : NULL;
-    if (start_pool) start_pool();
-    LOGI("arm64 binder libraries preloaded before namespace %s%s", name, start_pool ? ", thread pool started" : "");
+    LOGI("arm64 binder libraries preloaded before namespace %s", name);
     if (g_set_executable) g_set_executable(APP_PROCESS, sizeof APP_PROCESS - 1);
   }
+  start_guest_pool(name);
   return g_create_namespace(name, ld_path, default_path, type, permitted, parent);
 }
 
@@ -346,6 +374,7 @@ typedef void *(*LoadLibraryExtFn)(const char *, int, void *);
 static LoadLibraryExtFn g_load_library_ext;
 
 static void *bridge_load_library_ext(const char *path, int flags, void *ns) {
+  start_guest_pool(path);
   void *handle = g_load_library_ext(path, flags, ns);
   if (handle) prism_patch_guest_library(path);
   return handle;

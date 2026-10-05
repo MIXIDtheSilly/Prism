@@ -2573,13 +2573,17 @@ static VkResult VKAPI_CALL prism_GetMemoryFdPropertiesKHR(VkDevice device, VkExt
 
 // --- waits ---------------------------------------------------------------------------------------
 
-// gfxstream makes a wait on the PC, as asked, on the render thread of the waiting process's
-// connection. One that never ends (on a fence or semaphore that a process which died was to
-// signal) holds that thread in the PC's driver for good, and the emulator ends a connection only
-// once its render thread is free, holding its global lock meanwhile: the whole emulator stops, and
-// its hang detector kills it 15 s later. So the PC waits WAIT_SLICE_NS at most, and longer waits
-// are made of such slices here.
-#define WAIT_SLICE_NS 100000000ull
+// gfxstream makes a wait on the PC, as asked, and the waiting thread spins on its connection's ring
+// buffer until the PC answers (AddressSpaceStream::speculativeRead backs off to sleeping only after
+// tens of millions of tries): a whole vCPU for as long as the GPU takes, which for the compositor
+// waiting on a frame is most of the frame. A wait that never ends (on a fence or semaphore that a
+// process which died was to signal) would also hold that connection's render thread in the PC's
+// driver for good, and the emulator ends a connection only once its render thread is free, holding
+// its global lock meanwhile: the whole emulator stops, and its hang detector kills it 15 s later.
+// So the PC never waits: Prism asks without a timeout and sleeps here between asks, POLL_MIN_NS
+// first, doubling to POLL_MAX_NS. Each ask is one short round trip.
+#define POLL_MIN_NS 100000ull  // 0.1 ms
+#define POLL_MAX_NS 500000ull  // 0.5 ms: what a finished wait can be late by
 
 static uint64_t now_ns(void) {
   struct timespec t;
@@ -2587,39 +2591,37 @@ static uint64_t now_ns(void) {
   return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
 
-// The time left until deadline (0: none, the first slice is all there is), as the next slice.
-static uint64_t next_slice(uint64_t deadline, uint64_t timeout, uint64_t *left) {
-  if (deadline) {
-    uint64_t now = now_ns();
-    timeout = now < deadline ? deadline - now : 0;
-  }
-  *left = timeout;
-  return timeout < WAIT_SLICE_NS ? timeout : WAIT_SLICE_NS;
+// Sleeps before the next ask; 0 once the deadline has passed.
+static int poll_pause(uint64_t deadline, uint64_t *pause) {
+  uint64_t now = now_ns();
+  if (now >= deadline) return 0;
+  uint64_t ns = deadline - now < *pause ? deadline - now : *pause;
+  struct timespec t = {(time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull)};
+  nanosleep(&t, NULL);
+  *pause = *pause * 2 < POLL_MAX_NS ? *pause * 2 : POLL_MAX_NS;
+  return 1;
 }
 
 static uint64_t deadline_of(uint64_t timeout) {
-  if (timeout <= WAIT_SLICE_NS) return 0;
   uint64_t now = now_ns();
   return timeout > UINT64_MAX - now ? UINT64_MAX : now + timeout;
 }
 
 static VkResult VKAPI_CALL prism_WaitForFences(VkDevice device, uint32_t count, const VkFence *fences,
                                                VkBool32 all, uint64_t timeout) {
-  uint64_t deadline = deadline_of(timeout), left, slice;
+  uint64_t deadline = deadline_of(timeout), pause = POLL_MIN_NS;
   for (;;) {
-    slice = next_slice(deadline, timeout, &left);
-    VkResult result = next.WaitForFences(device, count, fences, all, slice);
-    if (result != VK_TIMEOUT || slice == left) return result;
+    VkResult result = next.WaitForFences(device, count, fences, all, 0);
+    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return result;
   }
 }
 
 static VkResult wait_semaphores(PFN_vkWaitSemaphores down, VkDevice device, const VkSemaphoreWaitInfo *info,
                                 uint64_t timeout) {
-  uint64_t deadline = deadline_of(timeout), left, slice;
+  uint64_t deadline = deadline_of(timeout), pause = POLL_MIN_NS;
   for (;;) {
-    slice = next_slice(deadline, timeout, &left);
-    VkResult result = down(device, info, slice);
-    if (result != VK_TIMEOUT || slice == left) return result;
+    VkResult result = down(device, info, 0);
+    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return result;
   }
 }
 

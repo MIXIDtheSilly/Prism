@@ -304,8 +304,17 @@ python tools\emulator.py status
   hanging thread 'QEMU2 main loop'"). A gfxstream render thread was in NVIDIA's driver, waiting
   without end on a sync object for a guest Vulkan wait (`vkWaitSemaphores`, by its decoder case)
   whose signaller had died, and ending that process's connection waits for that thread. Prism's
-  Vulkan driver now hands the PC waits of at most 100 ms (fences and semaphores) and waits out the
-  rest in the guest; killing the runtime service no longer stops the emulator.
+  Vulkan driver now never has the PC wait (fences and semaphores): it asks with no timeout and
+  sleeps in the guest between asks, 0.1 ms doubling to 0.5 ms; killing the runtime service no
+  longer stops the emulator. Asking that way also stops a guest spin: while the PC waits, the
+  waiting thread spins on gfxstream's ring buffer (`AddressSpaceStream::speculativeRead`), and the
+  runtime service's frame waits kept one of its binder threads at 50-97% of a vCPU.
+- **Chrome's app zygote spinning** (`com.oculus.browser_zygote` at ~90% of a vCPU, and no
+  renderer ever started): Prism started the arm64 libbinder's thread pool at the first namespace,
+  which an app zygote makes while preloading, and a zygote forks only once it's down to one thread
+  (`ZygoteHooks.preFork` lists /proc/self/task until then). libprism_jni now leaves a zygote's
+  pool alone (by process name: `zygote`, `zygote64`, `*_zygote`) and each child starts its own at
+  its next namespace or arm64 library.
 - **The guest pausing.** When the whole guest stalls for seconds (the PC busy), gfxstream's guest
   health monitor reports every stream as hung, with the encoder's current packet as hex
   (`VkEncoder::getPacketContents`); between packets that packet's pointer is null, and the report

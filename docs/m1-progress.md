@@ -98,9 +98,10 @@ python tools\emulator.py status
   a headset's display scans out as it is drawn; here nothing reaches SurfaceFlinger unless a buffer
   is queued. Prism refuses that surface with a real EGL error, and the compositor falls back to a
   back buffer it swaps each frame.
-- **Vulkan compositor** (`setprop debug.oculus.compositorGpuApi vk`, not yet the default). The
-  emulator's GLES lacks `GL_EXT_memory_object_fd`, so the GL compositor can't sample clients'
-  Vulkan swapchains; the Vulkan one shares them through Prism's driver. The x86_64 Vulkan loader
+- **Vulkan compositor** (`debug.oculus.compositorGpuApi=vk`, which deploy sets). The GL
+  compositor needs `GL_EXT_memory_object_fd` to sample clients' Vulkan swapchains, and its surface
+  swapchains abort VrShell (their producers don't cross the binder bridge); the Vulkan one shares
+  them through Prism's driver. The x86_64 Vulkan loader
   drives the window too, so the translator's Vulkan proxy is patched (its table of loader
   functions) to give `vkCreateAndroidSurfaceKHR` the same stand-in window as EGL.
 - **arm64 libraries by path.** Meta's code dlopens some platform libraries by absolute path
@@ -263,7 +264,8 @@ python tools\emulator.py status
   the smallest OpenXR app that draws, a moving grid in a stereo projection layer through Vulkan,
   blue, or orange while a trigger is held. Built and installed like xrprobe. `xrgame` is the same
   app as a store game is: an ordinary app (`adb install`) bundling its own loader, Khronos's, built
-  from the OpenXR SDK's source into `work/build/openxr-sdk`.
+  from the OpenXR SDK's source into `work/build/openxr-sdk`; `xrgles` is xrgame drawing with
+  OpenGL ES.
 - **xrprobe** (`python tools/xrprobe.py --install`, then `--start`, `adb logcat -s XrProbe`): an
   OpenXR app, bound to the controllers as VrShell is, that logs its session states, each hand's
   interaction profile and the controllers' and headset's locations. It's a system app (Meta's
@@ -383,9 +385,26 @@ python tools\emulator.py status
   cursor), so its loader takes `/product/etc/openxr/1/active_runtime.aarch64.json` and loads the
   runtime from VrDriver's APK, as a game's loader does on a headset.
   The running-app card says "App name unavailable": the library service has no record of a
-  system app it didn't install. OpenGL ES apps can't make swapchains yet: the runtime imports its
-  buffers into GL through `GL_EXT_memory_object_fd` or EGL dma-buf import, and the emulator's GLES
-  has neither (Vulkan apps, as most are, work).
+  system app it didn't install.
+- **OpenGL ES apps.** The runtime's swapchain images are the compositor's, shared with the app as
+  file descriptors, which it imports into GL through `GL_EXT_memory_object_fd` or EGL dma-buf
+  import; the emulator's GLES has neither, and a GLES app's `xrCreateSwapchain` failed. Prism's
+  GLES layer (`native/gles_prism`, `tools/gles.py`; Android's EGL loader takes it from
+  `/data/local/debug/gles`, named by `debug.gles.layers`) adds the extension: an fd from Prism's
+  Vulkan driver holds an AHardwareBuffer (the image, or for two layers a mirror with them
+  stacked), the texture gets ordinary storage of its format, and before the app's next fence a
+  draw in a context of the layer's own copies what was written into the buffer, re-encoding sRGB
+  (the emulator has no raw copy). xrgles (xrgame drawing with GLES) runs at 72 frames a second,
+  upright and in the same colors as xrgame, with an image per eye or one image of two layers
+  (`debug.prism.xrdemo.layers=2`). Meta's switch `persist.oculus.useGraphicBuffers` (swapchains as
+  AHardwareBuffers) is no way around it: gralloc here makes no layered buffers, and VrShell's
+  multiview swapchains fail. The emulator's GLES advertises the PC's `GL_OVR_multiview2` but its
+  encoder has none of its functions; Guardian, which renders multiview without asking, aborted on
+  an incomplete framebuffer whenever it showed (an app's exit, say), and with the extension hidden
+  jumped to a null function instead. The layer emulates multiview: a multiview attachment is its
+  base view's layer, a draw or clear into it is made once a view with that view's layer attached,
+  and a shader's `gl_ViewID_OVR` becomes a uniform the layer sets. Guardian's framebuffers are
+  complete and its frames reach the compositor. (A multiview GLES game is untried.)
 - **2D apps.** An ordinary Android app installed with adb opens as a Horizon panel, with its title
   and window bar.
 - **Launching from the library.** The library's menu (its side bar) has All, Unknown Sources and
@@ -395,5 +414,5 @@ python tools\emulator.py status
   library is a cylinder layer around the viewer, its tiles bowed and tilted toward its edges as
   they should be; its glass background isn't drawn (the dark card behind it is the Store's
   window), and the first tile of All is blank (an app without an icon).
-- **Next:** panels' glass backgrounds; GLES apps' swapchains; a real game; system_server's deaths by SIGPIPE (twice,
+- **Next:** panels' glass backgrounds; system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

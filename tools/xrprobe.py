@@ -7,10 +7,11 @@ run through the translator:
   immersive app's frames reach Horizon's compositor.
 - xrgame: xrdemo as a store app is: an ordinary app (installed with adb install) that bundles its
   own OpenXR loader, Khronos's, which finds Horizon's runtime as a game's would.
+- xrgles: xrgame drawing with OpenGL ES instead of Vulkan.
 
     work/build/<app>/<app>.apk   xrprobe and xrdemo installed as /system_ext/app/<Dir>/<Dir>.apk
 
-    python tools/xrprobe.py [xrdemo|xrgame] [--ndk PATH] [--install] [--start]
+    python tools/xrprobe.py [xrdemo|xrgame|xrgles] [--ndk PATH] [--install] [--start]
     then: adb logcat -s XrProbe (XrDemo)
 
 xrprobe and xrdemo load Meta's OpenXR loader, a system library an app can't load, so they're system
@@ -34,10 +35,11 @@ sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import find_ndk  # noqa: E402
 from emulator import SERIAL, adb_path  # noqa: E402
 
-APPS = {  # name: (package, system app directory or None, source, log tag, graphics libraries)
+APPS = {  # name: (package, system app directory or None, source, log tag, compiler flags and libraries)
     'xrprobe': ('com.prism.xrprobe', 'PrismXrProbe', 'xrprobe', 'XrProbe', ['-lEGL']),
     'xrdemo': ('com.prism.xrdemo', 'PrismXrDemo', 'xrdemo', 'XrDemo', ['-lvulkan']),
     'xrgame': ('com.prism.xrgame', None, 'xrdemo', 'XrDemo', ['-lvulkan']),  # bundles Khronos's loader
+    'xrgles': ('com.prism.xrgles', None, 'xrdemo', 'XrDemo', ['-DXRDEMO_GLES', '-lEGL', '-lGLESv3']),  # xrgame on GLES
 }
 LOADER = 'release-1.1.63'  # Khronos's OpenXR SDK, for xrgame's loader
 HEADERS = 'https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/'

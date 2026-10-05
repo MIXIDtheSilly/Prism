@@ -5,8 +5,10 @@
  * projection layer in LOCAL space. Holding either trigger turns the scene from blue to orange. It
  * logs (tag XrDemo) its session states, its swapchains and, once a second, the frames it submitted.
  *
- * Vulkan, as most Quest apps (and VrShell) use: the runtime's GLES swapchains import its buffers
- * through GL_EXT_memory_object_fd or EGL dma-buf import, which the emulator's GLES doesn't have.
+ * Vulkan, as most Quest apps (and VrShell) use; built with XRDEMO_GLES it uses OpenGL ES instead
+ * (XR_KHR_opengl_es_enable, a pbuffer context, scissored clears into a framebuffer per image), and
+ * with debug.prism.xrdemo.layers=2 one swapchain of two layers, an eye a layer, as multiview apps
+ * have. A bar 30% of the way down each eye's image tells up from down.
  * Like xrprobe, it loads Meta's OpenXR loader (libopenxr_loader.so, from the image).
  */
 #include <android/log.h>
@@ -15,12 +17,19 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/system_properties.h>
 #include <time.h>
-#include <vulkan/vulkan.h>
 
+#ifdef XRDEMO_GLES
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#define XR_USE_GRAPHICS_API_OPENGL_ES
+#else
+#include <vulkan/vulkan.h>
+#define XR_USE_GRAPHICS_API_VULKAN
+#endif
 #define XR_NO_PROTOTYPES  // its functions come from the loader, by name
 #define XR_USE_PLATFORM_ANDROID
-#define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -37,8 +46,16 @@ static XrInstance instance;
   F(xrCreateActionSet) F(xrCreateAction) F(xrSuggestInteractionProfileBindings) F(xrAttachSessionActionSets)    \
   F(xrSyncActions) F(xrGetActionStateFloat) F(xrLocateViews) F(xrEnumerateViewConfigurationViews)              \
   F(xrEnumerateSwapchainFormats) F(xrCreateSwapchain) F(xrEnumerateSwapchainImages) F(xrAcquireSwapchainImage) \
-  F(xrWaitSwapchainImage) F(xrReleaseSwapchainImage) F(xrGetVulkanGraphicsRequirements2KHR)                     \
-  F(xrCreateVulkanInstanceKHR) F(xrGetVulkanGraphicsDevice2KHR) F(xrCreateVulkanDeviceKHR)
+  F(xrWaitSwapchainImage) F(xrReleaseSwapchainImage) GRAPHICS_FUNCTIONS(F)
+
+#ifdef XRDEMO_GLES
+#define GRAPHICS_FUNCTIONS(F) F(xrGetOpenGLESGraphicsRequirementsKHR)
+#define GRAPHICS_EXTENSION XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME
+#else
+#define GRAPHICS_FUNCTIONS(F) \
+  F(xrGetVulkanGraphicsRequirements2KHR) F(xrCreateVulkanInstanceKHR) F(xrGetVulkanGraphicsDevice2KHR) F(xrCreateVulkanDeviceKHR)
+#define GRAPHICS_EXTENSION XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME
+#endif
 
 #define DECLARE(name) static PFN_##name name;
 XR_FUNCTIONS(DECLARE)
@@ -69,6 +86,7 @@ static const char *result(XrResult r) {
     }                                   \
   } while (0)
 
+#ifndef XRDEMO_GLES
 #define VK_CHECK(call)                \
   do {                                \
     VkResult v_ = (call);             \
@@ -77,6 +95,7 @@ static const char *result(XrResult r) {
       return false;                   \
     }                                 \
   } while (0)
+#endif
 
 static XrPath path(const char *text) {
   XrPath p = XR_NULL_PATH;
@@ -102,6 +121,7 @@ static bool loader(struct android_app *app) {
 }
 
 static XrSystemId system_id;
+static bool layered;  // one swapchain, an eye a layer (GLES only)
 static XrSession session;
 static XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 static bool running;
@@ -110,6 +130,19 @@ static XrActionSet set;
 static XrAction trigger;
 static XrPath hands[2];
 
+#define MAX_IMAGES 8
+#ifdef XRDEMO_GLES
+static EGLDisplay display;
+static EGLConfig config;
+static EGLContext context;
+
+static struct eye {
+  XrSwapchain swapchain;
+  int32_t width, height;
+  uint32_t images;
+  GLuint framebuffers[MAX_IMAGES];
+} eyes[2];
+#else
 static VkInstance vk_instance;
 static VkPhysicalDevice physical;
 static VkDevice device;
@@ -120,7 +153,6 @@ static VkCommandPool pool;
 static VkCommandBuffer commands;
 static VkFence fence;
 
-#define MAX_IMAGES 8
 static struct eye {
   XrSwapchain swapchain;
   int32_t width, height;
@@ -128,9 +160,10 @@ static struct eye {
   VkImageView views[MAX_IMAGES];
   VkFramebuffer framebuffers[MAX_IMAGES];
 } eyes[2];
+#endif
 
 static bool create_instance(struct android_app *app) {
-  const char *enabled[] = {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+  const char *enabled[] = {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, GRAPHICS_EXTENSION};
   XrInstanceCreateInfoAndroidKHR android = {XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR, NULL, app->activity->vm, app->activity->clazz};
   XrInstanceCreateInfo info = {XR_TYPE_INSTANCE_CREATE_INFO, &android};
   strcpy(info.applicationInfo.applicationName, "xrdemo");
@@ -147,6 +180,35 @@ static bool create_instance(struct android_app *app) {
   return load_all();
 }
 
+#ifdef XRDEMO_GLES
+// An ES 3 context on a small pbuffer: the app draws only into the swapchains' framebuffers.
+static bool create_gles(void) {
+  XrGraphicsRequirementsOpenGLESKHR requirements = {XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
+  CHECK(xrGetOpenGLESGraphicsRequirementsKHR(instance, system_id, &requirements));
+  display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  EGLint major, minor, count = 0;
+  if (!eglInitialize(display, &major, &minor)) {
+    ERR("eglInitialize: %#x", eglGetError());
+    return false;
+  }
+  const EGLint attributes[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                               EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
+  if (!eglChooseConfig(display, attributes, &config, 1, &count) || !count) {
+    ERR("eglChooseConfig: %#x", eglGetError());
+    return false;
+  }
+  const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+  context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+  const EGLint surface_attributes[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
+  EGLSurface surface = eglCreatePbufferSurface(display, config, surface_attributes);
+  if (context == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE || !eglMakeCurrent(display, surface, surface, context)) {
+    ERR("EGL context: %#x", eglGetError());
+    return false;
+  }
+  LOG("EGL %d.%d, GLES %s, renderer %s", major, minor, glGetString(GL_VERSION), glGetString(GL_RENDERER));
+  return true;
+}
+#else
 // Vulkan through the runtime (XR_KHR_vulkan_enable2): it adds the instance and device extensions it
 // needs, and picks the physical device.
 static bool create_vulkan(void) {
@@ -194,12 +256,18 @@ static bool create_vulkan(void) {
   LOG("Vulkan device %s, queue family %u", properties.deviceName, queue_family);
   return true;
 }
+#endif
 
 static bool create_session(void) {
   XrSystemGetInfo system = {XR_TYPE_SYSTEM_GET_INFO, NULL, XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
   CHECK(xrGetSystem(instance, &system, &system_id));
+#ifdef XRDEMO_GLES
+  if (!create_gles()) return false;
+  XrGraphicsBindingOpenGLESAndroidKHR binding = {XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR, NULL, display, config, context};
+#else
   if (!create_vulkan()) return false;
   XrGraphicsBindingVulkan2KHR binding = {XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR, NULL, vk_instance, physical, device, queue_family, 0};
+#endif
   XrSessionCreateInfo info = {XR_TYPE_SESSION_CREATE_INFO, &binding, 0, system_id};
   CHECK(xrCreateSession(instance, &info, &session));
   XrReferenceSpaceCreateInfo space = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO, NULL, XR_REFERENCE_SPACE_TYPE_LOCAL, {{0, 0, 0, 1}, {0, 0, 0}}};
@@ -217,10 +285,16 @@ static bool create_swapchains(void) {
   if (format_count > 256) format_count = 256;
   CHECK(xrEnumerateSwapchainFormats(session, format_count, &format_count, formats));
   int64_t format = 0;
+#ifdef XRDEMO_GLES
+  for (uint32_t i = 0; i < format_count && !format; i++)
+    if (formats[i] == GL_SRGB8_ALPHA8 || formats[i] == GL_RGBA8) format = formats[i];
+#else
   for (uint32_t i = 0; i < format_count && !format; i++)
     if (formats[i] == VK_FORMAT_R8G8B8A8_SRGB || formats[i] == VK_FORMAT_R8G8B8A8_UNORM) format = formats[i];
+#endif
   if (!format) format = formats[0];
 
+#ifndef XRDEMO_GLES
   VkAttachmentDescription attachment = {0, (VkFormat)format, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR,
                                         VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                         VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -232,7 +306,13 @@ static bool create_swapchains(void) {
     ERR("vkCreateRenderPass failed");
     return false;
   }
+#endif
 
+#ifdef XRDEMO_GLES
+  char value[PROP_VALUE_MAX] = "";
+  __system_property_get("debug.prism.xrdemo.layers", value);
+  layered = !strcmp(value, "2");
+#endif
   for (uint32_t e = 0; e < 2; e++) {
     struct eye *eye = &eyes[e];
     eye->width = (int32_t)views[e].recommendedImageRectWidth;
@@ -240,7 +320,30 @@ static bool create_swapchains(void) {
     XrSwapchainCreateInfo info = {XR_TYPE_SWAPCHAIN_CREATE_INFO, NULL, 0,
                                   XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT, format, 1,
                                   (uint32_t)eye->width, (uint32_t)eye->height, 1, 1, 1};
-    CHECK(xrCreateSwapchain(session, &info, &eye->swapchain));
+    if (layered) info.arraySize = 2;
+    if (layered && e == 1)
+      eye->swapchain = eyes[0].swapchain;
+    else
+      CHECK(xrCreateSwapchain(session, &info, &eye->swapchain));
+#ifdef XRDEMO_GLES
+    XrSwapchainImageOpenGLESKHR images[MAX_IMAGES];
+    for (int i = 0; i < MAX_IMAGES; i++) images[i] = (XrSwapchainImageOpenGLESKHR){XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
+    CHECK(xrEnumerateSwapchainImages(eye->swapchain, MAX_IMAGES, &eye->images, (XrSwapchainImageBaseHeader *)images));
+    glGenFramebuffers((GLsizei)eye->images, eye->framebuffers);
+    for (uint32_t i = 0; i < eye->images; i++) {
+      glBindFramebuffer(GL_FRAMEBUFFER, eye->framebuffers[i]);
+      if (layered)
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, images[i].image, 0, (GLint)e);
+      else
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[i].image, 0);
+      GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+      if (status != GL_FRAMEBUFFER_COMPLETE) {
+        ERR("eye %u image %u (texture %u): framebuffer status %#x", e, i, images[i].image, status);
+        return false;
+      }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#else
     XrSwapchainImageVulkan2KHR images[MAX_IMAGES];
     for (int i = 0; i < MAX_IMAGES; i++) images[i] = (XrSwapchainImageVulkan2KHR){XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR};
     CHECK(xrEnumerateSwapchainImages(eye->swapchain, MAX_IMAGES, &eye->images, (XrSwapchainImageBaseHeader *)images));
@@ -253,7 +356,9 @@ static bool create_swapchains(void) {
                                          (uint32_t)eye->width, (uint32_t)eye->height, 1};
       VK_CHECK(vkCreateFramebuffer(device, &fb_info, NULL, &eye->framebuffers[i]));
     }
-    LOG("eye %u: %dx%d, format %lld, %u images", e, eye->width, eye->height, (long long)format, eye->images);
+#endif
+    LOG("eye %u: %dx%d, format %lld, %u images%s", e, eye->width, eye->height, (long long)format, eye->images,
+        layered ? (e ? ", layer 1" : ", layer 0") : "");
   }
   return true;
 }
@@ -317,26 +422,80 @@ static float trigger_value(void) {
 // One eye's image: a background, and a grid of squares in two colors whose phase follows the frame
 // count, so a running app is visibly moving.
 #define MAX_RECTS 512
-static void record(const struct eye *eye, VkFramebuffer framebuffer, bool pressed, uint64_t frame) {
-  VkClearValue background = {.color = {.float32 = {pressed ? 0.55f : 0.05f, pressed ? 0.25f : 0.12f, pressed ? 0.05f : 0.35f, 1}}};
-  VkRenderPassBeginInfo begin = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, render_pass, framebuffer,
-                                 {{0, 0}, {(uint32_t)eye->width, (uint32_t)eye->height}}, 1, &background};
-  vkCmdBeginRenderPass(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-  static VkClearRect rects[2][MAX_RECTS];
-  uint32_t counts[2] = {0, 0};
+struct rect {
+  int x, y, width, height;
+};
+static void grid(const struct eye *eye, uint64_t frame, struct rect rects[2][MAX_RECTS], uint32_t counts[2]) {
+  counts[0] = counts[1] = 0;
   int cell = eye->width / 12, size = cell / 2, shift = (int)(frame % (uint64_t)cell);
   for (int y = 0; y + cell <= eye->height; y += cell)
     for (int x = 0; x + cell <= eye->width; x += cell) {
       int odd = (x / cell + y / cell) & 1;
       int left = x + (cell - size) / 2 + shift - cell / 2;
-      if (left < 0 || left + size > eye->width || counts[odd] == MAX_RECTS) continue;
-      rects[odd][counts[odd]++] = (VkClearRect){{{left, y + (cell - size) / 2}, {(uint32_t)size, (uint32_t)size}}, 0, 1};
+      if (left < 0 || left + size > eye->width || counts[odd] == MAX_RECTS - 1) continue;
+      rects[odd][counts[odd]++] = (struct rect){left, y + (cell - size) / 2, size, size};
     }
-  VkClearAttachment colors[2] = {
-      {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {pressed ? 1.0f : 0.3f, pressed ? 0.7f : 0.8f, pressed ? 0.2f : 1.0f, 1}}}},
-      {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {0.9f, 0.9f, 0.9f, 1}}}}};
-  for (int c = 0; c < 2; c++)
-    if (counts[c]) vkCmdClearAttachments(commands, 1, &colors[c], counts[c], rects[c]);
+  // A bar 30% of the way down, to tell up from down: Vulkan's rows go down, GL's up.
+  int bar = cell / 4, top = eye->height * 3 / 10;
+#ifdef XRDEMO_GLES
+  rects[1][counts[1]++] = (struct rect){0, eye->height - top - bar, eye->width, bar};
+#else
+  rects[1][counts[1]++] = (struct rect){0, top, eye->width, bar};
+#endif
+}
+static const float backgrounds[2][3] = {{0.05f, 0.12f, 0.35f}, {0.55f, 0.25f, 0.05f}};
+static const float squares[2][2][3] = {{{0.3f, 0.8f, 1.0f}, {0.9f, 0.9f, 0.9f}}, {{1.0f, 0.7f, 0.2f}, {0.9f, 0.9f, 0.9f}}};
+
+#ifdef XRDEMO_GLES
+static bool draw(const struct eye *eye, uint32_t index, bool pressed, uint64_t frame) {
+  static struct rect rects[2][MAX_RECTS];
+  uint32_t counts[2];
+  grid(eye, frame, rects, counts);
+  while (glGetError() != GL_NO_ERROR) {
+  }  // the runtime's, from its own calls
+  glBindFramebuffer(GL_FRAMEBUFFER, eye->framebuffers[index]);
+  glViewport(0, 0, eye->width, eye->height);
+  const float *b = backgrounds[pressed];
+  glClearColor(b[0], b[1], b[2], 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_SCISSOR_TEST);
+  for (int c = 0; c < 2; c++) {
+    const float *s = squares[pressed][c];
+    glClearColor(s[0], s[1], s[2], 1);
+    for (uint32_t i = 0; i < counts[c]; i++) {
+      glScissor(rects[c][i].x, rects[c][i].y, rects[c][i].width, rects[c][i].height);
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
+  }
+  glDisable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glFlush();
+  GLenum error = glGetError();
+  if (error != GL_NO_ERROR) {
+    ERR("GL error %#x", error);
+    return false;
+  }
+  return true;
+}
+#else
+static void record(const struct eye *eye, VkFramebuffer framebuffer, bool pressed, uint64_t frame) {
+  const float *b = backgrounds[pressed];
+  VkClearValue background = {.color = {.float32 = {b[0], b[1], b[2], 1}}};
+  VkRenderPassBeginInfo begin = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, render_pass, framebuffer,
+                                 {{0, 0}, {(uint32_t)eye->width, (uint32_t)eye->height}}, 1, &background};
+  vkCmdBeginRenderPass(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+  static struct rect rects[2][MAX_RECTS];
+  static VkClearRect clears[MAX_RECTS];
+  uint32_t counts[2];
+  grid(eye, frame, rects, counts);
+  for (int c = 0; c < 2; c++) {
+    if (!counts[c]) continue;
+    for (uint32_t i = 0; i < counts[c]; i++)
+      clears[i] = (VkClearRect){{{rects[c][i].x, rects[c][i].y}, {(uint32_t)rects[c][i].width, (uint32_t)rects[c][i].height}}, 0, 1};
+    const float *s = squares[pressed][c];
+    VkClearAttachment color = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {.float32 = {s[0], s[1], s[2], 1}}}};
+    vkCmdClearAttachments(commands, 1, &color, counts[c], clears);
+  }
   vkCmdEndRenderPass(commands);
 }
 
@@ -352,6 +511,7 @@ static bool draw(const struct eye *eye, uint32_t index, bool pressed, uint64_t f
   VK_CHECK(vkResetFences(device, 1, &fence));
   return true;
 }
+#endif
 
 static uint64_t frames, failures;
 
@@ -373,24 +533,25 @@ static void frame(void) {
   const XrCompositionLayerBaseHeader *layers[] = {(const XrCompositionLayerBaseHeader *)&projection};
   bool render = frame_state.shouldRender &&
                 XR_SUCCEEDED(xrLocateViews(session, &locate, &view_state, 2, &view_count, views)) && view_count == 2;
+  uint32_t index = 0;
+  bool drawn = true;
   for (uint32_t e = 0; render && e < 2; e++) {
     struct eye *eye = &eyes[e];
-    uint32_t index = 0;
     XrSwapchainImageAcquireInfo acquire = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     XrSwapchainImageWaitInfo image_wait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, NULL, XR_INFINITE_DURATION};
-    if (XR_FAILED(xrAcquireSwapchainImage(eye->swapchain, &acquire, &index)) ||
-        XR_FAILED(xrWaitSwapchainImage(eye->swapchain, &image_wait))) {
+    if (!(layered && e == 1) && (XR_FAILED(xrAcquireSwapchainImage(eye->swapchain, &acquire, &index)) ||
+                                 XR_FAILED(xrWaitSwapchainImage(eye->swapchain, &image_wait)))) {
       render = false;
       break;
     }
-    bool drawn = draw(eye, index, pressed, frames);
+    drawn &= draw(eye, index, pressed, frames);
     XrSwapchainImageReleaseInfo release = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(eye->swapchain, &release);
-    render &= drawn;
+    if (!(layered && e == 0)) xrReleaseSwapchainImage(eye->swapchain, &release);
     projection_views[e] = (XrCompositionLayerProjectionView){
         XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, NULL, views[e].pose, views[e].fov,
-        {eye->swapchain, {{0, 0}, {eye->width, eye->height}}, 0}};
+        {eye->swapchain, {{0, 0}, {eye->width, eye->height}}, layered ? e : 0}};
   }
+  render &= drawn;
   XrFrameEndInfo end = {XR_TYPE_FRAME_END_INFO, NULL, frame_state.predictedDisplayTime, XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
                         render ? 1u : 0u, layers};
   XrResult r = xrEndFrame(session, &end);

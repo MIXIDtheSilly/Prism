@@ -327,7 +327,7 @@ python tools\emulator.py status
   binder relay, and its native threads find its classes. No process crash-loops after boot.
 - **The viewer** (`python toolsiewer.py`): Horizon in a desktop window, one eye's half of the
   display from the frames the emulator shares (`-share-vid`; mapping `SHM_videmulator5590`, a
-  VideoInfo then RGBA), so its own window can stay minimized. The right controller points where the
+  VideoInfo then BGRA), so its own window can stay minimized. The right controller points where the
   mouse is: its ray goes through the pixel under the mouse, within a pixel or two on panels at
   VrShell's distance (1.08 m). The left button pulls the trigger, Tab presses the Meta button,
   right-drag looks around, WASD and R/F move. The compositor draws each half from the head's

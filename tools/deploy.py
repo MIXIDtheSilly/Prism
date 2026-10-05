@@ -141,6 +141,9 @@ META_PARAMS = [
     ('/data/user_de/0/com.oculus.systemdriver', 'oculus_xrruntime:oculus_frosted_glass', 'true'),
 ]
 META_PARAMS_SCRIPT = '/system/bin/prism_meta_params.sh'
+# debugfs is restricted on this image (init unmounts it), so it's mounted just for the write.
+SCHED_FEATURES = ('mount -t debugfs debugfs /sys/kernel/debug; '
+                  'echo NO_TTWU_QUEUE > /sys/kernel/debug/sched/features; umount /sys/kernel/debug')
 DATA_ROOT = '/data/prism'
 
 # ARM64 code runs through Digitalis (tools/translator.py), which replaces the stock image's
@@ -394,6 +397,9 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
                 props[f'ro.product.product.{m.group(1)}'] = value.strip()
     props['ro.control_privapp_permissions'] = 'log'  # report missing allowlist entries, don't crash
     props['ro.dalvik.vm.native.bridge'] = NATIVE_BRIDGE
+    # Digitalis moves a hot region to its optimizing tier only from 20 instructions up by default;
+    # VrShell's and the compositor's hot loops are many short regions. 0 lets any hot region gear up.
+    props['berberis.gearup_min_insns'] = '0'
     props['ro.hardware.vulkan'] = VULKAN_DRIVER  # overrides /vendor/build.prop's: product loads last
     # Meta's compositor on Vulkan, which shares clients' swapchains through Prism's Vulkan driver.
     # On GL, VrShell aborts at its first surface swapchain: the compositor's surface reaches the
@@ -679,7 +685,10 @@ def build(args):
               f'    copy /system_ext/lib64/{GLES_LAYER} {GLES_LAYER_DIR}/{GLES_LAYER}',
               f'    chmod 0644 {GLES_LAYER_DIR}/{GLES_LAYER}',
               '    # Meta config parameters Prism sets (META_PARAMS).',
-              f'    exec {DAEMON_SECLABEL} root root -- /system/bin/sh {META_PARAMS_SCRIPT}']
+              f'    exec {DAEMON_SECLABEL} root root -- /system/bin/sh {META_PARAMS_SCRIPT}',
+              '    # The emulator makes each vCPU its own package, so with TTWU_QUEUE every cross-CPU wake-up',
+              '    # is an IPI, a slow exit to qemu under WHPX; NO_TTWU_QUEUE wakes the task from the waker.',
+              f'    exec {DAEMON_SECLABEL} root root -- /system/bin/sh -c "{SCHED_FEATURES}"']
     lines += ['',
               '# adb stays up whatever Horizon decides: Meta\'s software turns adb off (as a headset does',
               '# outside developer mode), and init then stops adbd. The emulator\'s adbd talks over a qemu',

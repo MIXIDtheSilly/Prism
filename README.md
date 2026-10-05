@@ -68,3 +68,10 @@ docs/                 Plan, findings and progress
 Prism is for running software from a headset you own, for research and development. It does not
 fake Quest device identity or attestation, and Meta account sign-in and the Store are out of
 scope. Do not use it to bypass DRM, platform security or license terms.
+
+## License
+
+Prism is source-available, not open source. You may download, build, run and modify it for your
+own personal use, and fork it on GitHub to send contributions. You may not sell it or
+redistribute it, modified or not, in source or binary form. See [LICENSE](LICENSE) for the full
+terms. Third-party components under `prebuilts/` keep their own licenses.

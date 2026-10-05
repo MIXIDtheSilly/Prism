@@ -1,0 +1,52 @@
+Prism License
+
+Copyright (c) 2026 MIXIDtheSilly (https://github.com/MIXIDtheSilly). All rights reserved.
+
+This license covers the source code, scripts, documentation and other material in this
+repository ("the Software"), except third-party components, which keep their own licenses (see
+"Third-party components" below).
+
+1. Personal use
+
+   You may download, build, run and modify the Software for your own personal, private,
+   non-commercial use.
+
+2. Contributing
+
+   You may fork this repository on GitHub, and change your fork, only to prepare contributions
+   (pull requests, patches or issues) to this repository. By submitting a contribution, you
+   confirm that you wrote it or have the right to submit it, and you grant the copyright holder a
+   perpetual, worldwide, irrevocable, royalty-free license to use, modify, sublicense and
+   distribute it under any terms, including the terms of this license.
+
+3. What you may not do
+
+   Unless the copyright holder gives you written permission, you may not:
+
+   a. sell the Software, or any part or modified version of it, or use it in any product or
+      service that is sold or that earns money;
+   b. redistribute, publish, mirror or re-upload the Software, any part of it, or any modified
+      version of it, in source or compiled form, except a GitHub fork used only as described in
+      section 2;
+   c. distribute builds, binaries, packages or images made from the Software;
+   d. remove or change this license or any copyright notice.
+
+   Linking to this repository is always allowed.
+
+4. Third-party components
+
+   Files that come from other projects, such as everything under prebuilts/, are not covered by
+   this license. They stay under their own licenses, given in the NOTICE and license files next
+   to them.
+
+5. Termination
+
+   If you break these terms, your rights under this license end automatically.
+
+6. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+   BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+   IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -210,6 +210,25 @@ SKIP_WINDOWS_WITHOUT_XR_INFO = [
            reason="windows without Meta's XrWindowInfo (stock SurfaceFlinger's)"),
 ]
 
+# Every volumetric window's Android windows sit at the origin of display 0, one over another. Meta's
+# InputDispatcher sends a panel's injected motion to the window its volumetric window token names;
+# stock InputDispatcher drops the token and gives it to the topmost window there, so the open
+# library or a 2D app took the clicks meant for the system bar under them. Each volumetric window
+# also mirrors its windows onto a display of its own (MirrorRoot), where they are the only ones:
+# its motion goes there.
+TO_MIRROR_DISPLAY = Splice(
+    'Loculus/internal/volumetricwindow/VolumetricWindowManagerServiceImpl;',
+    'prepareInjectedEventsLocked(Loculus/internal/volumetricwindow/VolumetricWindow;Ljava/util/List;'
+    'Loculus/internal/volumetricwindow/VolumetricWindowManagerServiceImpl$DeferredInput;)V',
+    'invoke-virtual {v5, v6}, Landroid/view/MotionEvent;->setVwToken(Landroid/os/IBinder;)V',
+    '''    invoke-virtual {v5, v6}, Landroid/view/MotionEvent;->setVwToken(Landroid/os/IBinder;)V
+    invoke-virtual {p1}, Loculus/internal/volumetricwindow/VolumetricWindow;->getVirtualDisplayId()I
+    move-result v6
+    if-ltz v6, :prism_no_mirror
+    invoke-virtual {v5, v6}, Landroid/view/MotionEvent;->setDisplayId(I)V
+    :prism_no_mirror''',
+    reason="a panel's motion goes to its volumetric window's mirror display (stock input ignores the token)")
+
 # Keyed by device path; each jar (or APK) is read from the partition image its path names.
 BRIDGES = {
     '/system/framework/framework.jar': [
@@ -250,7 +269,8 @@ BRIDGES = {
         Replace(f'{PM}/PackageAbiHelperImpl;', f'getBundledAppAbis({PACKAGE}){ABIS}', BUNDLED_APP_ABIS,
                 reason="bundled apps' libraries for a translated ABI (Meta's apps have lib/arm64)"),
     ],
-    '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO],
+    '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO,
+                                                       TO_MIRROR_DISPLAY],
     '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH],
 }
 

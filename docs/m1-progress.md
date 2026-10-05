@@ -72,7 +72,8 @@ python tools\emulator.py status
   services.jar's `getBundledAppAbis` is replaced so Meta's apps, with `lib/arm64`, get
   `arm64-v8a` and load their libraries through the bridge. The volumetric window service's window
   listener skips windows without Meta's `XrWindowInfo` (stock SurfaceFlinger gives none; it threw
-  on every change of windows). One app is patched too, OCMS (see The library); its APK is repacked with its entries aligned and its APK Signing Block kept, since
+  on every change of windows), and sends a panel's injected motion to the panel's mirror display
+  (see The system bar). One app is patched too, OCMS (see The library); its APK is repacked with its entries aligned and its APK Signing Block kept, since
   PackageManager reads a system app's signers without verifying its contents.
 
 - **Vulkan** ([native/vulkan_prism](../native/vulkan_prism/vulkan_prism.c)). Meta's compositor
@@ -360,5 +361,13 @@ python tools\emulator.py status
   stayed a loading shimmer. `tools/emulator.py` passes qemu its own `-smp` (the AVD's 6 cores),
   which wins; boot to the first panel went from 2 min 18 s to 1 min 21 s, and the compositor from
   about 17 frames a second to 40-46 (of 72).
-- **Next:** the library grid, and system_server's deaths by SIGPIPE (twice, soon after an app's
-  window was placed; none since).
+- **The system bar.** Every volumetric window's Android windows sit at the origin of display 0,
+  one over another, and the volumetric window service injects a panel's motion there tagged with
+  its volumetric window token (`setVwToken`). Meta's InputDispatcher delivers by that token; stock
+  InputDispatcher drops it and hit-tests, so the open library or a 2D app took the clicks meant for
+  the system bar under them, and Quick Settings never opened. Each volumetric window also mirrors
+  its windows onto a display of its own (`MirrorRoot for <token>`), where they're the only ones:
+  Prism patches the service to send a panel's motion to that display. The system bar's Quick
+  Settings opens (Quick Controls: volume, brightness, Wi-Fi, Bluetooth, boundary, Link).
+- **Next:** sideloaded apps in the library (Unknown Sources), then launching an OpenXR app from it;
+  system_server's deaths by SIGPIPE (twice, soon after an app's window was placed; none since).

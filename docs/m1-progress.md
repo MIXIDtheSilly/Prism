@@ -349,7 +349,10 @@ python tools\emulator.py status
   vrdevice's `device_default_refresh_rate` (/system/etc/device_props.json, read once by
   vrdevicemanagerserver at boot), which deploy sets to 60 too: with only the property, VrShell
   restarted on its own timed its frames for 72 against the 60 Hz compositor (47 shared frames a
-  second, 10 ms of jitter, against 60 and 1.4 ms with both).
+  second, 10 ms of jitter, against 60 and 1.4 ms with both). The emulator runs with
+  `-feature AsyncComposeSupport`: the composer HAL otherwise waits out each composition on the PC
+  (rcCompose, 8-9 ms a frame), and with panels redrawing under the controller's ray the display
+  lost frames while the compositor kept 60 (52.8 shared frames a second, against 60 with it).
 - **Panels' bodies.** VrShell gave the Store's and the Universal Menu's volumetric windows
   single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a headset's
   SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers

@@ -135,7 +135,12 @@ def start(args):
     command = [os.path.join(sdk_root(), 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator'),
                '-avd', AVD, '-port', str(PORT), '-writable-system', '-selinux', 'permissive', '-no-snapshot',
                '-no-boot-anim', '-gpu', 'host', '-crash-report-mode', 'never',
-               '-share-vid']  # the display's frames in shared memory, for tools/viewer.py
+               '-share-vid',  # the display's frames in shared memory, for tools/viewer.py
+               # The composer HAL waits out each frame's composition on the PC (rcCompose) by spinning
+               # on its ring, 8-9 ms of a 16.7 ms frame already; with panels redrawing it ran over and
+               # the display (and the viewer) lost frames while the compositor kept 60. With this the
+               # HAL composes asynchronously (rcComposeAsync).
+               '-feature', 'AsyncComposeSupport']
     if args.headless:
         command.append('-no-window')
     if args.wipe:

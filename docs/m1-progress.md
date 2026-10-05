@@ -284,7 +284,7 @@ python tools\emulator.py status
 - **Clicking panels.** A controller's ray hovers a panel's controls and its trigger presses them:
   the right trigger closes the Store's window from its bar's ✕. Behind that window is the home
   environment's sky and floor; the solid green that filled the view was the Store window's body,
-  which isn't drawn. Prism publishes a controller's aim pose (the runtime pitches the grip from it).
+  which wasn't drawn then (see Panels' bodies). Prism publishes a controller's aim pose (the runtime pitches the grip from it).
 - **The Universal Menu.** A headset's trackingservice also reports the Meta button as a key
   (KEY_FORWARD, from its own input device), and VrShell's SystemButtonHandler takes it only from
   Meta's controller input source; released within 500 ms it's VrShell's system button press. Stock

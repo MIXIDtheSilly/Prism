@@ -70,8 +70,9 @@ python tools\emulator.py status
   `Lockdep.registerHandler` needs Meta's modified ART, so its body is replaced with a return.
   Android looks for a bundled app's libraries only under `lib/<first 64-bit ISA>` (`x86_64`);
   services.jar's `getBundledAppAbis` is replaced so Meta's apps, with `lib/arm64`, get
-  `arm64-v8a` and load their libraries through the bridge. One app is patched too, OCMS (see The
-  library); its APK is repacked with its entries aligned and its APK Signing Block kept, since
+  `arm64-v8a` and load their libraries through the bridge. The volumetric window service's window
+  listener skips windows without Meta's `XrWindowInfo` (stock SurfaceFlinger gives none; it threw
+  on every change of windows). One app is patched too, OCMS (see The library); its APK is repacked with its entries aligned and its APK Signing Block kept, since
   PackageManager reads a system app's signers without verifying its contents.
 
 - **Vulkan** ([native/vulkan_prism](../native/vulkan_prism/vulkan_prism.c)). Meta's compositor

@@ -13,7 +13,7 @@
 The patched jars are built locally from the user's OTA into work/build/compat/<device path>, which
 tools/deploy.py uses instead of the originals.
 
-    python tools/compat.py
+    python tools/compat.py [device path ...]
 """
 import argparse
 import os
@@ -192,6 +192,24 @@ RESOLVE_EMPTY_FETCH = Splice(
     sget-object v0, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}''',
     reason='an empty fetch is resolved too (no Meta account: the library has only local apps)')
 
+# Meta's SurfaceFlinger gives each window's input handle an XrWindowInfo (its volumetric window, pose,
+# size and shape), which the volumetric window service follows. Stock SurfaceFlinger has none to give,
+# and the listener threw on the first window, once for every change of windows. Windows without one
+# are skipped: the service keeps the placements VrShell gives it.
+VW_LISTENER = 'Loculus/internal/volumetricwindow/VwWindowInfosListener;'
+VW_CHANGED = 'onWindowInfosChanged([Landroid/view/InputWindowHandle;[Landroid/window/WindowInfosListener$DisplayInfo;)V'
+SKIP_WINDOWS_WITHOUT_XR_INFO = [
+    Splice(VW_LISTENER, VW_CHANGED, 'aget-object v3, p1, v2',
+           '''    aget-object v3, p1, v2
+    iget-object v4, v3, Landroid/view/InputWindowHandle;->xrWindowInfo:Landroid/view/XrWindowInfo;
+    if-eqz v4, :prism_next''',
+           reason="windows without Meta's XrWindowInfo (stock SurfaceFlinger's)"),
+    Splice(VW_LISTENER, VW_CHANGED, 'add-int/lit8 v2, v2, 0x1',
+           '''    :prism_next
+    add-int/lit8 v2, v2, 0x1''',
+           reason="windows without Meta's XrWindowInfo (stock SurfaceFlinger's)"),
+]
+
 # Keyed by device path; each jar (or APK) is read from the partition image its path names.
 BRIDGES = {
     '/system/framework/framework.jar': [
@@ -232,7 +250,7 @@ BRIDGES = {
         Replace(f'{PM}/PackageAbiHelperImpl;', f'getBundledAppAbis({PACKAGE}){ABIS}', BUNDLED_APP_ABIS,
                 reason="bundled apps' libraries for a translated ABI (Meta's apps have lib/arm64)"),
     ],
-    '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING],
+    '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO],
     '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH],
 }
 
@@ -489,9 +507,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--images', default=os.path.join('work', 'images'))
     ap.add_argument('--out', default=os.path.join('work', 'build', 'compat'))
+    ap.add_argument('only', nargs='*', help='device paths to patch (default: all)')
     args = ap.parse_args()
+    unknown = set(args.only) - set(BRIDGES)
+    if unknown:
+        sys.exit(f'nothing to patch in {", ".join(sorted(unknown))}')
     images = {}
     for device_path, bridges in BRIDGES.items():
+        if args.only and device_path not in args.only:
+            continue
         print(f'{device_path}: {len(bridges)} patches')
         partition = device_path.split('/')[1]
         path = device_path if partition == 'system' else device_path[len(partition) + 1:]

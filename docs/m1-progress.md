@@ -387,8 +387,13 @@ python tools\emulator.py status
   buffers into GL through `GL_EXT_memory_object_fd` or EGL dma-buf import, and the emulator's GLES
   has neither (Vulkan apps, as most are, work).
 - **2D apps.** An ordinary Android app installed with adb opens as a Horizon panel, with its title
-  and window bar. The library service finds it as a sideloaded app at the next boot only (it
-  ignores the install itself).
-- **Next:** the library's tiles, drawn too close to the viewer and scattered (the side bar with
-  Unknown Sources isn't shown); GLES apps' swapchains; system_server's deaths by SIGPIPE (twice,
+  and window bar.
+- **Launching from the library.** The library's menu (its side bar) has All, Unknown Sources and
+  Downloads. Unknown Sources lists the apps installed with adb (the library service adds an
+  install as it happens, without logging it), under Meta's warning; clicking xrgame there launches
+  it through VrShell (`com.oculus.vrshell.intent.action.LAUNCH`) as Horizon's immersive app. The
+  library is a cylinder layer around the viewer, its tiles bowed and tilted toward its edges as
+  they should be; its glass background isn't drawn (the dark card behind it is the Store's
+  window), and the first tile of All is blank (an app without an icon).
+- **Next:** panels' glass backgrounds; GLES apps' swapchains; a real game; system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

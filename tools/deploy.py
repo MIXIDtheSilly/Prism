@@ -128,6 +128,19 @@ IDENTITY = ('brand', 'device', 'manufacturer', 'model', 'name')
 
 ZYGOTE_RC = '/system/etc/init/hw/init.zygote64.rc'
 PRELOAD = '/system/lib64/libprism_jni.so'
+# Meta config parameters (gatekeepers) Prism sets. A headset gets them from Meta's servers; each app
+# keeps the ones it uses in its config client's cache (deviceconfig_cache_v2.txt: name, logging id,
+# timestamp, source, propagation, value), which it loads at start and writes back. Horizon's own
+# local override (its DC_OVERRIDE debug broadcast) doesn't reach a parameter its service has no
+# schema for, which is all of them without a server sync, so Prism sets the cached value: at
+# post-fs-data, before any app starts, a parameter's row is given its value if the cache has it.
+# The runtime's native gatekeepers (gkcache.dat) are rebuilt from its client's values each run, so
+# a row set on a fresh cache counts from the next boot. (package's data directory, config:param, value)
+META_PARAMS = [
+    # Panels' frosted glass: the compositor's gate (its device check is patched in libprism_jni).
+    ('/data/user_de/0/com.oculus.systemdriver', 'oculus_xrruntime:oculus_frosted_glass', 'true'),
+]
+META_PARAMS_SCRIPT = '/system/bin/prism_meta_params.sh'
 DATA_ROOT = '/data/prism'
 
 # ARM64 code runs through Digitalis (tools/translator.py), which replaces the stock image's
@@ -368,7 +381,7 @@ def read_prop_file(fs, path):
     return [line for line in text.splitlines() if '=' in line and not line.lstrip().startswith('#')]
 
 
-def prism_props(images):
+def prism_props(images, emulator_flag='hidden', model='quest3'):
     props = {}
     for partition, path in (('system', '/system/build.prop'), ('system_ext', '/etc/build.prop'),
                             ('product', '/etc/build.prop')):
@@ -411,7 +424,33 @@ def prism_props(images):
     # which the runtime imports with GL_EXT_memory_object_fd; the emulator's GLES has none, and
     # every GLES app's xrCreateSwapchain failed. Prism's GLES layer (native/gles_prism) adds it.
     props['debug.gles.layers'] = GLES_LAYER
+    # The emulator's /vendor/build.prop sets ro.kernel.qemu=1, which nothing of the emulator's own
+    # reads (its HALs and init scripts use ro.boot.qemu) and Meta's runtime takes for its emulator:
+    # it then skips DeviceConfig for its gatekeepers. --emulator-flag shown keeps it;
+    # `python tools/emulator.py emulator-flag` switches it on a running emulator.
+    if emulator_flag == 'hidden':
+        props['ro.kernel.qemu'] = '0'
+    # Meta's runtime tells headsets apart by Build.MODEL, looked up in its table of codenames; "Quest
+    # 3" isn't one, so on ranchu it takes the emulator's device type (270), and with it the
+    # emulator's paths (formats, GPU fallback, DRM, the HMD's configuration; no frosted glass).
+    # --model eureka gives it Quest 3's codename instead, which every app then sees as the model.
+    # `python tools/emulator.py model` switches it on a running emulator.
+    if model == 'eureka':
+        props['ro.product.product.model'] = 'Eureka'
     return props
+
+
+def meta_params_script():
+    """Sets each META_PARAMS row's value in its app's config cache, keeping the file's owner and label."""
+    lines = ['#!/system/bin/sh', '# Prism: Meta config parameters (tools/deploy.py, META_PARAMS).', 'set_param() {',
+             '  cache="$1/files/deviceconfig_cache_v2.txt"',
+             '  [ -f "$cache" ] && grep -q "^$2," "$cache" || return 0',
+             '  awk -F, -v k="$2" -v v="$3" \'BEGIN {OFS=","} $1 == k && NF == 6 {$6 = v} {print}\' "$cache" > "$cache.prism"',
+             '  cmp -s "$cache" "$cache.prism" || cat "$cache.prism" > "$cache"',
+             '  rm -f "$cache.prism"',
+             '}']
+    lines += [f"set_param '{directory}' '{name}' '{value}'" for directory, name, value in META_PARAMS]
+    return '\n'.join(lines) + '\n'
 
 
 def build(args):
@@ -638,7 +677,9 @@ def build(args):
               '    mkdir /data/local/debug 0755 root root',
               f'    mkdir {GLES_LAYER_DIR} 0755 root root',
               f'    copy /system_ext/lib64/{GLES_LAYER} {GLES_LAYER_DIR}/{GLES_LAYER}',
-              f'    chmod 0644 {GLES_LAYER_DIR}/{GLES_LAYER}']
+              f'    chmod 0644 {GLES_LAYER_DIR}/{GLES_LAYER}',
+              '    # Meta config parameters Prism sets (META_PARAMS).',
+              f'    exec {DAEMON_SECLABEL} root root -- /system/bin/sh {META_PARAMS_SCRIPT}']
     lines += ['',
               '# adb stays up whatever Horizon decides: Meta\'s software turns adb off (as a headset does',
               '# outside developer mode), and init then stops adbd. The emulator\'s adbd talks over a qemu',
@@ -651,10 +692,11 @@ def build(args):
               'on property:sys.boot_completed=1',
               f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())
+    overlay.add(META_PARAMS_SCRIPT, 'f', 0o755, data=meta_params_script().encode())
 
     # Identity and Meta properties, appended to the stock product build.prop.
     base = stock['product'].read(stock['product'].lookup('/etc/build.prop')).decode()
-    props = prism_props(images)
+    props = prism_props(images, args.emulator_flag, args.model)
     section = '\n# Prism: Horizon OS identity and Meta properties\n' + ''.join(f'{k}={v}\n' for k, v in props.items())
     overlay.add('/product/etc/build.prop', 'f', 0o644, data=(base + section).encode())
 
@@ -765,6 +807,10 @@ def main():
     ap.add_argument('--out', default=os.path.join('work', 'deploy'))
     ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--no-reboot', action='store_true')
+    ap.add_argument('--emulator-flag', choices=('hidden', 'shown'), default='hidden',
+                    help="ro.kernel.qemu, which Meta's runtime reads as running on its emulator (default: hidden)")
+    ap.add_argument('--model', choices=('quest3', 'eureka'), default='quest3',
+                    help="Build.MODEL: Horizon's \"Quest 3\", or the codename Meta's runtime knows (default: quest3)")
     args = ap.parse_args()
     replaced = build(args)[0]
     if not args.build_only:

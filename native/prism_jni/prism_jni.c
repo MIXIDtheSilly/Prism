@@ -340,11 +340,28 @@ static void *bridge_create_namespace(const char *name, const char *ld_path, cons
   return g_create_namespace(name, ld_path, default_path, type, permitted, parent);
 }
 
+// An app's arm64 libraries load through loadLibraryExt; Prism patches some as they do, before any of
+// their code runs (guest_patch.c).
+typedef void *(*LoadLibraryExtFn)(const char *, int, void *);
+static LoadLibraryExtFn g_load_library_ext;
+
+static void *bridge_load_library_ext(const char *path, int flags, void *ns) {
+  void *handle = g_load_library_ext(path, flags, ns);
+  if (handle) prism_patch_guest_library(path);
+  return handle;
+}
+
 static void hook_create_namespace(NativeBridgeCallbacks *itf) {
   void **slot = &itf->v1_to_v6[11];  // createNamespace
-  if (*slot == (void *)bridge_create_namespace) return;
-  g_create_namespace = (CreateNamespaceFn)*slot;
-  if (!write_slot(slot, (void *)bridge_create_namespace)) LOGW("translator's createNamespace: can't write its slot");
+  if (*slot != (void *)bridge_create_namespace) {
+    g_create_namespace = (CreateNamespaceFn)*slot;
+    if (!write_slot(slot, (void *)bridge_create_namespace)) LOGW("translator's createNamespace: can't write its slot");
+  }
+  slot = &itf->v1_to_v6[13];  // loadLibraryExt
+  if (*slot != (void *)bridge_load_library_ext) {
+    g_load_library_ext = (LoadLibraryExtFn)*slot;
+    if (!write_slot(slot, (void *)bridge_load_library_ext)) LOGW("translator's loadLibraryExt: can't write its slot");
+  }
 }
 
 // ---- Horizon's arm64 libraries for arm64 code that opens /system/lib64/<name>.so by path. On a

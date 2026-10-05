@@ -7,6 +7,8 @@ Prism uses its own AVD (prism-api34) on its own port, so it never touches other 
     python tools/emulator.py wait              # until Android reports boot completed
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
+    python tools/emulator.py emulator-flag [hidden|shown]  # ro.kernel.qemu for Meta's runtime; reboots
+    python tools/emulator.py model [quest3|eureka]         # Build.MODEL; reboots
     python tools/emulator.py stop
     python tools/emulator.py adb <args...>
 """
@@ -188,6 +190,48 @@ def status(args):
     print(shell(script, check=False).strip())
 
 
+# ro.kernel.qemu=1 (the emulator's /vendor/build.prop) is how Meta's runtime knows its emulator; deploy
+# hides it by overriding it from /product/etc/build.prop, which loads last. A read-only property
+# changes only with a reboot.
+FLAG = 'ro.kernel.qemu'
+PRODUCT_PROPS = '/product/etc/build.prop'
+
+
+def emulator_flag(args):
+    if args.state is None:
+        value = shell(f'getprop {FLAG}', check=False).strip()
+        print(f'{FLAG}={value!r}: {"shown" if value == "1" else "hidden"}')
+        return
+    root(argparse.Namespace(timeout=300))
+    line = f'{FLAG}=0'
+    script = f"sed -i '/^{FLAG}=/d' {PRODUCT_PROPS}"
+    if args.state == 'hidden':
+        script += f" && echo '{line}' >> {PRODUCT_PROPS}"
+    shell(script)
+    print(f'{FLAG} {args.state} from the next boot; rebooting')
+    adb('reboot')
+
+
+# Build.MODEL. Deploy writes Horizon's ("Quest 3"); Meta's runtime knows Quest 3 by its codename,
+# Eureka, and without it takes the emulator's device type. A later line of build.prop wins.
+MODEL = 'ro.product.product.model'
+CODENAME = 'Eureka'
+
+
+def model(args):
+    if args.state is None:
+        value = shell('getprop ro.product.model', check=False).strip()
+        print(f'ro.product.model={value!r}: {"eureka" if value == CODENAME else "quest3"}')
+        return
+    root(argparse.Namespace(timeout=300))
+    script = f"sed -i '/^{MODEL}={CODENAME}$/d' {PRODUCT_PROPS}"
+    if args.state == 'eureka':
+        script += f" && echo '{MODEL}={CODENAME}' >> {PRODUCT_PROPS}"
+    shell(script)
+    print(f'model {args.state} from the next boot; rebooting')
+    adb('reboot')
+
+
 def stop(_args):
     if running():
         adb('shell', 'sync', check=False, timeout=30)  # a kill drops what's still in the guest's page cache
@@ -211,6 +255,10 @@ def main():
     st = sub.add_parser('status')
     st.add_argument('--lines', type=int, default=25)
     sub.add_parser('stop')
+    f = sub.add_parser('emulator-flag')
+    f.add_argument('state', nargs='?', choices=('hidden', 'shown'), help='omit to print the current state')
+    m = sub.add_parser('model')
+    m.add_argument('state', nargs='?', choices=('quest3', 'eureka'), help='omit to print the current state')
     a = sub.add_parser('adb')
     a.add_argument('rest', nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -218,7 +266,7 @@ def main():
         subprocess.run([adb_path(), '-s', SERIAL, *args.rest])
         return
     {'create': create, 'start': start, 'wait': wait, 'root': root, 'status': status,
-     'stop': stop}[args.command](args)
+     'stop': stop, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
 
 
 if __name__ == '__main__':

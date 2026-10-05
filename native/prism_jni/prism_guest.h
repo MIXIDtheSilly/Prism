@@ -14,3 +14,6 @@ void *prism_window_function(const char *name, void *real);
 
 // The same, for AImageReader_new (guest_media.c).
 void *prism_media_function(const char *name, void *real);
+
+// Patches the arm64 library just loaded from path, if Prism patches it (guest_patch.c).
+void prism_patch_guest_library(const char *path);

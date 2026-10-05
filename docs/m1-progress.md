@@ -414,5 +414,32 @@ python tools\emulator.py status
   library is a cylinder layer around the viewer, its tiles bowed and tilted toward its edges as
   they should be; its glass background isn't drawn (the dark card behind it is the Store's
   window), and the first tile of All is blank (an app without an icon).
+- **Meta's emulator mode.** Meta's runtime has an emulator of its own in mind, and two things put
+  Prism in it:
+  - `ro.kernel.qemu=1`, from the emulator's `/vendor/build.prop`, which nothing of the emulator's
+    own reads (its HALs use `ro.boot.qemu`). With it, the runtime skips DeviceConfig for its
+    gatekeepers. Deploy overrides it to 0 from `/product/etc/build.prop`, which loads last
+    (`--emulator-flag shown` keeps it; `tools/emulator.py emulator-flag [hidden|shown]` switches a
+    running emulator, with a reboot).
+  - The device type. The runtime looks `Build.MODEL` up in a table of codenames; "Quest 3" isn't
+    one, and on ranchu hardware an unknown model is its emulator (type 270). `--model eureka`
+    (`tools/emulator.py model [quest3|eureka]`) makes the model Quest 3's codename, so the runtime
+    takes it for a Quest 3 (type 272). It's off by default: every app then sees "Eureka" as the
+    model, and the compositor takes the headset's paths, which pre-warp each eye's image for the
+    lenses (Quest 1's, as its lens profile is looked up elsewhere) in the window.
+- **Meta's config parameters.** Gatekeepers and other parameters come from Meta's servers. Each
+  app's config client caches the ones it uses (`files/deviceconfig_cache_v2.txt` in its data:
+  name, logging id, timestamp, source, propagation, value), loads them at start and writes them
+  back. Horizon's own local override (the `DC_OVERRIDE` debug broadcast to
+  `com.oculus.deviceconfigservice.DeviceConfigDebugReceiver`) stores an override but doesn't reach
+  a parameter its service has no schema for, which is all of them without a server sync. Deploy's
+  `META_PARAMS` are set in those caches at post-fs-data, before apps start; the runtime's native
+  gatekeepers (`gkcache.dat`) follow its client's values from its next start.
+- **Frosted glass.** Panels' glass backgrounds are the compositor's: it blurs what's behind a glass
+  layer (`XR_METAX1_composition_layer_glass`). It sets glass up only for the headsets it knows and
+  when `oculus_xrruntime:oculus_frosted_glass` is on. Prism sets the parameter (`META_PARAMS`), and
+  libprism_jni patches the device check (one instruction of `libvrruntimeservice.so`, written as
+  the translator loads it, after checking the bytes:
+  [guest_patch.c](../native/prism_jni/guest_patch.c)); the compositor logs "Glass is enabled".
 - **Next:** panels' glass backgrounds; system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

@@ -211,6 +211,8 @@ static void *find_symbol(const void *base, const char *name);
 static void hook_translator_imports(const struct dl_phdr_info *info);
 static void hook_create_namespace(NativeBridgeCallbacks *itf);
 static const NativeBridgeCallbacks *g_bridge;
+typedef void (*SetExecutableFn)(const char *, size_t);  // takes a std::string_view: pointer, length
+static SetExecutableFn g_set_executable;
 
 static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
   (void)size, (void)data;
@@ -222,6 +224,9 @@ static int find_bridge(struct dl_phdr_info *info, size_t size, void *data) {
         find_symbol((const void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr), "NativeBridgeItf");
     if (!itf || itf->version < 8) return 0;  // another of the translator's libraries
     g_bridge = itf;
+    g_set_executable = (SetExecutableFn)find_symbol(
+        (const void *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr),
+        "_ZN8berberis25SetMainExecutableRealPathENSt3__117basic_string_viewIcNS0_11char_traitsIcEEEE");
     hook_translator_imports(info);
     hook_create_namespace((NativeBridgeCallbacks *)itf);
     return 1;
@@ -299,6 +304,15 @@ static const struct {
                      {"libhidlbase.so", RTLD_NOW},
                      {"libprism_binder_bridge.so", RTLD_NOW},
                      {"libprism_guest_media.so", RTLD_NOW | RTLD_GLOBAL}};
+// The executable an app's arm64 code sees. A headset's app processes are zygote's, whose
+// /proc/self/exe is /system/bin/app_process64. The translator answers arm64 code's readlink of it
+// with the main executable it records, the guest app_process it loaded
+// (/system/bin/arm64/app_process64). Meta's spatial persistence client (libplugin.so) tells Java
+// apps from native executables by that path: from any other path under /system/bin it sends the
+// path as its package name, and the spatial persistence service refused the shell's and Guardian's
+// anchor queries for it (ERROR_RPC_PACKAGE_NAME_MISMATCH, 10 a second). By the time an app creates
+// its first namespace the guest app_process is loaded, so Prism records the host's path instead.
+#define APP_PROCESS "/system/bin/app_process64"
 typedef void *(*CreateNamespaceFn)(const char *, const char *, const char *, uint64_t, const char *, void *);
 static CreateNamespaceFn g_create_namespace;
 
@@ -321,6 +335,7 @@ static void *bridge_create_namespace(const char *name, const char *ld_path, cons
                    : NULL;
     if (start_pool) start_pool();
     LOGI("arm64 binder libraries preloaded before namespace %s%s", name, start_pool ? ", thread pool started" : "");
+    if (g_set_executable) g_set_executable(APP_PROCESS, sizeof APP_PROCESS - 1);
   }
   return g_create_namespace(name, ld_path, default_path, type, permitted, parent);
 }

@@ -70,7 +70,9 @@ python tools\emulator.py status
   `Lockdep.registerHandler` needs Meta's modified ART, so its body is replaced with a return.
   Android looks for a bundled app's libraries only under `lib/<first 64-bit ISA>` (`x86_64`);
   services.jar's `getBundledAppAbis` is replaced so Meta's apps, with `lib/arm64`, get
-  `arm64-v8a` and load their libraries through the bridge.
+  `arm64-v8a` and load their libraries through the bridge. One app is patched too, OCMS (see The
+  library); its APK is repacked with its entries aligned and its APK Signing Block kept, since
+  PackageManager reads a system app's signers without verifying its contents.
 
 - **Vulkan** ([native/vulkan_prism](../native/vulkan_prism/vulkan_prism.c)). Meta's compositor
   requires `VK_KHR_external_memory_fd`: it hands swapchain memory to its clients as file
@@ -334,5 +336,20 @@ python tools\emulator.py status
   both directions (Java Surface parcels on the host side, the relay in between), and the Store's
   body draws ("Token fetch rejected by server": no Meta account), as does the Universal Menu:
   its system bar, clock and the library's tiles.
-- **Next:** the library's tiles are empty, and system_server's deaths by SIGPIPE (twice, soon after
-  an app's window was placed; none since).
+- **Anchors.** Meta's spatial persistence client (`libplugin.so`) names its caller by
+  `readlink("/proc/self/exe")`: `/system/bin/app_process64` means a Java app, whose package name it
+  sends; any other path under `/system/bin` is a native executable, sent as the path. The
+  translator answers arm64 code with the guest app_process it loaded
+  (`/system/bin/arm64/app_process64`), so the spatial persistence service refused the shell's and
+  Guardian's anchor queries (`ERROR_RPC_PACKAGE_NAME_MISMATCH`, 10 a second, half of all logging).
+  libprism_jni now records the host's app_process as the translator's main executable
+  (`berberis::SetMainExecutableRealPath`) once an app's guest side is up; both clients are
+  validated by package and VrShell is trusted.
+- **The library.** OCMS (Horizon's content service) publishes the library once the Store channel's
+  content is resolved, and skipped resolving a fetch that found nothing (no Meta account), so the
+  library never got ready: OCMS refetched every 15 s and VrShell polled it every 500 ms. Prism
+  patches OCMS to resolve an empty fetch like any other (an empty Store library plus the device's
+  own apps): it reaches LIBRARY_READY at boot. The Universal Menu's grid still shows its loading
+  shimmer, and an app installed with adb isn't picked up yet.
+- **Next:** the library grid, and system_server's deaths by SIGPIPE (twice, soon after an app's
+  window was placed; none since).

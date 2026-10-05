@@ -1,4 +1,4 @@
-"""Compatibility patches in Horizon's framework jars for stock Android underneath.
+"""Compatibility patches in Horizon's framework jars (and an app) for stock Android underneath.
 
 * Bridges: stock libandroid_runtime looks some Java members up by exact signature and aborts if
   they're missing. Where Meta added parameters, Prism adds a method with the stock signature that
@@ -175,7 +175,24 @@ BUNDLED_APP_ABIS = f'''    .registers 10
 REGISTER_LOCK_ORDERING = Rewrite(f'{VMRUNTIME}->registerLockOrdering([I)V', drop=True,
                                  reason="lock-order checking through Meta's ART")
 
-# Keyed by device path; each jar is read from the partition image its path names.
+# OCMS, Horizon's content service, publishes the library (LibrarySynced: the Universal Menu's tiles,
+# VrShell's AppManagerClient) once the Store channel's content is resolved. A fetch that finds
+# content resolves it; one that finds none (EMPTY: no Meta account here) skips that, so the library
+# never got ready, OCMS refetched every 15 s and the tiles stayed loading. An empty fetch is resolved
+# like one that found content: an empty Store library, with the apps installed on the device.
+OCMS_FETCHED = 'Lcom/oculus/ocms/am/init/AppManagerInternal$onLibraryContentFetched$1;'
+FETCH_STATUS = 'Lcom/oculus/ocms/am/common/ChannelFetchStatus;'
+RESOLVE_EMPTY_FETCH = Splice(
+    OCMS_FETCHED, 'run()V',
+    f'sget-object v0, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}',
+    f'''    sget-object v0, {FETCH_STATUS}->EMPTY:{FETCH_STATUS}
+    if-ne v1, v0, :prism_not_empty
+    sget-object v1, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}
+    :prism_not_empty
+    sget-object v0, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}''',
+    reason='an empty fetch is resolved too (no Meta account: the library has only local apps)')
+
+# Keyed by device path; each jar (or APK) is read from the partition image its path names.
 BRIDGES = {
     '/system/framework/framework.jar': [
         Bridge('Landroid/view/InputDevice;', '<init>',
@@ -216,6 +233,7 @@ BRIDGES = {
                 reason="bundled apps' libraries for a translated ABI (Meta's apps have lib/arm64)"),
     ],
     '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING],
+    '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH],
 }
 
 
@@ -373,11 +391,68 @@ def patch_jar(data, bridges, workdir):
         sys.exit(f'classes not found in the jar: {", ".join(by_class)}')
     if unused:
         sys.exit(f'members to rewrite that the jar never uses: {", ".join(sorted(unused))}')
+    return replaced
+
+
+def repack_jar(data, replaced):
+    src = zipfile.ZipFile(io_bytes(data))
     out = io_bytes()
     with zipfile.ZipFile(out, 'w') as dst:
         for info in src.infolist():
             dst.writestr(info, replaced.get(info.filename, src.read(info.filename)), compress_type=info.compress_type)
     return out.getvalue()
+
+
+def repack_apk(data, replaced):
+    """The APK with some entries' contents replaced, as PackageManager takes it from a system
+    partition: entries keep their order and compression, stored ones stay aligned (4 bytes, native
+    libraries 4 KiB, as zipalign leaves them), and the APK Signing Block stays before the central
+    directory. On system partitions PackageManager reads the signers' certificates without
+    verifying the contents, so the APK keeps its signers."""
+    import struct
+    import zlib
+    eocd = data.rindex(b'PK\x05\x06')
+    count, cd_size, cd_offset = struct.unpack_from('<HII', data, eocd + 10)
+    block = b''
+    if data[cd_offset - 16:cd_offset] == b'APK Sig Block 42':
+        size = struct.unpack_from('<Q', data, cd_offset - 24)[0]
+        block = data[cd_offset - size - 8:cd_offset]
+    entries, at = [], cd_offset
+    for _ in range(count):
+        fields = list(struct.unpack_from('<4s6H3I5H2I', data, at))
+        name_len, extra_len, comment_len = fields[10:13]
+        entries.append((fields, data[at + 46:at + 46 + name_len + extra_len + comment_len]))
+        at += 46 + name_len + extra_len + comment_len
+    body, central = io_bytes(), io_bytes()
+    for fields, tail in sorted(entries, key=lambda e: e[0][16]):
+        flags, method, crc, csize, usize, name_len = fields[3], fields[4], fields[7], fields[8], fields[9], fields[10]
+        name = tail[:name_len]
+        local = fields[16]
+        local_name, local_extra = struct.unpack_from('<2H', data, local + 26)
+        start = local + 30 + local_name + local_extra
+        payload = data[start:start + csize]
+        content = replaced.get(name.decode())
+        if content is not None:
+            crc, usize = zlib.crc32(content), len(content)
+            if method == 0:
+                payload = content
+            else:
+                packer = zlib.compressobj(9, zlib.DEFLATED, -15)
+                payload = packer.compress(content) + packer.flush()
+            csize = len(payload)
+        flags &= ~0x8  # sizes in the headers, no data descriptor
+        offset = body.tell()
+        pad = 0
+        if method == 0:
+            align = 4096 if name.endswith(b'.so') else 4
+            pad = -(offset + 30 + name_len) % align
+        body.write(struct.pack('<4s5H3I2H', b'PK\x03\x04', fields[2], flags, method, fields[5], fields[6],
+                               crc, csize, usize, name_len, pad) + name + b'\0' * pad + payload)
+        fields[3], fields[7], fields[8], fields[9], fields[16] = flags, crc, csize, usize, offset
+        central.write(struct.pack('<4s6H3I5H2I', *fields) + tail)
+    head = body.getvalue() + block
+    return head + central.getvalue() + struct.pack('<4s4H2IH', b'PK\x05\x06', 0, 0, count, count,
+                                                   len(central.getvalue()), len(head), 0)
 
 
 def io_bytes(data=None):
@@ -425,7 +500,8 @@ def main():
         data = images[partition].read(images[partition].lookup(path))
         workdir = tempfile.mkdtemp(prefix='prism-compat-')
         try:
-            patched = patch_jar(data, bridges, workdir)
+            replaced = patch_jar(data, bridges, workdir)
+            patched = (repack_apk if device_path.endswith('.apk') else repack_jar)(data, replaced)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         verify(patched, bridges)

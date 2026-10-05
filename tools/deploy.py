@@ -308,9 +308,10 @@ class Archive:
         self.tar.addfile(info, io.BytesIO(data) if kind == 'f' else None)
         self.count += 1
 
-    def add_tree(self, fs, src, dest, skip=(), flat=False):
+    def add_tree(self, fs, src, dest, skip=(), flat=False, device=None):
         """Copies an image subtree (file or directory) to dest, keeping modes, owners and symlinks.
-        flat: only the directory's own files, none of its subdirectories."""
+        flat: only the directory's own files, none of its subdirectories.
+        device: where dest appears on the device, for overrides (dest, unless bind-mounted there)."""
         ino = fs.lookup(src)
         for path, node in fs.walk(ino, src.rstrip('/')) if ino.mode & S_IFMT == S_IFDIR else [(src, ino)]:
             rel = path[len(src.rstrip('/')):]
@@ -321,8 +322,8 @@ class Archive:
             kind = {S_IFDIR: 'd', S_IFLNK: 'l', S_IFREG: 'f'}.get(node.mode & S_IFMT)
             if not kind or (flat and parts and (len(parts) > 1 or kind == 'd')):
                 continue
-            if kind == 'f' and dest + rel in self.overrides:
-                with open(self.overrides[dest + rel], 'rb') as f:
+            if kind == 'f' and (device or dest) + rel in self.overrides:
+                with open(self.overrides[(device or dest) + rel], 'rb') as f:
                     data = f.read()
             else:
                 data = fs.read(node) if kind in ('f', 'l') else b''
@@ -440,7 +441,7 @@ def build(args):
         sys.exit(f'no space service in {args.spaces}; run: python tools/spaces.py')
     print(f'using {len(overrides)} Prism-patched files: {", ".join(sorted(overrides))}')
     overlay = Archive(os.path.join(args.out, 'overlay.tar'), overrides)
-    data = Archive(os.path.join(args.out, 'data.tar'))
+    data = Archive(os.path.join(args.out, 'data.tar'), overrides)
     replaced, binds = [], []
     for partition, path, how, *rest in LAYOUT:
         options = rest[0] if rest else {}
@@ -453,7 +454,7 @@ def build(args):
             continue
         skip = options.get('skip', ())
         if how == 'bind':
-            data.add_tree(fs, path, f'{DATA_ROOT}/{partition}{path}', skip)
+            data.add_tree(fs, path, f'{DATA_ROOT}/{partition}{path}', skip, device=target)
             binds.append((f'{DATA_ROOT}/{partition}{path}', target))
             overlay.add(target, 'd', 0o755)  # the mount point; stock has no /system_ext/app
         else:

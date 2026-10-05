@@ -67,6 +67,7 @@ def main():
     ap.add_argument('--eye', choices=('left', 'right'), default='left')
     ap.add_argument('--no-stats', action='store_true', help='start with the F1 stats hidden')
     ap.add_argument('--build', action='store_true', help='rebuild the viewer even if it looks current')
+    ap.add_argument('--log', action='store_true', help="print the viewer's stats once a second")
     args = ap.parse_args()
     if os.name != 'nt':
         sys.exit('the viewer runs on Windows')
@@ -75,7 +76,7 @@ def main():
                    capture_output=True)
     subprocess.run([EXE, '--emulator-port', str(EMULATOR_PORT), '--tracking-port', str(PORT), '--eye', args.eye,
                     '--adb', adb_path(), '--serial', SERIAL, '--stats', '0' if args.no_stats else '1',
-                    '--shots', os.path.join(ROOT, 'work', 'screenshots')])
+                    '--shots', os.path.join(ROOT, 'work', 'screenshots')] + (['--log'] if args.log else []))
 
 
 if __name__ == '__main__':

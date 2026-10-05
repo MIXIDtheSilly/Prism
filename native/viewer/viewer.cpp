@@ -292,6 +292,7 @@ struct App {
     float uploadMs = 0;
     // Stats overlay (Direct2D text over the swap chain).
     bool overlay = true;
+    bool log = false;  // --log: the stats line on stdout once a second
     float sourceFps = 0, shownFps = 0;
     std::array<float, 120> intervals{};  // ms between frames shown, a ring
     size_t intervalNext = 0, intervalCount = 0;
@@ -701,8 +702,10 @@ int main(int argc, char** argv)
 {
     int emulatorPort = 5590, trackingPort = 7340;
     std::string adb = "adb", serial = "emulator-5590";
-    for (int i = 1; i + 1 < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--log") { g_app.log = true; continue; }
+        if (i + 1 == argc) break;  // the rest take a value
         if (arg == "--emulator-port") emulatorPort = std::atoi(argv[++i]);
         else if (arg == "--tracking-port") trackingPort = std::atoi(argv[++i]);
         else if (arg == "--eye") g_app.eye = std::string(argv[++i]) == "right" ? 1 : 0;
@@ -768,6 +771,17 @@ int main(int argc, char** argv)
             swprintf_s(title, L"Prism  |  %.0f fps  |  %ls  |  left: trigger, right-drag: look, WASD R/F: move, Tab: Meta  |  F1 stats",
                 g_app.shownFps, !g_frames.base ? L"waiting for the emulator" : g_input.connected ? L"tracking" : L"no tracking service");
             SetWindowTextW(g_app.window, title);
+            if (g_app.log) {
+                float average = 0, worst = 0;
+                for (size_t i = 0; i < g_app.intervalCount; ++i) {
+                    const float ms = g_app.intervals[(g_app.intervalNext + g_app.intervals.size() - 1 - i) % g_app.intervals.size()];
+                    if (i < size_t(presented)) average += ms, worst = std::max(worst, ms);
+                }
+                const size_t n = std::min<size_t>(presented, g_app.intervalCount);
+                std::printf("viewer: %4.1f fps from the emulator, %4.1f shown, %5.1f ms avg %5.1f worst, upload %.2f ms\n",
+                            g_app.sourceFps, g_app.shownFps, n ? average / n : 0.f, worst, g_app.uploadMs);
+                std::fflush(stdout);
+            }
             presented = 0;
             statsAt = now;
             pending = true;  // the overlay's numbers changed

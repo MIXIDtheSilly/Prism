@@ -95,7 +95,6 @@ LAYOUT = [
     ('system', '/system/etc/xrs-hmdconfig.capnp.bin', 'merge'),
     ('system', '/system/etc/xrs_version_code', 'merge'),
     ('system', '/system/etc/display.conf', 'merge'),  # vrdevice: display timing
-    ('system', '/system/etc/device_props.json', 'merge'),  # vrdevice: chipset, refresh rate
     ('system_ext', '/framework', 'replace'),
     # DeviceAuthServer proves the device's identity with the headset's certificate hardware, which
     # Prism doesn't fake (see README, Scope); without that hardware it crashes in a loop.
@@ -141,6 +140,7 @@ META_PARAMS = [
     ('/data/user_de/0/com.oculus.systemdriver', 'oculus_xrruntime:oculus_frosted_glass', 'true'),
 ]
 META_PARAMS_SCRIPT = '/system/bin/prism_meta_params.sh'
+DEVICE_PROPS = '/system/etc/device_props.json'  # vrdevice: chipset, default refresh rate (patched)
 # debugfs is restricted on this image (init unmounts it), so it's mounted just for the write.
 SCHED_FEATURES = ('mount -t debugfs debugfs /sys/kernel/debug; '
                   'echo NO_TTWU_QUEUE > /sys/kernel/debug/sched/features; umount /sys/kernel/debug')
@@ -417,10 +417,11 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
     props['ro.ovr.sliceCountY'] = '1'
     props['debug.oculus.frontbufferHeight'] = '1080'
     # The compositor's vsync starts at the device's default rate (72) whatever the display reports,
-    # and the emulator's display is 60 Hz (hw.lcd.vsync, tools/emulator.py), so 72 frames a second
-    # became 60 on screen and in the viewer, one dropped in six, unevenly. "<rate>[:2 for half]"
-    # forces a rate; it must be one the display offers (the runtime logs them, SupportedDisplayRefreshRates).
-    props['debug.oculus.refreshRate'] = '60'
+    # and the emulator's display is 60 Hz (emulator.DISPLAY_HZ), so 72 frames a second became 60 on
+    # screen and in the viewer, one dropped in six, unevenly. "<rate>[:2 for half]" forces a rate; it
+    # must be one the display offers (the runtime logs them, SupportedDisplayRefreshRates). Clients
+    # take theirs from vrdevice's default instead (DEVICE_PROPS), which deploy sets to match.
+    props['debug.oculus.refreshRate'] = str(emulator.DISPLAY_HZ)
     # VrShell gives its environment 15 s to load, times the device's timeout multiplier when Meta's
     # switch allows it. Under translation the load takes 15 s to well over a minute, so it failed on
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
@@ -666,6 +667,14 @@ def build(args):
     if 'max-level="6"' not in manifest:
         sys.exit(f'{SUSPEND_VINTF} no longer limits the HIDL system suspend; check its declaration')
     overlay.add(SUSPEND_VINTF, 'f', 0o644, data=manifest.replace(' max-level="6"', '').encode())
+
+    # vrdevice's device properties, with the display's rate as the default refresh rate. Apps take
+    # their rate from it: VrShell restarted alone timed its frames for 72 against a 60 Hz compositor.
+    text = images['system'].read(images['system'].lookup(DEVICE_PROPS)).decode()
+    text, n = re.subn(r'("device_default_refresh_rate"\s*:\s*")[^"]*"', rf'\g<1>{emulator.DISPLAY_HZ}.0"', text)
+    if n != 1:
+        sys.exit(f'{DEVICE_PROPS} has no device_default_refresh_rate; check its format')
+    overlay.add(DEVICE_PROPS, 'f', 0o644, data=text.encode())
 
     # zygote preloads libprism_jni.so.
     rc = stock['system'].read(stock['system'].lookup(ZYGOTE_RC)).decode()

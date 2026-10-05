@@ -345,7 +345,11 @@ python tools\emulator.py status
   The compositor runs at 60 Hz, the display's rate: its vsync otherwise starts at the device's
   default 72 whatever the display reports, and the emulator shares at most 60 frames a second, so
   one compositor frame in six was dropped, unevenly. `debug.oculus.refreshRate` ("<rate>", or
-  "<rate>:2" for half) forces the rate; deploy sets 60.
+  "<rate>:2" for half) forces the compositor's rate; deploy sets 60. Apps take theirs from
+  vrdevice's `device_default_refresh_rate` (/system/etc/device_props.json, read once by
+  vrdevicemanagerserver at boot), which deploy sets to 60 too: with only the property, VrShell
+  restarted on its own timed its frames for 72 against the 60 Hz compositor (47 shared frames a
+  second, 10 ms of jitter, against 60 and 1.4 ms with both).
 - **Panels' bodies.** VrShell gave the Store's and the Universal Menu's volumetric windows
   single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a headset's
   SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers

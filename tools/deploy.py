@@ -416,6 +416,11 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
     # the window, renders the frame in one pass.
     props['ro.ovr.sliceCountY'] = '1'
     props['debug.oculus.frontbufferHeight'] = '1080'
+    # The compositor's vsync starts at the device's default rate (72) whatever the display reports,
+    # and the emulator's display is 60 Hz (hw.lcd.vsync, tools/emulator.py), so 72 frames a second
+    # became 60 on screen and in the viewer, one dropped in six, unevenly. "<rate>[:2 for half]"
+    # forces a rate; it must be one the display offers (the runtime logs them, SupportedDisplayRefreshRates).
+    props['debug.oculus.refreshRate'] = '60'
     # VrShell gives its environment 15 s to load, times the device's timeout multiplier when Meta's
     # switch allows it. Under translation the load takes 15 s to well over a minute, so it failed on
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.

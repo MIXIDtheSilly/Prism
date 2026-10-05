@@ -508,7 +508,7 @@ D3D11_VIEWPORT fit(float w, float h, float aspect)
     return {(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
 }
 
-// Frame-time bar color: within a 72 fps budget green, within 30 fps yellow, else red.
+// Frame-time bar color: within a 60 fps budget green, within 30 fps yellow, else red.
 D2D1_COLOR_F frame_color(float ms)
 {
     return ms <= 17.5f ? D2D1::ColorF(0.3f, 0.85f, 0.4f) : ms <= 33.4f ? D2D1::ColorF(0.95f, 0.8f, 0.2f) : D2D1::ColorF(0.95f, 0.3f, 0.25f);

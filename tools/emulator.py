@@ -78,9 +78,10 @@ def create(args):
         'hw.gpu.enabled': 'yes', 'hw.gpu.mode': 'host', 'hw.gltransport': 'asg',
         # A landscape 1080p display, the shape a desktop window of Horizon will have.
         'hw.lcd.width': '1920', 'hw.lcd.height': '1080', 'hw.lcd.density': '320',
-        # The display stays at 60 Hz although the compositor draws 72 frames a second: the frames the
-        # emulator shares (-share-vid, the viewer's) come at most 60 a second, a frame within 1/60 s
-        # of the last skipped, so at 72 Hz only every other one (36 a second) reached the viewer.
+        # The display stays at 60 Hz, and deploy sets the compositor to match (debug.oculus.refreshRate;
+        # it would draw 72): the frames the emulator shares (-share-vid, the viewer's) come at most 60
+        # a second, a frame within 1/60 s of the last skipped, so at 72 Hz only every other one (36 a
+        # second) reached the viewer.
         'hw.lcd.vsync': '60',
         'hw.initialOrientation': 'landscape', 'hw.keyboard': 'yes', 'hw.mainKeys': 'no',
         'hw.audioInput': 'yes', 'hw.audioOutput': 'yes', 'hw.sdCard': 'no', 'PlayStore.enabled': 'no',

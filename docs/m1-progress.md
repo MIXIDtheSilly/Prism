@@ -342,6 +342,10 @@ python tools\emulator.py status
   right-drag looks around, WASD and R/F move. The compositor draws each half from the head's
   center (not the eye's), the middle of the FOV apps render, undistorted; the runtime's aim pose is
   the published pose turned 5° in and moved 9 mm (xrprobe), which the viewer undoes.
+  The compositor runs at 60 Hz, the display's rate: its vsync otherwise starts at the device's
+  default 72 whatever the display reports, and the emulator shares at most 60 frames a second, so
+  one compositor frame in six was dropped, unevenly. `debug.oculus.refreshRate` ("<rate>", or
+  "<rate>:2" for half) forces the rate; deploy sets 60.
 - **Panels' bodies.** VrShell gave the Store's and the Universal Menu's volumetric windows
   single-pass composition (`dumpsys volumetric_window`: XR_SINGLE_PASS), where a headset's
   SurfaceFlinger hands the windows' buffers to the runtime as OpenXR layers

@@ -24,7 +24,7 @@ struct AndroidSnapshot {
     bool valid = false;
     int cores = 0;
     double cpuPercent = 0;  // of all cores
-    std::string compositor;  // "71/72": frames the compositor showed in its last second, of its rate
+    std::string compositor;  // "60/60": frames the compositor showed in its last second, of its rate
     std::vector<ThreadUse> threads;  // busiest first
 };
 

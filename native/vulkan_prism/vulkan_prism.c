@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -2770,6 +2771,31 @@ static int prism_close(hw_device_t *device) {
   return 0;
 }
 
+// gfxstream's guest health monitor reports a stream stalled for seconds (the whole guest paused
+// by the PC) with the encoder's current packet as hex, from VkEncoder::getPacketContents; between
+// packets that packet's pointer is null, and the report reads through it: a stall would kill the
+// process (Horizon's runtime). The function returns an empty string instead; nothing else calls it.
+static void quiet_hang_reports(void) {
+  void *encoder = dlopen("libvulkan_enc.so", RTLD_NOW | RTLD_NOLOAD);
+  unsigned char *fn = encoder ? dlsym(encoder, "_ZN9gfxstream2vk9VkEncoder17getPacketContentsEPKhm") : NULL;
+  // push rbp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x48; mov r14, rcx; mov r15, rdx
+  static const unsigned char prologue[] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+                                           0x48, 0x83, 0xec, 0x48, 0x49, 0x89, 0xce, 0x49, 0x89, 0xd7};
+  // xorps xmm0, xmm0; movups [rdi], xmm0; mov qword [rdi+16], 0; mov rax, rdi; ret: an empty
+  // libc++ string in the returned slot
+  static const unsigned char empty[] = {0x0f, 0x57, 0xc0, 0x0f, 0x11, 0x07, 0x48, 0xc7, 0x47, 0x10,
+                                        0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xf8, 0xc3};
+  if (!fn || memcmp(fn, prologue, sizeof prologue)) {
+    LOGI("gfxstream's getPacketContents isn't the checked build; hang reports unchanged");
+    return;
+  }
+  uintptr_t page = (uintptr_t)getpagesize(), start = (uintptr_t)fn & ~(page - 1);
+  uintptr_t end = ((uintptr_t)fn + sizeof empty + page - 1) & ~(page - 1);
+  if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC)) return;
+  memcpy(fn, empty, sizeof empty);
+  mprotect((void *)start, end - start, PROT_READ | PROT_EXEC);
+}
+
 static void open_driver(void) {
   char driver[PROP_VALUE_MAX] = "";
   __system_property_get("ro.boot.hardware.vulkan", driver);  // the emulator's choice
@@ -2777,6 +2803,7 @@ static void open_driver(void) {
   char path[PROP_VALUE_MAX + 32];
   snprintf(path, sizeof path, "/vendor/lib64/hw/vulkan.%s.so", driver);
   void *so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (so) quiet_hang_reports();
   hwvulkan_module_t *module = so ? dlsym(so, "HMI") : NULL;
   if (!module) {
     LOGE("can't load %s: %s", path, dlerror());

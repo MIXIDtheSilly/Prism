@@ -7,7 +7,8 @@ What goes where:
     bind-mounts them over the stock directories in post-fs-data, before zygote starts.
   * Prism's JNI glue goes to /system/lib64; zygote preloads libprism_jni.so.
   * Prism's Vulkan driver goes to /vendor/lib64/hw (ro.hardware.vulkan=prism).
-  * Prism's thermal HAL goes to /vendor/bin/hw, with its init script and VINTF declaration.
+  * Prism's thermal and maintenance boot HALs go to /vendor/bin/hw, with their init scripts and
+    VINTF declarations.
   * Prism's tracking service goes to /system_ext/bin, with its init script; it hosts Meta's
     MemoryBroker, whose VINTF declaration goes with it.
   * Prism's binder relay goes to /system_ext/bin, with its init script; its arm64 client goes with
@@ -179,6 +180,24 @@ THERMAL_VINTF = '''<manifest version="1.0" type="device">
         <name>android.hardware.thermal</name>
         <version>1</version>
         <fqname>IThermal/default</fqname>
+    </hal>
+</manifest>
+'''
+# Prism's maintenance boot HAL (tools/thermal.py), which a headset's odm has: Horizon's
+# MaintenanceBoot app waits for it each boot, retrying every second while it's missing.
+MAINTENANCE_HAL = 'prism_maintenanceboot'
+MAINTENANCE_RC = f'''service vendor.prism-maintenanceboot /vendor/bin/hw/{MAINTENANCE_HAL}
+    interface aidl vendor.oculus.hardware.maintenanceboot.IMaintenanceBoot/default
+    class hal
+    user system
+    group system
+    seclabel u:r:su:s0
+'''
+MAINTENANCE_VINTF = '''<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>vendor.oculus.hardware.maintenanceboot</name>
+        <version>1</version>
+        <fqname>IMaintenanceBoot/default</fqname>
     </hal>
 </manifest>
 '''
@@ -401,6 +420,9 @@ def build(args):
     thermal = os.path.join(args.thermal, THERMAL_HAL)
     if not os.path.exists(thermal):
         sys.exit(f'no thermal HAL in {args.thermal}; run: python tools/thermal.py')
+    maintenance = os.path.join(args.thermal, MAINTENANCE_HAL)
+    if not os.path.exists(maintenance):
+        sys.exit(f'no maintenance boot HAL in {args.thermal}; run: python tools/thermal.py')
     tracking = os.path.join(args.tracking, TRACKING)
     if not os.path.exists(tracking):
         sys.exit(f'no tracking service in {args.tracking}; run: python tools/tracking.py')
@@ -541,6 +563,10 @@ def build(args):
         overlay.add(f'/vendor/bin/hw/{THERMAL_HAL}', 'f', 0o755, gid=2000, data=f.read())
     overlay.add(f'/vendor/etc/init/{THERMAL_HAL}.rc', 'f', 0o644, data=THERMAL_RC.encode())
     overlay.add(f'/vendor/etc/vintf/manifest/{THERMAL_HAL}.xml', 'f', 0o644, data=THERMAL_VINTF.encode())
+    with open(maintenance, 'rb') as f:
+        overlay.add(f'/vendor/bin/hw/{MAINTENANCE_HAL}', 'f', 0o755, gid=2000, data=f.read())
+    overlay.add(f'/vendor/etc/init/{MAINTENANCE_HAL}.rc', 'f', 0o644, data=MAINTENANCE_RC.encode())
+    overlay.add(f'/vendor/etc/vintf/manifest/{MAINTENANCE_HAL}.xml', 'f', 0o644, data=MAINTENANCE_VINTF.encode())
 
     # Prism's binder relay.
     with open(os.path.join(args.relay, RELAY), 'rb') as f:

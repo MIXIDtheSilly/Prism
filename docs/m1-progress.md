@@ -141,7 +141,11 @@ python tools\emulator.py status
   promoted to core that Meta's code looks for by name, such as `VK_KHR_driver_properties`).
 - **Thermal HAL** ([native/thermal_prism](../native/thermal_prism/thermal_prism.c)). vrdevice
   needs the stable-AIDL `android.hardware.thermal.IThermal/default`; the emulator has only the
-  HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings.
+  HIDL mock. Prism's HAL, written against libbinder_ndk, reports fixed cool readings. Beside it
+  goes the maintenance boot HAL a headset's odm has
+  ([maintenanceboot_prism.c](../native/thermal_prism/maintenanceboot_prism.c)): Horizon's
+  MaintenanceBoot app records at each boot that maintenance boot is off, and without the HAL it
+  retried every second, forever. Prism's keeps the settings in memory.
 - **Binder objects between arm64 code and Java** ([native/binder_relay](../native/binder_relay)). An
   app's arm64 libbinder is a /dev/binder connection of its own, separate from its Java binder's, so
   Horizon's `AIBinder_toJavaBinder` and `AIBinder_fromJavaBinder` can't hand an object across.
@@ -291,6 +295,11 @@ python tools\emulator.py status
   whose signaller had died, and ending that process's connection waits for that thread. Prism's
   Vulkan driver now hands the PC waits of at most 100 ms (fences and semaphores) and waits out the
   rest in the guest; killing the runtime service no longer stops the emulator.
+- **The guest pausing.** When the whole guest stalls for seconds (the PC busy), gfxstream's guest
+  health monitor reports every stream as hung, with the encoder's current packet as hex
+  (`VkEncoder::getPacketContents`); between packets that packet's pointer is null, and the report
+  killed the runtime service with SIGSEGV after almost six hours up. Prism's Vulkan driver makes
+  the function return an empty string (checking its prologue first).
 - **Translator aborts** (scudo: "invalid chunk state when deallocating", in
   `berberis::InstallTranslated`): the bundle's block chaining keeps per-thread state in a
   `thread_local` vector, which bionic destroys before running pthread key destructors; an arm64

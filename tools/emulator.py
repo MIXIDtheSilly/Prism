@@ -109,6 +109,15 @@ def running():
     return listed()
 
 
+def cores():
+    try:
+        with open(os.path.join(avd_home(), AVD + '.avd', 'config.ini')) as f:
+            config = dict(line.rstrip('\n').split('=', 1) for line in f if '=' in line)
+        return int(config.get('hw.cpu.ncore', '1'))
+    except (OSError, ValueError):
+        return 1
+
+
 def start(args):
     if running():
         print(f'{SERIAL} is already running')
@@ -123,6 +132,12 @@ def start(args):
         command.append('-no-window')
     if args.wipe:
         command.append('-wipe-data')
+    # Under the Windows Hypervisor Platform the emulator overrides hw.cpu.ncore with one vCPU ("Not
+    # all modern X86 virtualization features supported"), and on one CPU Horizon starves: a Navigator
+    # panel's two coroutine workers block on account-only requests and its library never loads.
+    # qemu's own -smp comes after the emulator's and wins. Must be last: -qemu takes the rest.
+    if cores() > 1:
+        command += ['-qemu', '-smp', str(cores())]
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS if os.name == 'nt' else 0
     subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
     print(f'starting {AVD} as {SERIAL} (log: {log.name})')

@@ -350,7 +350,14 @@ python tools\emulator.py status
   content is resolved, and skipped resolving a fetch that found nothing (no Meta account), so the
   library never got ready: OCMS refetched every 15 s and VrShell polled it every 500 ms. Prism
   patches OCMS to resolve an empty fetch like any other (an empty Store library plus the device's
-  own apps): it reaches LIBRARY_READY at boot. The Universal Menu's grid still shows its loading
-  shimmer, and an app installed with adb isn't picked up yet.
+  own apps): it reaches LIBRARY_READY at boot. The Universal Menu's library then shows Horizon's
+  own apps (Chats, Files, Settings, Camera, Dogfood Hub), with icons and names, once the guest has
+  more than one CPU (see CPUs).
+- **CPUs.** Under the Windows Hypervisor Platform the emulator gives the guest one vCPU whatever
+  the AVD asks for ("Not all modern X86 virtualization features supported"). On one CPU the
+  Navigator's coroutine dispatcher has two workers, and both blocked for good on account-only
+  GraphQL requests (profile photo and avatar), so the library's flows never ran and its grid
+  stayed a loading shimmer. `tools/emulator.py` passes qemu its own `-smp` (the AVD's 6 cores),
+  which wins; boot to the first panel went from 2 min 18 s to 1 min 21 s.
 - **Next:** the library grid, and system_server's deaths by SIGPIPE (twice, soon after an app's
   window was placed; none since).

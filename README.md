@@ -1,5 +1,7 @@
 ![Prism](img/prism_banner.png)
 
+[![Support Prism on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Prism-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/mixid_mbb)
+
 Prism is an experimental Horizon OS emulator for Windows PCs. It aims to run Meta's own Horizon
 OS system software (the home environment, system UI, panels and apps) on a PC, in a desktop window
 first and later in a PC VR headset.
@@ -10,6 +12,26 @@ first and later in a PC VR headset.
 > runtime and compositor. Next: panels' glass backgrounds, then output to a PC VR headset. See
 > [Progress](#progress), [docs/plan.md](docs/plan.md) and
 > [docs/m1-progress.md](docs/m1-progress.md).
+
+## Support Prism
+
+I'm a student, and I build Prism in my spare time. Most of that time goes into reverse engineering:
+working out what Meta's software expects from a real Quest and then giving it that from a PC.
+Getting this far meant things like:
+
+- rebuilding the C API of Meta's space manager from its binaries, so panels know where to go;
+- finding the one 16-bit field at offset 0xe38 that tells Meta's runtime a controller is actually
+  in your hand, before VrShell would draw it;
+- stopping a system bar that asked for a Meta account 40,000 times a second until Android ran out
+  of memory and took the emulator down with it.
+
+If you'd like to see Horizon OS running on a PC, a coffee on Ko-fi helps a lot. It keeps the
+late-night debugging going and gets the next milestone (a PC VR headset) here sooner.
+
+[![Buy me a coffee on Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mixid_mbb)
+
+Not in a position to donate? Starring the repo, trying Prism on your own headset's OTA and
+reporting what breaks helps too.
 
 ## Progress
 

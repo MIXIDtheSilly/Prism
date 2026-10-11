@@ -22,10 +22,17 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, 'jni'))
-from build import find_ndk  # noqa: E402
+from build import extracted, find_ndk  # noqa: E402
+import stamp  # noqa: E402
 
 BUNDLE = os.path.join(ROOT, 'prebuilts', 'digitalis')
 SHIM_SOURCE = os.path.join(ROOT, 'native', 'berberis_compat', 'berberis_compat.c')
+BIONIC = os.path.join(ROOT, 'work', 'device', 'bionic')
+
+
+def inputs(bionic=BIONIC):
+    """The bundle, the shim, and what imports are checked against: stock's libraries and bionic."""
+    return [BUNDLE, SHIM_SOURCE, __file__, bionic, *extracted(os.path.join(ROOT, 'work', 'baseline', 'fs'))]
 SHIM = 'libpcx.so'
 REPLACED = 'libc++.so'
 assert len(SHIM) == len(REPLACED)
@@ -220,7 +227,11 @@ def main():
     ap.add_argument('--bionic', default=os.path.join('work', 'device', 'bionic'),
                     help='stock bionic from /apex/com.android.runtime (pulled from the emulator)')
     ap.add_argument('--out', default=os.path.join('work', 'build', 'translator'))
+    ap.add_argument('--force', action='store_true', help='build even if current')
     args = ap.parse_args()
+    fingerprint = stamp.fingerprint(inputs(args.bionic))
+    if stamp.up_to_date(args.out, fingerprint, args.force):
+        return
 
     with open(os.path.join(BUNDLE, 'SHA256SUMS')) as f:
         for line in f:
@@ -275,6 +286,7 @@ def main():
             unresolved[os.path.basename(path)] = sorted(missing)
     if unresolved:
         sys.exit(f'imports with no provider on Android 14: {unresolved}')
+    stamp.write(args.out, fingerprint)
     print(f'{len(hosts)} host binaries, {patched} pointed at {SHIM}; all imports resolve -> {args.out}')
 
 

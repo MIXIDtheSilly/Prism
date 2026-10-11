@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import API, find_ndk  # noqa: E402
+import stamp  # noqa: E402
 
 NATIVE = os.path.join(ROOT, 'native', 'hidl_prism')
 FS = os.path.join(ROOT, 'work', 'fs')
@@ -83,14 +84,27 @@ def config_site(ndk, host, out):
         f.write(text)
 
 
+def horizon_libs():
+    return COMMON + [lib for _, libs in BINARIES.values() for lib in libs]
+
+
+def inputs():
+    """The sources and the Horizon libraries the daemons link (the AOSP headers come from AOSP_TAG)."""
+    return [NATIVE, __file__, *[os.path.join(FS, lib) for lib in horizon_libs()]]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ndk')
     ap.add_argument('--out', default=os.path.join('work', 'build', 'hidl'))
+    ap.add_argument('--force', action='store_true', help='build even if current')
     args = ap.parse_args()
-    for lib in COMMON + [l for _, libs in BINARIES.values() for l in libs]:
+    for lib in horizon_libs():
         if not os.path.exists(os.path.join(FS, lib)):
             sys.exit(f'no {lib} in {FS}; run tools/prepare.py first')
+    fingerprint = stamp.fingerprint(inputs())
+    if stamp.up_to_date(args.out, fingerprint, args.force):
+        return
     fetch_headers()
     ndk = find_ndk(args.ndk)
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
@@ -106,6 +120,7 @@ def main():
         subprocess.run([clang, *flags, os.path.join(NATIVE, source), '-o', out, '-ldl', '-Wl,--build-id=sha1',
                         '-Wl,--allow-shlib-undefined', *[os.path.join(FS, lib) for lib in COMMON + libs]], check=True)
         print(f'built {out}')
+    stamp.write(args.out, fingerprint)
 
 
 if __name__ == '__main__':

@@ -46,6 +46,33 @@ def read_header(base):
     return HEADER.unpack(ctypes.string_at(base, HEADER.size))
 
 
+def frame_rate(seconds=1.0, port=PORT):
+    """Frames a second the emulator shared over `seconds`, or None if it isn't sharing any. Unlike
+    open_frames, it lets the mapping go again, so it can be asked as often as needed."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenFileMappingW.restype = wt.HANDLE
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.MapViewOfFile.argtypes = [wt.HANDLE, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+    kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    mapping = kernel32.OpenFileMappingW(FILE_MAP_READ, False, f'SHM_videmulator{port}')
+    if not mapping:
+        return None
+    try:
+        base = kernel32.MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)
+        if not base:
+            return None
+        try:
+            start, first = time.perf_counter(), read_header(base)[3]
+            time.sleep(seconds)
+            frames = (read_header(base)[3] - first) & 0xffffffff
+            return frames / (time.perf_counter() - start)
+        finally:
+            kernel32.UnmapViewOfFile(base)
+    finally:
+        kernel32.CloseHandle(mapping)
+
+
 def percentile(sorted_values, p):
     return sorted_values[min(len(sorted_values) - 1, int(len(sorted_values) * p / 100))]
 

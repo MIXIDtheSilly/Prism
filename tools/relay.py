@@ -16,17 +16,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import API, find_ndk  # noqa: E402
+import stamp  # noqa: E402
 
 NATIVE = os.path.join(ROOT, 'native', 'binder_relay')
 RELAY = 'prism_binder_relay'
 BRIDGE = 'libprism_binder_bridge.so'
 
 
+def inputs():
+    return [NATIVE, __file__]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ndk')
     ap.add_argument('--out', default=os.path.join('work', 'build', 'relay'))
+    ap.add_argument('--force', action='store_true', help='build even if current')
     args = ap.parse_args()
+    fingerprint = stamp.fingerprint(inputs())
+    if stamp.up_to_date(args.out, fingerprint, args.force):
+        return
     ndk = find_ndk(args.ndk)
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
     clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
@@ -40,6 +49,7 @@ def main():
         subprocess.run([clang, f'--target={target}-linux-android{API}', *flags, *common, os.path.join(NATIVE, source),
                         '-o', out, '-lbinder_ndk', '-llog', '-ldl'], check=True)
         print(f'built {out}')
+    stamp.write(args.out, fingerprint)
 
 
 if __name__ == '__main__':

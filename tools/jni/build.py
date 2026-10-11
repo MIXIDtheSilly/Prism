@@ -22,11 +22,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'inventory'))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'ota'))
+sys.path.append(os.path.join(ROOT, 'tools'))
 import dex  # noqa: E402
+import stamp  # noqa: E402
 from inventory import Tree, classpaths  # noqa: E402
 
 SOURCE_DIR = os.path.join(ROOT, 'native', 'prism_jni')  # prism_jni.c and the HLE sources (hle_*.c)
+# Headers of other parts its sources include.
+SHARED_HEADERS = [os.path.join(ROOT, 'native', 'guest_media', 'guest_media.h'),
+                  os.path.join(ROOT, 'native', 'spaces_prism', 'spaces_protocol.h')]
 API = 34
+
+
+def extracted(fs):
+    """What stands for an extracted file system in a stamp: its partitions' manifests, which
+    tools/ota/ext4.py writes as it extracts each one."""
+    return sorted(glob.glob(os.path.join(fs, '*.manifest.tsv'))) or [fs]
+
+
+def inputs(fs=os.path.join(ROOT, 'work', 'fs'), baseline=os.path.join(ROOT, 'work', 'baseline', 'fs')):
+    return [SOURCE_DIR, *SHARED_HEADERS, __file__, os.path.join(ROOT, 'tools', 'inventory'),
+            *extracted(fs), *extracted(baseline)]
 
 
 def find_ndk(sdk_hint):
@@ -115,7 +131,11 @@ def main():
     ap.add_argument('--baseline', default=os.path.join('work', 'baseline', 'fs'))
     ap.add_argument('--out', default=os.path.join('work', 'build', 'jni'))
     ap.add_argument('--ndk')
+    ap.add_argument('--force', action='store_true', help='build even if current')
     args = ap.parse_args()
+    fingerprint = stamp.fingerprint(inputs(args.fs, args.baseline))
+    if stamp.up_to_date(args.out, fingerprint, args.force):
+        return
     ndk = find_ndk(args.ndk)
     os.makedirs(args.out, exist_ok=True)
     entries, libs = collect(Tree(args.fs), Tree(args.baseline))
@@ -128,6 +148,7 @@ def main():
                     [f'-DPRISM_STUB_LIB={c_string(lib)}'])
     with open(os.path.join(args.out, 'libs.json'), 'w') as f:
         json.dump({'preload': 'libprism_jni.so', 'stand_ins': [f'lib{l}.so' for l in libs]}, f, indent=1)
+    stamp.write(args.out, fingerprint)
     print(f'built {1 + len(libs)} libraries in {args.out}')
 
 

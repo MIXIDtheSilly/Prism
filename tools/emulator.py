@@ -6,6 +6,7 @@ Prism uses its own AVD (prism-api34) on its own port, so it never touches other 
     python tools/emulator.py config [--display WxH] [--memory MB] [--cores N]  # change the AVD; next start
     python tools/emulator.py start [--headless|--window] [--wait]  # boot it: writable system, SELinux permissive; windowless above 60 Hz
     python tools/emulator.py wait              # until Android reports boot completed
+    python tools/emulator.py ready             # until Horizon's home is drawing (on the TSC, VrShell up, frames shared)
     python tools/emulator.py patch-share-vid [--rate HZ] [--undo]  # -share-vid shares more than 60 frames a second
     python tools/emulator.py clock             # reboot until the guest's clock is the TSC (start --wait does this)
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
@@ -393,6 +394,59 @@ def wait(args):
     return False
 
 
+SHELL_PROCESS = 'com.oculus.vrshell'  # VrShell, which draws Horizon's home
+
+
+def stage():
+    """How far Horizon has got, as (stage, detail): 'stopped'; 'booting' (Android); 'clock' (booted
+    on HPET, not the TSC: everything runs slower); 'starting' (VrShell not up yet, or the compositor
+    not yet sharing frames at half the display's rate); 'ready'. One adb call and a second's look
+    at the shared frames, so it can be polled."""
+    if not running():
+        return 'stopped', ''
+    try:
+        out = shell(f'echo "$(getprop sys.boot_completed)|$(cat {CLOCKSOURCE})|$(pidof {SHELL_PROCESS})"',
+                    check=False, timeout=10).strip()
+    except subprocess.TimeoutExpired:
+        return 'booting', 'adb is not answering yet'
+    booted, clock, shell_pid = (out.split('|') + ['', '', ''])[:3]
+    if booted != '1':
+        return 'booting', ''
+    if clock != 'tsc':
+        return 'clock', f'the clock is {clock or "unknown"}'
+    if not shell_pid:
+        return 'starting', 'VrShell is not up yet'
+    from perf import frame_rate  # perf imports this module
+    fps = frame_rate(1.0)
+    if fps is None:
+        return 'starting', 'no shared frames (the emulator runs without -share-vid?)'
+    if fps < refresh_rate() / 2:
+        return 'starting', f'{fps:.0f} frames a second'
+    return 'ready', f'{fps:.0f} frames a second'
+
+
+def ready(args):
+    """Waits until Horizon's home is drawing (stage() 'ready'), rebooting onto the TSC as ensure_tsc
+    does, and printing each stage as it's reached. False after args.timeout seconds."""
+    deadline = time.time() + args.timeout
+    shown = None
+    while time.time() < deadline:
+        now, detail = stage()
+        line = f'{now}: {detail}' if detail else now
+        # A frame rate that is still climbing is not news; anything else is.
+        climbing = shown and shown.startswith(now + ':') and 'frames a second' in shown and 'frames a second' in detail
+        if line != shown and not climbing:
+            print(line, flush=True)
+            shown = line
+        if now == 'ready':
+            return True
+        if now == 'clock' and not ensure_tsc(args):
+            return False
+        time.sleep(2)
+    print(f'Horizon was not ready within {args.timeout}s ({shown})')
+    return False
+
+
 def root(args):
     adb('root')
     adb('wait-for-device')
@@ -496,6 +550,7 @@ def main():
     s.add_argument('--any-core', action='store_true', help="don't pin the emulator to the performance cores")
     for p in (s, sub.add_parser('wait'), sub.add_parser('root'), sub.add_parser('clock')):
         p.add_argument('--timeout', type=int, default=300)
+    sub.add_parser('ready').add_argument('--timeout', type=int, default=600)
     st = sub.add_parser('status')
     st.add_argument('--lines', type=int, default=25)
     sub.add_parser('stop')
@@ -509,6 +564,8 @@ def main():
     if args.command == 'adb':
         subprocess.run([adb_path(), '-s', SERIAL, *args.rest])
         return
+    if args.command == 'ready':
+        sys.exit(0 if ready(args) else 1)
     {'create': create, 'config': configure, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
      'stop': stop, 'patch-share-vid': patch_share_vid, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
 

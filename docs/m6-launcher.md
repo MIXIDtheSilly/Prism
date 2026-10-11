@@ -132,9 +132,11 @@ emulator through `prism.py` itself.
 
 ## Phases
 
-1. **Plumbing.** `stale()` in the build tools, deploy's id on the guest, `emulator.ready()`. Done
-   when each build tool rerun with nothing changed does nothing, and `ready()` returns when Home is
-   drawn.
+1. **Plumbing.** *Done (2026-10-11).* `tools/stamp.py` in the eleven build tools (`--force` to
+   build anyway): rerun with nothing changed, all eleven take 2 s together, against minutes for a
+   full build (compat alone 8.5); a touched source rebuilds only its part. Deploy writes its id to
+   `/data/prism/deploy-id` (the next deploy is the first to). `emulator.stage()` (one adb call and
+   a second of frames) and `emulator.py ready` reach "ready: 89 frames a second" on a running Home.
 2. **`setup` and `doctor`.** Done when a fresh clone with a new AVD (an `--avd` option, since
    `emulator.py` has the one name, `prism-api34`, today) goes from
    the OTA to Horizon running, and a second `setup` finishes in seconds. `doctor` names a missing

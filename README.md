@@ -136,6 +136,7 @@ tools/relay.py        Builds the binder bridge between arm64 apps and the host's
 tools/guest_media.py  Builds the arm64 media functions Meta's libraries expect
 tools/head.py         Moves the headset from the PC: mouse and keys drive the head pose
 tools/perf.py         Measures shared frame rate, jitter and guest CPU (the benchmark for frame-rate work)
+tools/stamp.py        Whether a build is current: a stamp of what it was made from
 tools/viewer.py       Horizon in a desktop window: the mouse points and clicks, keys move
 tools/steamvr.py      Horizon in a PC headset through SteamVR (OpenXR): its tracking and frames
 tools/xrprobe.py      Builds and runs Prism's OpenXR test apps (xrprobe, xrdemo, xrgame)

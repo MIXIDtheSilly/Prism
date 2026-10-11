@@ -41,6 +41,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, 'ota'))
 sys.path.insert(0, HERE)
 import emulator  # noqa: E402
+import stamp  # noqa: E402
 from ext4 import S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Ext4  # noqa: E402
 
 # Stock's mainline modules (APEXes) stay underneath Horizon, and some of their apps share a UID
@@ -803,6 +804,28 @@ def reset(args):
     emulator.root(args)
 
 
+# What a deploy put on the guest: deploy_id() of what it was made from. A wiped or recreated AVD has
+# none, whatever work/ holds.
+DEPLOY_ID = f'{DATA_ROOT}/deploy-id'
+BUILDS = ('jni', 'compat', 'translator', 'vulkan', 'gles', 'thermal', 'tracking', 'hidl', 'relay', 'spaces',
+          'guest_media')
+
+
+def deploy_id(args):
+    """A fingerprint of everything a deploy is made from: Horizon's and stock's images, Prism's
+    builds, this file and the AVD's settings it reads (the display's rate and size; the rest of
+    emulator.py doesn't change what is deployed)."""
+    builds = [getattr(args, name) for name in BUILDS]
+    return stamp.fingerprint([args.images, args.baseline, *builds, __file__, os.path.join(HERE, 'ota', 'ext4.py')],
+                             extra=[emulator.refresh_rate(), emulator.display(), args.emulator_flag, args.model])
+
+
+def deployed_id():
+    """The deploy id on the running guest, or None (never deployed, or deployed before ids)."""
+    out = emulator.shell(f'cat {DEPLOY_ID} 2>/dev/null', check=False, timeout=20).strip()
+    return out if re.fullmatch(r'[0-9a-f]{64}', out) else None
+
+
 def apply(args, replaced):
     adb, shell = emulator.adb, emulator.shell
     reset(args)
@@ -823,6 +846,7 @@ def apply(args, replaced):
               'rm -f /data/local/tmp/prism-overlay.tar /data/local/tmp/prism-data.tar',
               # Fresh package manager state and compiled code for the new platform.
               FRESH_PACKAGE_STATE,
+              f'echo {args.deploy_id} > {DEPLOY_ID}',
               'sync', 'echo applied']
     out = adb('shell', '\n'.join(script), check=False, timeout=900, stderr=True)
     print(out.strip().splitlines()[-1] if out.strip() else '')
@@ -839,7 +863,7 @@ def apply(args, replaced):
             emulator.ensure_tsc(args)
 
 
-def main():
+def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--images', default=os.path.join('work', 'images'))
     ap.add_argument('--baseline', default=os.path.join('work', 'baseline', 'images'))
@@ -861,7 +885,13 @@ def main():
                     help="ro.kernel.qemu, which Meta's runtime reads as running on its emulator (default: hidden)")
     ap.add_argument('--model', choices=('quest3', 'eureka'), default='quest3',
                     help="Build.MODEL: Horizon's \"Quest 3\", or the codename Meta's runtime knows (default: quest3)")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = parser().parse_args()
+    # Taken before building: a file changed while deploy runs makes the next check see it.
+    args.deploy_id = deploy_id(args)
     replaced = build(args)[0]
     if not args.build_only:
         apply(args, replaced)

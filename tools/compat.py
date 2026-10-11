@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(HERE, 'ota'))
 sys.path.insert(0, os.path.join(HERE, 'inventory'))
 import dex  # noqa: E402
 import smali  # noqa: E402
+import stamp  # noqa: E402
 from ext4 import Ext4  # noqa: E402
 
 
@@ -576,15 +577,29 @@ def verify(data, bridges):
                 sys.exit(f'verification failed: {b.cls}->{b.name}{sig} missing')
 
 
+def inputs(images=os.path.join(os.path.dirname(HERE), 'work', 'images')):
+    """This file (the patches), the tools it uses, and the partition images the patched files come from."""
+    partitions = sorted({path.split('/')[1] for path in BRIDGES})
+    return [__file__, os.path.join(HERE, 'smali.py'), os.path.join(HERE, 'inventory', 'dex.py'),
+            os.path.join(HERE, 'ota', 'ext4.py'), *[os.path.join(images, p + '.img') for p in partitions]]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--images', default=os.path.join('work', 'images'))
     ap.add_argument('--out', default=os.path.join('work', 'build', 'compat'))
+    ap.add_argument('--force', action='store_true', help='patch even if current')
     ap.add_argument('only', nargs='*', help='device paths to patch (default: all)')
     args = ap.parse_args()
     unknown = set(args.only) - set(BRIDGES)
     if unknown:
         sys.exit(f'nothing to patch in {", ".join(sorted(unknown))}')
+    # A stamp only for patching everything: patching some leaves the rest as they were.
+    fingerprint = stamp.fingerprint(inputs(args.images))
+    if not args.only and stamp.up_to_date(args.out, fingerprint, args.force):
+        return
+    if args.only:
+        stamp.write(args.out, 'partial')
     images = {}
     for device_path, bridges in BRIDGES.items():
         if args.only and device_path not in args.only:
@@ -607,6 +622,8 @@ def main():
         with open(out, 'wb') as f:
             f.write(patched)
         print(f'  -> {out}')
+    if not args.only:
+        stamp.write(args.out, fingerprint)
 
 
 if __name__ == '__main__':

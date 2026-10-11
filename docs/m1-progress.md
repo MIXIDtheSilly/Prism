@@ -6,19 +6,30 @@
 python tools\emulator.py create            # once: the prism-api34 AVD
 python tools\emulator.py start --wait
 python tools\emulator.py root              # once per AVD: writable system partitions
+python tools\emulator.py adb pull /apex/com.android.runtime/lib64/bionic work\device\  # once: stock bionic, for translator.py's check
 python tools\jni\build.py                  # Prism's JNI glue for this Horizon build
 python tools\compat.py                     # bridged framework.jar
 python tools\translator.py                 # Digitalis ARM64 translator, adapted to Android 14
 python tools\vulkan.py                     # Prism's Vulkan driver (opaque-fd memory for the compositor)
+python tools\gles.py                       # Prism's GLES layer (GL_EXT_memory_object_fd, for GLES apps)
 python tools\thermal.py                    # Prism's thermal HAL (stable-AIDL IThermal, for vrdevice)
 python tools\tracking.py                   # Prism's tracking service (MemoryBroker, the head pose)
+python tools\hidl.py                       # Prism's HIDL services (controller HAL, system suspend)
+python tools\relay.py                      # Prism's binder relay (arm64 apps' binder objects)
 python tools\spaces.py                     # Prism's space service (Meta's space manager, for system_server)
 python tools\guest_media.py                # Prism's arm64 media functions (panels' surface sizes)
 python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot (onto the TSC)
-python tools\emulator.py status
+python tools\emulator.py ready             # until Home is drawing: on the TSC, VrShell up, frames shared
 python tools\viewer.py                     # Horizon in a desktop window
 python tools\steamvr.py                    # or in a PC headset, through SteamVR
 ```
+
+Each build leaves a stamp of what it was made from (`tools/stamp.py`: its sources' and inputs'
+sizes and times) and does nothing while they are unchanged, so after a pull the whole list can be
+run again and only what changed is built (`--force` builds anyway; compat alone takes minutes).
+Deploy writes the fingerprint of everything it pushed to the guest (`/data/prism/deploy-id`), so
+`deploy.deployed_id() == deploy.deploy_id(args)` says whether the running emulator has the current
+build.
 
 For 90 frames a second instead of 60 (the PC's monitor can be any rate; the frames go to the viewer
 through shared memory):

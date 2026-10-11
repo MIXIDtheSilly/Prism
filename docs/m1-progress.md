@@ -14,8 +14,22 @@ python tools\thermal.py                    # Prism's thermal HAL (stable-AIDL IT
 python tools\tracking.py                   # Prism's tracking service (MemoryBroker, the head pose)
 python tools\spaces.py                     # Prism's space service (Meta's space manager, for system_server)
 python tools\guest_media.py                # Prism's arm64 media functions (panels' surface sizes)
-python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot
+python tools\deploy.py                     # reset to stock, push Horizon's layer, reboot (onto the TSC)
 python tools\emulator.py status
+python tools\viewer.py                     # Horizon in a desktop window
+python tools\steamvr.py                    # or in a PC headset, through SteamVR
+```
+
+For 90 frames a second instead of 60 (the PC's monitor can be any rate; the frames go to the viewer
+through shared memory):
+
+```powershell
+python tools\emulator.py stop
+python tools\emulator.py config --refresh 90      # the AVD's display rate
+python tools\emulator.py patch-share-vid          # the emulator's frame sharing allows 90 (--undo restores)
+python tools\emulator.py start --wait  # no emulator window at 90 Hz (it costs frames); --window keeps it
+python tools\deploy.py                            # the compositor, apps and Android's minimum rate follow
+python tools\perf.py --guest                      # shared frame rate, jitter, busiest guest threads
 ```
 
 ## How it fits together
@@ -81,8 +95,10 @@ python tools\emulator.py status
   descriptors. The emulator's gfxstream driver shares memory on Android only as AHardwareBuffers.
   Prism's driver (`vulkan.prism.so`, selected by `ro.hardware.vulkan`) wraps the emulator's and
   backs opaque fds with them: OPAQUE_FD images, buffers and allocations become AHardwareBuffer
-  ones, `vkGetMemoryFdKHR` returns a Unix socket with the memory's AHardwareBuffer queued in it,
-  and importing that fd receives the buffer and imports it. Fences and semaphores already export
+  ones, `vkGetMemoryFdKHR` returns one end of a Unix socket, and a thread in the exporting process
+  sends the memory's AHardwareBuffer down the other each time an import asks for it, so an fd and
+  its dups import any number of times (four queued copies were a fixed budget before, and a failed
+  import used one up). Fences and semaphores already export
   as sync fds. Two of Meta's switches fit the compositor to the emulator: GL contexts get pbuffers
   (`persist.oculus.forceGLESContextBuffer`; the emulator's EGL has no surfaceless contexts), and
   its output surface comes from SurfaceFlinger rather than the headset's display path
@@ -287,7 +303,12 @@ python tools\emulator.py status
   system_server runs out of memory and dies, and qemu with it (5-15 minutes after setup). An
   offline login stops it: Horizon's `shared_prefs/authentication.xml` with a `uid` and an
   `access_token` (placeholders; Meta's servers reject the token, and Horizon doesn't log out for
-  that), then Horizon adds the `com.oculus` account itself. With an account but no token, VrShell
+  that), then Horizon adds the `com.oculus` account itself. Horizon removed that account again
+  (2026-10-05), and the busy-wait came back as a dispatcher thread at 55% of a vCPU plus about as
+  much in system_server's binder threads. It is the loop in the flow's coroutine (R8's `X/28c`)
+  that asks again at once while the id is empty; `tools/compat.py` patches LibraryPanelApp.apk to
+  wait a second between asks, account or not (system_server went from 67% of a vCPU to 8%). With
+  an account but no token, VrShell
   holds every app back behind "You've been logged out" instead.
 - **Clicking panels.** A controller's ray hovers a panel's controls and its trigger presses them:
   the right trigger closes the Store's window from its bar's ✕. Behind that window is the home
@@ -461,5 +482,110 @@ python tools\emulator.py status
   libprism_jni patches the device check (one instruction of `libvrruntimeservice.so`, written as
   the translator loads it, after checking the bytes:
   [guest_patch.c](../native/prism_jni/guest_patch.c)); the compositor logs "Glass is enabled".
+- **SteamVR** (M5; tried with a headset on 2026-10-11: focused and tracking, 90 frames a second
+  submitted, and performance good enough to use). `python tools\steamvr.py` starts
+  `native/steamvr`, an OpenXR app on the PC (Direct3D 11; its loader, session and controller actions
+  follow Refract's host bridge). Each frame of the PC runtime it sends the headset's pose, both
+  controllers' aim poses (turned back as the viewer's are) and their buttons to the tracking service,
+  as the viewer does. Each new frame the emulator shares goes to the headset as a projection layer,
+  a view per half, posed where the headset was when Horizon rendered it, so the PC runtime reprojects
+  Horizon's 60 frames a second to the headset's rate. That pose is the one sent `--latency` ms
+  (default 45) before the frame arrived; + and - tune it in the console until the world holds still
+  as the head turns. Each view is submitted from Horizon's eye (`--ipd`, which xrprobe logs), with
+  the viewer's fitted edges moved by the parallax at the depth they were fitted at. The origin is
+  where the headset is when tracking starts (R again, F9 in any window, or the PC runtime's own
+  recenter: LOCAL's change). The left menu button is the Meta button (PC runtimes keep the right
+  system button); F7 and F8 on the keyboard hold the Meta and left menu buttons, in any window, and
+  also while the PC runtime's dashboard has the controllers. The thumbsticks go through: the input
+  line takes x and y after the triggers, and tracking_prism publishes them in CONTROLLER's thumbstick
+  snapshot at 0x250, which the tracking client reads as 7 bytes (touched, a byte not known, x and y
+  as u16s over 0-65535, centered at 0x7fff, up the smaller y, valid), as xrprobe showed: an app sees
+  the stick pushed right as x 1 and up as y 1. Haptics come back: tracking_prism serves
+  `IHapticsService/default` ([haptics.c](../native/tracking_prism/haptics.c)), whose one call hands
+  the runtime a socket; the runtime writes {u32 type, u32 length} messages into it, and for an app's
+  xrApplyHapticFeedback sets the amplitude (type 1: u64 device id, u8 0-255) and sets it back to 0
+  when the duration is over (xrprobe vibrates on a trigger press: 0xff, then 0 200 ms later).
+  VrShell's UI ticks are parametric effects (XR_EXT_haptic_parametric), which the runtime's haptics
+  plugin (`libtrex_haptics_server_plugin.so`, in VrDriver) plays only at a location the controller
+  describes: CONTROLLER's three haptic channels from 0x4b0 (snapshots of 0x85 bytes, 0x118 apart:
+  the location, four actuator entries {present, type, sample rate, samples, ...}, valid), which
+  were empty ("Parametric haptics is not supported for the location"). tracking_prism describes
+  each channel as buffered (type 2) at 320 Hz, 25 samples a submission, as Touch's were; the plugin
+  then renders them into buffered messages (type 3: u64 device, u8 count, 25 amplitudes), a hover
+  being 17 samples, three at 50/255. Each amplitude goes back up the pose connection ("haptic l|r
+  amplitude"), each buffer as a pulse of its peak for as long as it isn't silent ("haptic l|r
+  amplitude seconds"), and prism_vr plays them on that controller. PCM messages are only logged.
+  Each frame's pose is
+  found from when the emulator shared it (VideoInfo's time: Unix microseconds) rather than when
+  prism_vr saw it, a PC frame later at most. The compositor's window per eye was 1.37 by 1.54
+  tangent units (69° by 75°) against 2.15 across in what apps render, since the window is a
+  physical screen (the compositor's default Quest 1 headset) seen at `metersPerTanAngCtr` meters a
+  unit. Deploy sets `debug.oculus.headsetOverride=1` and `debug.oculus.metersPerTanAngCtr=0.0264`
+  (from about 0.039), which the runtime reads at its start ("Custom Headset Overrides Enabled" in its
+  log): each half now shows 2.03 by 2.28 (91° by 97°), nearly all apps render, 1.48 times the
+  default's, and the pointer's dot lands within a few pixels of the fitted edges (kViews, scaled
+  by that). The `UPDATE_HMDMESH` broadcast, which should reload them, never reached the runtime's
+  receiver; killing the runtime service reloads them but took the emulator down the second time.
+  The view stays narrower than a headset's lenses, with black round it. The display is 2560x1440
+  (`tools/emulator.py config --display`), about 630 pixels a tangent unit against 474 at 1920x1080,
+  over the same angles: the compositor draws its panel at 3840x2160 whatever the display, and
+  Prism's Vulkan driver fits it to the output, so only the output's size changes. That output is
+  Prism's stand-in for the compositor's arm64 window, which reports no size; it was made 1920x1080
+  and Horizon filled only that corner of a larger display. It now takes the display's size
+  (`Display.getRealSize`). Deploy sets `frontbufferHeight` (1080, 1440 or 2160) to the display's
+  height. Horizon's home holds 59.7 shared frames a second at 2560x1440 (59.2 at 1080p). The
+  guest has 12 GB (8 had the home 3 GB into swap).
+- **Performance** (`python tools/perf.py --guest`: the shared frames' rate and interval percentiles, the
+  compositor's `FPS=`, the busiest guest threads; each run is a line of `work/logs/perf.csv`).
+  - *60 Hz, settled (2026-10-09):* 59.9 shared frames a second, p99 19 ms. Prism's Vulkan driver is not
+    the cost: its stats line (now with time in waits and in vkQueueSubmit) shows one copy into and one
+    out of a mirror a frame and vkQueueSubmit at 0.08 ms (compositor) to 0.3 ms (VrShell) a submit.
+    VrShell's `ShellFrameLoop` is at 69% of a vCPU, all user time in translated code;
+    `berberis.gear_switch_threshold` (default 1000) at 100 changed nothing, so the translator's
+    tiering is not the lever.
+  - *The 60 cap* is the emulator's frame sharing (`-share-vid`, VideoFrameSharer): its constructor
+    starts fps at 60 and a frame within 1/fps of the last is skipped (72 Hz gave 36).
+    `python tools/emulator.py patch-share-vid` sets that one immediate (checked against the
+    instructions around it, in both qemu builds; the originals stay as `.orig`, `--undo` restores
+    them), and `emulator.py config --refresh 90` + deploy gives the display, the compositor and apps
+    the rate (`SupportedDisplayRefreshRates: [ 45 90 ]`).
+  - *90 Hz, patched (2026-10-09):* the emulator reported 90 fps and the compositor 89 of 90, yet only
+    45 frames a second were shared, with no frame numbers skipped: not the sharing cap, the display.
+    SurfaceFlinger's scheduler (`dumpsys SurfaceFlinger`: the time spent at each rate) sat at a 45 Hz
+    *render rate*, half of the display's one 90 Hz mode, for 8 minutes of every 8; with nothing asking
+    for more, it composes every other vsync, and the compositor's layer got 45 buffers a second
+    (`dumpsys SurfaceFlinger --latency <layer>`: frameReady 22 ms apart). Android's minimum and peak
+    refresh rate Settings pin it (`settings put system min_refresh_rate 90.0`, peak the same; deploy's
+    prism.rc does it at boot): then 89.7 shared frames a second, mean 11.2 ms, p99 14.6 ms, the
+    compositor 83-89 of 90.
+    From a fresh deploy and boot (the prism.rc action, nothing set by hand): both Settings 90.0,
+    SurfaceFlinger only ever at 90 Hz, 89.4 shared frames a second, but p99 18.5 ms, 39 gaps over
+    1.5 frames in 30 s and the compositor at 72 of 90: the average is 90, the jitter is not yet
+    (VrShell's frame loop below).
+  - *The emulator's own window costs a lot at 90 Hz:* with it open (the default), the compositor
+    reached 49 of 90 and the guest's render threads were ~90% system time (a synchronous call to
+    gfxstream's render thread under WHPX counts as the caller's kernel time; vkQueueSubmit cost 0.5-2
+    ms a submit, seven times 60 Hz's). `emulator.py start --headless` (now the default above 60 Hz; `--window` keeps the window) took that away (compositor 89
+    of 90, system time 34% of the guest's CPU instead of 203%); the viewer reads the shared frames, so
+    it doesn't need the window. The RTX 3080 never leaves P3/P5 (675-1185 MHz of 2100) under this
+    bursty load; NVIDIA's "Prefer maximum performance" for qemu-system-x86_64[-headless].exe is the
+    thing to try for the submit latency.
+  - *What is left:* VrShell's `ShellFrameLoop` thread is at ~93% of a vCPU at 90 Hz (69% at 60): about
+    10.3 ms of translated-code CPU a frame in an 11.1 ms budget, so p99 (14.6 ms) and the 22 gaps
+    over 1.5 frames in 30 s are its jitter. That is the next target, with the translator's hot paths.
+    `log.tag.berberis=I` (deploy) stops Digitalis logging every region it translates (311,000 lines
+    in one hour).
+  - *Where ShellFrameLoop's time goes (2026-10-09):* `simpleperf record -e cpu-clock -t <tid>` in the
+    guest puts 94% of its samples in translated code ("unknown"), 2.5% in the kernel, 1.9% in
+    bionic, 0.2% in libberberis: not the translator's runtime, lookups or helpers. Digitalis's
+    `berberis.interp_stats=1` (logs as `berberis_interp`) shows almost nothing interpreted: 27
+    entries a second in VrShell, and the one hot spot is a `mrs cntvct_el0` in libvrapiimpl
+    (~3,000 trapping reads a second in one thread, 24,000 instructions a second). Pinning the
+    emulator to one thread per physical core (0x5555), or to High priority, changed nothing
+    measurable. The runs vary with what else the PC does: with another process using a core
+    (100%) the same build gave 88 frames a second, p99 21 ms and 110+ gaps in 60 s, against 89.6,
+    p99 14.5 ms and 15 gaps with the PC quiet, so measure with it quiet. The jitter is VrShell's
+    ~10.4 ms of translated code a frame in an 11.1 ms budget; shrinking it needs the translator's
+    code quality, or less work in the shell, not a driver or emulator change.
 - **Next:** panels' glass backgrounds; system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

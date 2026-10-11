@@ -6,10 +6,11 @@ Prism is an experimental Horizon OS emulator for Windows PCs. It aims to run Met
 OS system software (the home environment, system UI, panels and apps) on a PC, in a desktop window
 first and later in a PC VR headset.
 
-> **Status:** Horizon runs in a desktop window. It boots to Meta's home environment, and from the PC
-> you can look around, point at and click panels, open the Universal Menu and the library, and
-> launch apps: Android apps open as panels, and OpenXR games run as immersive apps on Meta's own
-> runtime and compositor. Next: panels' glass backgrounds, then output to a PC VR headset. See
+> **Status:** Horizon runs in a desktop window and in a PC VR headset through SteamVR. It boots to
+> Meta's home environment, and you can look around, point at and click panels, open the Universal
+> Menu and the library, and launch apps: Android apps open as panels, and OpenXR games run as
+> immersive apps on Meta's own runtime and compositor. Next: a launcher that sets up and starts
+> Prism in one step (M6). See
 > [Progress](#progress), [docs/plan.md](docs/plan.md) and
 > [docs/m1-progress.md](docs/m1-progress.md).
 
@@ -26,7 +27,7 @@ Getting this far meant things like:
   of memory and took the emulator down with it.
 
 If you'd like to see Horizon OS running on a PC, a coffee on Ko-fi helps a lot. It keeps the
-late-night debugging going and gets the next milestone (a PC VR headset) here sooner.
+late-night debugging going and gets the next milestone (a one-step launcher) here sooner.
 
 [![Buy me a coffee on Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/mixid_mbb)
 
@@ -42,7 +43,7 @@ reporting what breaks helps too.
 | M2: Native daemons and hardware services | Done for what Home and apps need |
 | M3: Home in a desktop window | Done |
 | M4: More than one app at a time | In progress |
-| M5: PC VR headset | Not started |
+| M5: PC VR headset | Working: Horizon in a headset through SteamVR |
 | M6: Launcher and packaging | Not started |
 
 What works:
@@ -51,10 +52,13 @@ What works:
   arm64 code translated to x86_64 by the Digitalis translator, and system_server runs every Meta
   service.
 - **Meta's XR stack.** Meta's OpenXR runtime and compositor run translated, drawing on the PC's
-  GPU. The compositor runs at 60 frames a second, the display's rate.
+  GPU. The compositor runs at the display's rate: 60 frames a second by default, or 90 (see below).
 - **The desktop viewer** (`tools\viewer.py`). The mouse aims the right controller's ray, the left
   button pulls its trigger, Tab presses the Meta button, right-drag looks around, and WASD and R/F
   move.
+- **A PC VR headset** (`tools\steamvr.py`). The headset's and controllers' tracking, buttons and
+  thumbsticks go to Horizon through SteamVR, Horizon's frames go to the headset, and haptics come
+  back to the controllers.
 - **Tracking.** The headset and two Touch Plus controllers are tracked, paired and held, all driven
   from the PC. VrShell draws the controllers and their rays.
 - **Panels.** Panels draw and respond to clicks: the Universal Menu, the system bar and Quick
@@ -68,10 +72,14 @@ What works:
 Not yet:
 
 - Panels' frosted-glass backgrounds.
+- A steady 90 frames a second in Home: it reaches 89.7 shared frames a second (p99 14.6 ms) once the
+  emulator's frame sharing is patched and the display set to 90 Hz, but VrShell's frame loop is
+  at the edge of its 11.1 ms budget. See [docs/m1-progress.md](docs/m1-progress.md#running-it).
 - Passthrough (black: there are no cameras).
 - The Store, Meta accounts and other online features. These are out of scope (see
   [Scope](#scope)).
-- Output to a PC VR headset (M5), and building the image in one step (M6).
+- Setting up and starting Prism in one step (M6): today it is the commands in
+  [docs/m1-progress.md](docs/m1-progress.md#running-it).
 
 ## How it works
 
@@ -127,7 +135,9 @@ tools/spaces.py       Builds Prism's space service (Meta's space manager, for sy
 tools/relay.py        Builds the binder bridge between arm64 apps and the host's Java binder
 tools/guest_media.py  Builds the arm64 media functions Meta's libraries expect
 tools/head.py         Moves the headset from the PC: mouse and keys drive the head pose
+tools/perf.py         Measures shared frame rate, jitter and guest CPU (the benchmark for frame-rate work)
 tools/viewer.py       Horizon in a desktop window: the mouse points and clicks, keys move
+tools/steamvr.py      Horizon in a PC headset through SteamVR (OpenXR): its tracking and frames
 tools/xrprobe.py      Builds and runs Prism's OpenXR test apps (xrprobe, xrdemo, xrgame)
 tools/smali.py        smali/baksmali, fetched on first use
 tools/deploy.py       Puts Horizon's layer onto the emulator
@@ -142,6 +152,7 @@ native/spaces_prism/  Space service over Meta's space manager (its C API, recons
 native/binder_relay/  Binder bridge between an app's arm64 libbinder and the host's Java binder
 native/guest_media/   arm64 media functions Meta's libraries expect
 native/viewer/        The desktop viewer (Direct3D 11)
+native/steamvr/       The SteamVR host (OpenXR, Direct3D 11)
 native/xrprobe/       OpenXR test app: logs what Horizon's runtime gives an app
 native/xrdemo/        OpenXR test app that draws (xrdemo, xrgame, xrgles)
 prebuilts/digitalis/  The Digitalis translator (Apache 2.0; see its NOTICE)

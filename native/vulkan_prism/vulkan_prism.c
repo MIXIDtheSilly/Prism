@@ -7,14 +7,14 @@
 // AHardwareBuffers. Prism advertises the extension and backs opaque fds with AHardwareBuffers:
 //
 //   * images, buffers and allocations asking for OPAQUE_FD handles get AHARDWAREBUFFER ones;
-//   * vkGetMemoryFdKHR returns one end of a Unix socket with the memory's AHardwareBuffer queued in
-//     it (AHardwareBuffer_sendHandleToUnixSocket); the fd crosses processes like any other;
-//   * importing such an fd receives the AHardwareBuffer from it and imports that.
+//   * vkGetMemoryFdKHR returns one end of a Unix socket, whose other end the exporting process keeps
+//     and answers on: it sends the memory's AHardwareBuffer (AHardwareBuffer_sendHandleToUnixSocket)
+//     each time it's asked. The fd crosses processes like any other;
+//   * importing such an fd asks for the AHardwareBuffer, receives it and imports that.
 //
 // Importing transfers an fd's ownership, but a dup of an opaque fd names the same memory, and Meta's
-// compositor imports its own swapchain memory and hands a dup of the same fd to its client. So the
-// buffer is queued in the socket EXPORT_COPIES times, one for each import; copies nobody reads go
-// when the socket's last fd is closed.
+// compositor imports its own swapchain memory and hands a dup of the same fd to its client. So an
+// fd answers every import made through it or its dups (see "sharing buffers between processes").
 // gralloc here makes only single-layer buffers in a few formats, and the host takes only images of
 // those for them. An sRGB image is its UNORM twin, created mutable so its views keep their sRGB
 // format. Any other image (multiview swapchains: two layers) is backed: each process has its own
@@ -39,11 +39,14 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/system_properties.h>
@@ -212,6 +215,10 @@ static unsigned g_acquires, g_releases;  // swapchain images acquired and presen
 // under another). Read once a second (see trace_submit).
 static unsigned g_dump_at;
 static unsigned g_submits, g_pulls, g_pushes;  // vkQueueSubmit calls, copies out of mirrors and into them
+// Where a frame's time goes, for the stats line: waits that had to ask the PC more than once, those
+// asks, the time spent in all waits, and in vkQueueSubmit (and of that, waiting for g_lock).
+static uint64_t g_wait_calls, g_wait_polls, g_wait_ns, g_submit_ns, g_submit_lock_ns;
+static uint64_t now_ns(void);
 static VkPhysicalDeviceMemoryProperties g_memory_properties;
 static struct {
   VkDevice device;
@@ -546,7 +553,7 @@ static VkResult VKAPI_CALL prism_CreateDevice(VkPhysicalDevice pd, const VkDevic
 // that uses it otherwise begins with a copy out of the mirror (see prism_QueueSubmit). So a client's
 // eye buffers reach the mirror with the frame it submits, and the compositor's copy is refreshed
 // when it next samples them.
-#define MAX_BACKED 256
+#define BACKED_BLOCK 64
 #define MAX_LAYERS 8
 #define NO_LAYOUT VK_IMAGE_LAYOUT_MAX_ENUM
 typedef struct {
@@ -566,21 +573,27 @@ typedef struct {
   void *owner;         // another backed image whose memory this one is bound to: that one's mirror is this one's
   int logged;          // copies of it logged: 1 into the mirror, 2 out of it
 } Backed;
-static Backed g_backed[MAX_BACKED];
+// Slots in blocks of BACKED_BLOCK, which never move once made: a Backed pointer (owner) stays valid
+// as the table grows.
+static Backed **g_backed_blocks;
+static uint32_t g_backed_block_count, g_backed_block_capacity;
 static int g_backed_count;  // read without the lock: with no backed images there's nothing to track
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;  // everything below
 
 static int tracking(void) { return __atomic_load_n(&g_backed_count, __ATOMIC_RELAXED) > 0; }
 
+static uint32_t backed_slots(void) { return g_backed_block_count * BACKED_BLOCK; }
+static Backed *backed_at(uint32_t i) { return &g_backed_blocks[i / BACKED_BLOCK][i % BACKED_BLOCK]; }
+
 static Backed *backed_image(VkImage image) {
-  for (int i = 0; image != VK_NULL_HANDLE && i < MAX_BACKED; i++)
-    if (g_backed[i].image == image) return &g_backed[i];
+  for (uint32_t i = 0; image != VK_NULL_HANDLE && i < backed_slots(); i++)
+    if (backed_at(i)->image == image) return backed_at(i);
   return NULL;
 }
 
 static Backed *backed_memory(VkDeviceMemory memory) {
-  for (int i = 0; memory != VK_NULL_HANDLE && i < MAX_BACKED; i++)
-    if (g_backed[i].memory == memory) return &g_backed[i];
+  for (uint32_t i = 0; memory != VK_NULL_HANDLE && i < backed_slots(); i++)
+    if (backed_at(i)->memory == memory) return backed_at(i);
   return NULL;
 }
 
@@ -609,6 +622,19 @@ static int grow(void **items, uint32_t *capacity, size_t size) {
 }
 #define ROOM(items, count, capacity) \
   ((count) < (capacity) || grow((void **)&(items), &(capacity), sizeof *(items)))
+
+// A free slot for a backed image, with a new block when every slot is taken; NULL without memory
+// for one. Under g_lock.
+static Backed *free_backed(void) {
+  for (uint32_t i = 0; i < backed_slots(); i++)
+    if (backed_at(i)->image == VK_NULL_HANDLE && backed_at(i)->memory == VK_NULL_HANDLE) return backed_at(i);
+  Backed *block;
+  if (!ROOM(g_backed_blocks, g_backed_block_count, g_backed_block_capacity) ||
+      !(block = calloc(BACKED_BLOCK, sizeof *block)))
+    return NULL;
+  g_backed_blocks[g_backed_block_count++] = block;
+  return block;
+}
 
 // The formats with an AHardwareBuffer equivalent (AHardwareBuffer_Format).
 static int ahb_format(VkFormat format) {
@@ -1086,18 +1112,21 @@ static VkResult VKAPI_CALL prism_CreateImage(VkDevice device, const VkImageCreat
   VkResult result = next.CreateImage(device, &copy, allocator, image);
   if (result != VK_SUCCESS || !backed) return result;
   pthread_mutex_lock(&g_lock);
-  Backed *b = NULL;
-  for (int i = 0; i < MAX_BACKED && !b; i++)
-    if (g_backed[i].image == VK_NULL_HANDLE && g_backed[i].memory == VK_NULL_HANDLE) b = &g_backed[i];
+  Backed *b = free_backed();
   if (b) {
     *b = (Backed){*image, device, info->extent, info->arrayLayers, info->format, mirror, info->initialLayout};
     __atomic_store_n(&g_backed_count, g_backed_count + 1, __ATOMIC_RELAXED);
   }
   pthread_mutex_unlock(&g_lock);
-  if (!b) LOGE("image %p: more than %d backed images, its contents aren't shared", (void *)*image, MAX_BACKED);
-  else LOGI("image %p: %ux%u, %u layers, format %d: backed, %s", (void *)*image, info->extent.width,
-            info->extent.height, info->arrayLayers, info->format,
-            mirror != VK_FORMAT_UNDEFINED ? "shared through a mirror" : "its contents aren't shared");
+  if (!b) {  // untracked, its memory couldn't be allocated or exported as it should
+    LOGE("image %p: no room to track a backed image", (void *)*image);
+    next.DestroyImage(device, *image, allocator);
+    *image = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
+  LOGI("image %p: %ux%u, %u layers, format %d: backed, %s", (void *)*image, info->extent.width,
+       info->extent.height, info->arrayLayers, info->format,
+       mirror != VK_FORMAT_UNDEFINED ? "shared through a mirror" : "its contents aren't shared");
   return result;
 }
 
@@ -1990,7 +2019,7 @@ static void trace_submit(VkQueue queue, uint32_t count, const VkSubmitInfo *subm
   }
 }
 
-static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
+static VkResult submit_tracked(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
   trace_submit(queue, count, submits);
   if (tracking()) {
     pthread_mutex_lock(&g_lock);
@@ -2002,12 +2031,20 @@ static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, cons
            "%u records, %u sets; %u binds, %u hits; %u acquires, %u presents", g_submits, g_pulls, g_pushes,
            g_backed_count, g_view_count, g_descriptor_count, g_framebuffer_count, g_record_count, g_set_pool_count, g_binds,
            g_bind_hits, g_acquires, g_releases);
+    LOGI("stats: %llu waits asked the PC %llu times and took %.1f ms in all; vkQueueSubmit took %.1f ms, %.1f of it for the lock",
+         (unsigned long long)__atomic_load_n(&g_wait_calls, __ATOMIC_RELAXED),
+         (unsigned long long)__atomic_load_n(&g_wait_polls, __ATOMIC_RELAXED),
+         (double)__atomic_load_n(&g_wait_ns, __ATOMIC_RELAXED) / 1e6,
+         (double)__atomic_load_n(&g_submit_ns, __ATOMIC_RELAXED) / 1e6,
+         (double)__atomic_load_n(&g_submit_lock_ns, __ATOMIC_RELAXED) / 1e6);
     }
     pthread_mutex_unlock(&g_lock);
   }
   if (!count || !tracking() || !__atomic_load_n(&g_record_count, __ATOMIC_RELAXED))
     return next.QueueSubmit(queue, count, submits, fence);
+  uint64_t locking = now_ns();
   pthread_mutex_lock(&g_lock);
+  __atomic_fetch_add(&g_submit_lock_ns, now_ns() - locking, __ATOMIC_RELAXED);
   const Queue *q = NULL;
   for (uint32_t i = 0; i < g_queue_count && !q; i++)
     if (g_queues[i].queue == queue) q = &g_queues[i];
@@ -2092,6 +2129,13 @@ static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, cons
   return result;
 }
 
+static VkResult VKAPI_CALL prism_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
+  uint64_t start = now_ns();
+  VkResult result = submit_tracked(queue, count, submits, fence);
+  __atomic_fetch_add(&g_submit_ns, now_ns() - start, __ATOMIC_RELAXED);
+  return result;
+}
+
 // --- memory --------------------------------------------------------------------------------------
 
 static VkResult VKAPI_CALL prism_CreateBuffer(VkDevice device, const VkBufferCreateInfo *info,
@@ -2104,6 +2148,130 @@ static VkResult VKAPI_CALL prism_CreateBuffer(VkDevice device, const VkBufferCre
   Scratch scratch = {.used = 0};
   replace_in_chain(&copy, &ahb, &scratch);
   return next.CreateBuffer(device, &copy, allocator, buffer);
+}
+
+// --- sharing buffers between processes ----------------------------------------------------------
+
+// An exported fd is one end of a Unix socket. The exporting process keeps the other end, and a
+// thread there sends the memory's AHardwareBuffer down it each time an importer asks (a byte): an fd
+// and its dups import as often as they're used, and an import that fails takes nothing away from
+// the next. The exporter's end goes, with its reference to the buffer, once every fd for the other
+// end is closed. Imports need the exporter alive: it answers them.
+#define RECEIVE_TIMEOUT_MS 2000
+typedef struct {
+  int fd;  // the exporter's end
+  AHardwareBuffer *buffer;
+} Export;
+static Export *g_exports;
+static uint32_t g_export_count, g_export_capacity;
+static pthread_mutex_t g_export_lock = PTHREAD_MUTEX_INITIALIZER;  // g_exports
+static int g_export_wake = -1;  // an eventfd: g_exports changed
+static pthread_once_t g_export_once = PTHREAD_ONCE_INIT;
+
+// The buffer exported at fd, taken off the list if remove. Under g_export_lock.
+static AHardwareBuffer *export_at(int fd, int remove) {
+  for (uint32_t i = 0; i < g_export_count; i++) {
+    if (g_exports[i].fd != fd) continue;
+    AHardwareBuffer *buffer = g_exports[i].buffer;
+    if (remove) g_exports[i] = g_exports[--g_export_count];
+    return buffer;
+  }
+  return NULL;
+}
+
+static void *serve_exports(void *unused) {
+  (void)unused;
+  struct pollfd *polls = NULL;
+  uint32_t capacity = 0, n = 0;
+  for (;;) {
+    pthread_mutex_lock(&g_export_lock);
+    if (capacity < g_export_count + 1) {
+      struct pollfd *p = realloc(polls, (g_export_count + 16) * sizeof *p);
+      if (p) polls = p, capacity = g_export_count + 16;
+    }
+    n = 0;
+    if (polls) polls[n++] = (struct pollfd){g_export_wake, POLLIN, 0};
+    for (uint32_t i = 0; i < g_export_count && n < capacity; i++) polls[n++] = (struct pollfd){g_exports[i].fd, POLLIN, 0};
+    pthread_mutex_unlock(&g_export_lock);
+    if (!n) {  // no memory for the list yet
+      usleep(100000);
+      continue;
+    }
+    if (poll(polls, n, -1) < 0) continue;
+    for (uint32_t i = 0; i < n; i++) {
+      if (!polls[i].revents) continue;
+      if (polls[i].fd == g_export_wake) {
+        uint64_t changes;
+        (void)!read(g_export_wake, &changes, sizeof changes);
+        continue;
+      }
+      char ask;
+      ssize_t got = recv(polls[i].fd, &ask, 1, 0);  // the exporter's end doesn't block
+      if (got < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+      // Only this thread removes exports, so the buffer outlives the lock.
+      pthread_mutex_lock(&g_export_lock);
+      AHardwareBuffer *buffer = export_at(polls[i].fd, got != 1);
+      pthread_mutex_unlock(&g_export_lock);
+      if (got == 1) {
+        int failed = buffer ? AHardwareBuffer_sendHandleToUnixSocket(buffer, polls[i].fd) : -1;
+        if (failed) LOGE("export %d: sending its AHardwareBuffer failed (%d)", polls[i].fd, failed);
+      } else {  // every fd for the importers' end is closed
+        close(polls[i].fd);
+        if (buffer) AHardwareBuffer_release(buffer);
+      }
+    }
+  }
+  return NULL;
+}
+
+static void start_serving_exports(void) {
+  g_export_wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  pthread_t thread;
+  if (g_export_wake >= 0 && !pthread_create(&thread, NULL, serve_exports, NULL)) {
+    pthread_setname_np(thread, "prism_exports");
+    pthread_detach(thread);
+    return;
+  }
+  LOGE("no thread to answer imports of exported memory: %s", strerror(errno));
+  if (g_export_wake >= 0) close(g_export_wake);
+  g_export_wake = -1;
+}
+
+// An fd buffer can be imported from, any number of times and through any dup of it; -1 on failure.
+static int export_buffer(AHardwareBuffer *buffer) {
+  pthread_once(&g_export_once, start_serving_exports);
+  int pair[2];
+  if (g_export_wake < 0 || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) return -1;
+  fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) | O_NONBLOCK);
+  pthread_mutex_lock(&g_export_lock);
+  int room = ROOM(g_exports, g_export_count, g_export_capacity);
+  if (room) {
+    AHardwareBuffer_acquire(buffer);
+    g_exports[g_export_count++] = (Export){pair[0], buffer};
+  }
+  pthread_mutex_unlock(&g_export_lock);
+  if (!room) {
+    close(pair[0]), close(pair[1]);
+    return -1;
+  }
+  uint64_t one = 1;
+  (void)!write(g_export_wake, &one, sizeof one);
+  return pair[1];
+}
+
+// The AHardwareBuffer an exported fd carries (acquired), asked for from its exporter; NULL if fd is
+// not one or its exporter is gone. The fd stays the caller's.
+static AHardwareBuffer *receive_buffer(int fd) {
+  char ask = 1;
+  struct pollfd ready = {fd, POLLIN, 0};
+  AHardwareBuffer *buffer = NULL;
+  if (send(fd, &ask, 1, MSG_NOSIGNAL) != 1 || poll(&ready, 1, RECEIVE_TIMEOUT_MS) != 1 ||
+      AHardwareBuffer_recvHandleFromUnixSocket(fd, &buffer) != 0 || !buffer) {
+    LOGE("fd %d holds no AHardwareBuffer (%s); only memory exported by Prism's driver can be imported", fd,
+         strerror(errno));
+    return NULL;
+  }
+  return buffer;
 }
 
 // The buffer a backed image's fd carries: its mirror, a single-layer color buffer (what gralloc
@@ -2166,10 +2334,7 @@ static VkResult backed_memory_allocate(VkDevice device, const VkMemoryAllocateIn
                                        const VkAllocationCallbacks *allocator, VkDeviceMemory *memory,
                                        const Backed *want, int fd) {
   AHardwareBuffer *buffer = NULL;
-  if (fd >= 0 && (AHardwareBuffer_recvHandleFromUnixSocket(fd, &buffer) != 0 || !buffer)) {
-    LOGE("fd %d holds no AHardwareBuffer; only memory exported by Prism's driver can be imported", fd);
-    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-  }
+  if (fd >= 0 && !(buffer = receive_buffer(fd))) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
   if (fd < 0 && !(buffer = mirror_buffer(want, info->allocationSize))) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, want->image};
   VkMemoryAllocateInfo own = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated, info->allocationSize,
@@ -2212,17 +2377,23 @@ static VkResult backed_memory_allocate(VkDevice device, const VkMemoryAllocateIn
 // Memory imported from an fd without naming a backed image: its buffer, in case a backed image is
 // bound to it (the compositor imports the memory of each swapchain image it exports, and binds a
 // second image to it).
-#define MAX_IMPORTS 256
 static struct {
   VkDeviceMemory memory;
   AHardwareBuffer *buffer;
-} g_imports[MAX_IMPORTS];
+} *g_imports;
+static uint32_t g_import_count, g_import_capacity;
+
+static int is_import(VkDeviceMemory memory) {
+  for (uint32_t i = 0; i < g_import_count; i++)
+    if (g_imports[i].memory == memory) return 1;
+  return 0;
+}
 
 static AHardwareBuffer *take_import(VkDeviceMemory memory) {
-  for (int i = 0; i < MAX_IMPORTS; i++) {
-    if (g_imports[i].memory != memory || !g_imports[i].buffer) continue;
+  for (uint32_t i = 0; i < g_import_count; i++) {
+    if (g_imports[i].memory != memory) continue;
     AHardwareBuffer *buffer = g_imports[i].buffer;
-    g_imports[i].memory = VK_NULL_HANDLE, g_imports[i].buffer = NULL;
+    g_imports[i] = g_imports[--g_import_count];
     return buffer;
   }
   return NULL;
@@ -2255,11 +2426,14 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
     export_ahb.handleTypes = as_ahb(export->handleTypes);
     replace_in_chain(&copy, &export_ahb, &scratch);
   }
-  AHardwareBuffer *buffer = NULL;
-  if (importing && (AHardwareBuffer_recvHandleFromUnixSocket(import->fd, &buffer) != 0 || !buffer)) {
-    LOGE("fd %d holds no AHardwareBuffer; only memory exported by Prism's driver can be imported", import->fd);
-    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+  if (importing) {  // room to note the import, before anything is taken from the fd
+    pthread_mutex_lock(&g_lock);
+    int room = ROOM(g_imports, g_import_count, g_import_capacity);
+    pthread_mutex_unlock(&g_lock);
+    if (!room) return VK_ERROR_OUT_OF_HOST_MEMORY;
   }
+  AHardwareBuffer *buffer = NULL;
+  if (importing && !(buffer = receive_buffer(import->fd))) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
   VkImportAndroidHardwareBufferInfoANDROID import_ahb = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};
   if (buffer) {
     VkAndroidHardwareBufferPropertiesANDROID props = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
@@ -2279,13 +2453,17 @@ static VkResult VKAPI_CALL prism_AllocateMemory(VkDevice device, const VkMemoryA
   VkResult result = next.AllocateMemory(device, &copy, allocator, memory);
   if (result == VK_SUCCESS && importing) {
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < MAX_IMPORTS; i++) {
-      if (g_imports[i].buffer) continue;
+    int room = ROOM(g_imports, g_import_count, g_import_capacity);  // another import may have taken it
+    if (room) {
       AHardwareBuffer_acquire(buffer);
-      g_imports[i].memory = *memory, g_imports[i].buffer = buffer;
-      break;
+      g_imports[g_import_count].memory = *memory, g_imports[g_import_count++].buffer = buffer;
     }
     pthread_mutex_unlock(&g_lock);
+    if (!room) {
+      next.FreeMemory(device, *memory, allocator);
+      *memory = VK_NULL_HANDLE;
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
   }
   if (buffer) AHardwareBuffer_release(buffer);  // the memory holds its own reference
   if (importing && result == VK_SUCCESS) close(import->fd);  // a successful import owns the fd
@@ -2302,8 +2480,8 @@ static void VKAPI_CALL prism_FreeMemory(VkDevice device, VkDeviceMemory memory, 
       if (gone.buffer) AHardwareBuffer_release(gone.buffer);
       gone = *b;
       b->memory = VK_NULL_HANDLE, b->buffer = NULL, b->mirror = VK_NULL_HANDLE, b->mirror_memory = VK_NULL_HANDLE;
-      for (int i = 0; i < MAX_BACKED; i++)
-        if (g_backed[i].owner == b) g_backed[i].owner = NULL;
+      for (uint32_t i = 0; i < backed_slots(); i++)
+        if (backed_at(i)->owner == b) backed_at(i)->owner = NULL;
       release_backed(b);
     }
     pthread_mutex_unlock(&g_lock);
@@ -2326,9 +2504,7 @@ static VkDeviceMemory memory_to_bind(VkDevice device, VkImage image, VkDeviceMem
   if (!tracking() || !next.GetImageMemoryRequirements) return memory;
   pthread_mutex_lock(&g_lock);
   Backed *b = backed_image(image);
-  int imported = 0;
-  for (int i = 0; b && b->mirror_format != VK_FORMAT_UNDEFINED && b->memory == VK_NULL_HANDLE && i < MAX_IMPORTS; i++)
-    imported |= g_imports[i].memory == memory && g_imports[i].buffer;
+  int imported = b && b->mirror_format != VK_FORMAT_UNDEFINED && b->memory == VK_NULL_HANDLE && is_import(memory);
   pthread_mutex_unlock(&g_lock);
   if (!imported) return memory;
   VkMemoryRequirements req;
@@ -2528,8 +2704,6 @@ static void VKAPI_CALL prism_CmdEndRenderPass2KHR(VkCommandBuffer cb, const VkSu
   next.CmdEndRenderPass2KHR(cb, end);
 }
 
-#define EXPORT_COPIES 4
-
 static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *info, int *fd) {
   if (info->handleType != OPAQUE_FD || !next.GetMemoryAndroidHardwareBufferANDROID)
     return VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -2547,21 +2721,13 @@ static VkResult VKAPI_CALL prism_GetMemoryFdKHR(VkDevice device, const VkMemoryG
     LOGE("vkGetMemoryFdKHR: memory has no AHardwareBuffer (%d)", result);
     return result;
   }
-  int pair[2];
-  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) {
-    AHardwareBuffer_release(buffer);
+  int shared = export_buffer(buffer);
+  AHardwareBuffer_release(buffer);  // the export holds its own reference
+  if (shared < 0) {
+    LOGE("vkGetMemoryFdKHR: no socket to share the AHardwareBuffer through");
     return VK_ERROR_TOO_MANY_OBJECTS;
   }
-  int sent = 0;
-  for (int i = 0; i < EXPORT_COPIES && !sent; i++) sent = AHardwareBuffer_sendHandleToUnixSocket(buffer, pair[0]);
-  close(pair[0]);  // what was sent stays readable at the other end
-  AHardwareBuffer_release(buffer);
-  if (sent) {
-    close(pair[1]);
-    LOGE("vkGetMemoryFdKHR: sending the AHardwareBuffer failed (%d)", sent);
-    return VK_ERROR_OUT_OF_HOST_MEMORY;
-  }
-  *fd = pair[1];
+  *fd = shared;
   return VK_SUCCESS;
 }
 
@@ -2607,21 +2773,29 @@ static uint64_t deadline_of(uint64_t timeout) {
   return timeout > UINT64_MAX - now ? UINT64_MAX : now + timeout;
 }
 
+// Counts a wait that had to ask the PC more than once: how many asks, and how long it took.
+static void wait_done(uint64_t start, unsigned asks) {
+  if (asks < 2) return;
+  __atomic_fetch_add(&g_wait_calls, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_wait_polls, asks, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_wait_ns, now_ns() - start, __ATOMIC_RELAXED);
+}
+
 static VkResult VKAPI_CALL prism_WaitForFences(VkDevice device, uint32_t count, const VkFence *fences,
                                                VkBool32 all, uint64_t timeout) {
-  uint64_t deadline = deadline_of(timeout), pause = POLL_MIN_NS;
-  for (;;) {
+  uint64_t start = now_ns(), deadline = deadline_of(timeout), pause = POLL_MIN_NS;
+  for (unsigned asks = 1;; asks++) {
     VkResult result = next.WaitForFences(device, count, fences, all, 0);
-    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return result;
+    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return wait_done(start, asks), result;
   }
 }
 
 static VkResult wait_semaphores(PFN_vkWaitSemaphores down, VkDevice device, const VkSemaphoreWaitInfo *info,
                                 uint64_t timeout) {
-  uint64_t deadline = deadline_of(timeout), pause = POLL_MIN_NS;
-  for (;;) {
+  uint64_t start = now_ns(), deadline = deadline_of(timeout), pause = POLL_MIN_NS;
+  for (unsigned asks = 1;; asks++) {
     VkResult result = down(device, info, 0);
-    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return result;
+    if (result != VK_TIMEOUT || !poll_pause(deadline, &pause)) return wait_done(start, asks), result;
   }
 }
 

@@ -1,15 +1,16 @@
 # M6: Launcher and packaging (plan)
 
-Goal: from an OTA, Prism is two commands, and after that one:
+Goal: Prism runs from a small window. You pick the OTA once and press Set up, and after that you
+press Start VR. The same steps are also commands, which the window runs:
 
 ```powershell
 python tools\prism.py setup path\to\horizon-ota.zip   # once, and again after pulling changes
 python tools\prism.py vr                              # or: desktop
 ```
 
-Done when a fresh clone on a PC with Python, the Android SDK and SteamVR gets from `setup` to
-Horizon in the headset without any other command, when `setup` run again with nothing changed
-finishes in seconds, and when Prism can be started from SteamVR's library.
+Done when a fresh clone on a PC with Python, the Android SDK and SteamVR gets from Set up to
+Horizon in the headset from the window alone, when setting up again with nothing changed finishes
+in seconds, and when Prism can be started from SteamVR's library.
 
 ## Where it is now
 
@@ -36,6 +37,46 @@ on their own. `prism.cmd` at the repository root runs it, so `prism vr` works fr
 | `stop` | Stops the bridge and the emulator |
 | `doctor` | Checks everything `setup` and `vr` need and says what is missing and how to get it |
 | `steamvr register\|unregister` | Prism's entry in SteamVR's library |
+| `ui` | The window (below) |
+
+### The window
+
+`tools/prism_ui.pyw`, in tkinter: it comes with Python on Windows, so Prism gains no dependency.
+`Prism.cmd` at the repository root opens it with `pythonw` (no console), so it can be
+double-clicked or pinned to the taskbar.
+
+```text
+┌ Prism ──────────────────────────────────────────┐
+│ Horizon   ● Ready (90 fps)        SteamVR ● On  │
+│ Setup     ✓ Current               OTA  ✓ Found  │
+│                                                 │
+│ [ Start VR ]  [ Desktop ]  [ Stop ]             │
+│                                                 │
+│ Headset   Latency [−] 45 ms [+]   [ Recenter ]  │
+│           [ Meta button ]  [ Menu button ]      │
+│                                                 │
+│ ▸ Setup and settings                            │
+│ ▸ Log                                           │
+└─────────────────────────────────────────────────┘
+```
+
+- **Status:** the emulator (stopped, booting, clock, Horizon starting, ready at N frames a
+  second), SteamVR (running or not), and whether setup is current. When it isn't, the line names
+  what changed ("tracking rebuilt, needs deploy") and Start offers to bring it up to date first.
+- **Start VR, Desktop, Stop** run `prism.py vr`, `desktop` and `stop` as child processes. Their
+  output goes to the log, so a crash in the bridge never takes the window down, and Stop ends the
+  whole process tree.
+- **Headset controls** while VR runs: latency, recenter and the two buttons, as the console's keys
+  and F7 to F9 work now. They need a control channel into `prism_vr`, which reads keys from its
+  console with `_getch` today: a `--control` option that also reads stdin lines (`latency 50`,
+  `recenter`, `meta down`, `meta up`), which the window writes. The values the bridge has are shown
+  on its status line, as it prints them now.
+- **Setup and settings** (collapsed): the OTA file (a file dialog), Set up and its progress, step
+  by step, as `setup` prints it, the refresh rate (60 or 90), IPD, menu-button mapping, and
+  Register in SteamVR. These are saved in `work/prism.json`.
+- **Log** (collapsed): the running command's output, plus a button that opens `work/logs`.
+- The window polls the status every few seconds through the same functions `doctor` and
+  `ready()` use, so what it shows is what the commands would find.
 
 ### Setup's steps
 
@@ -76,8 +117,8 @@ starting, Home drawing. Past a timeout it prints `emulator.py status` and the la
 A `.vrmanifest` (app key `prism.horizon`, a name, an image from `img/`), whose binary is Python with
 `tools\prism.py vr --from-steamvr` as its arguments, registered with
 `IVRApplications::AddApplicationManifest` (openvr_api.dll, which SteamVR ships). Launched this way
-there is no console: output goes to `work/logs/steamvr-run.log`, and the console's keys need
-stand-ins (F9 recenters already; latency would become a setting in `work/prism.json`).
+there is no console: output goes to `work/logs/steamvr-run.log`, and the window, if it's open,
+shows it and takes over the controls; the latency comes from `work/prism.json`.
 
 To check first: SteamVR ties a launched app to the process it started, and the OpenXR session
 belongs to `prism_vr.exe`, a child of Python. If SteamVR doesn't count the child as the app (it
@@ -102,17 +143,23 @@ emulator through `prism.py` itself.
 3. **`vr`, `desktop`, `stop`.** Done when `vr` from a stopped emulator reaches the headset with no
    other command; closing the bridge and running `vr` again reconnects without a boot; and a
    source changed, then `vr`, rebuilds and redeploys only that part.
-4. **SteamVR's library.** Done when Prism starts from the library in the headset, and quitting it
+4. **The window.** The status, Start VR, Desktop and Stop first, then Set up with its OTA picker and
+   progress, then the headset controls (with `prism_vr`'s `--control`). Done when everything from
+   a fresh clone to Horizon in the headset, the controls included, works from the window without a
+   console.
+5. **SteamVR's library.** Done when Prism starts from the library in the headset, and quitting it
    from SteamVR's dashboard leaves the emulator running for the next start.
-5. **Docs.** README's quick start becomes `setup` and `vr`; [m1-progress.md](m1-progress.md)'s
-   commands stay as what `setup` does underneath.
-6. **Experiment: boot from a snapshot.** A quick-boot snapshot taken once Home is drawn would skip
+6. **Docs.** README's quick start becomes: open `Prism.cmd`, pick the OTA, Set up, Start VR. The
+   commands are listed under it, and [m1-progress.md](m1-progress.md)'s commands stay as what
+   `setup` does underneath.
+7. **Experiment: boot from a snapshot.** A quick-boot snapshot taken once Home is drawn would skip
    the boot and the TSC check. The emulator's snapshots may not keep gfxstream's Vulkan state, which
    Meta's compositor depends on, so this is a test before a feature: Home drawing after a restore,
    at 90 frames a second (`perf.py --guest`).
 
 ## Not in M6
 
-- A graphical launcher. The commands come first; a window can call them later.
+- A larger app: the window starts, stops and sets up Prism; Horizon itself is used in the headset
+  or the viewer, not from it.
 - A single installer or `.exe` (Python, the SDK and the OTA stay the user's to provide), and
   anything that ships Horizon's files ([Scope](../README.md#scope)).

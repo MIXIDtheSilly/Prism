@@ -55,9 +55,10 @@ show up on a monitor and respond to clicks.
 **M4: More than one app at a time.** Shell and game together, all layer types, 2D Android apps
 as panels, launching games from the Library.
 
-**M5: Headset.** Output through a PC OpenXR runtime (SteamVR), with hands and haptics.
+**M5: Headset.** *Working.* Output through a PC OpenXR runtime (SteamVR), with hands and haptics.
 
-**M6: Launcher and packaging.** Point Prism at your own OTA; the image is built on your PC.
+**M6: Launcher and packaging.** Point Prism at your own OTA; the image is built on your PC. See
+[m6-launcher.md](m6-launcher.md).
 
 ## Out of scope
 

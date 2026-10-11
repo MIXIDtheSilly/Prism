@@ -168,6 +168,15 @@ emulator through `prism.py` itself.
    the boot and the TSC check. The emulator's snapshots may not keep gfxstream's Vulkan state, which
    Meta's compositor depends on, so this is a test before a feature: Home drawing after a restore,
    at 90 frames a second (`perf.py --guest`).
+   *Tried (2026-10-12): no gain, so not a feature.* A save is refused while a Vulkan app runs
+   (`UNSUPPORTED_VK_APP`) unless the emulator runs with `-feature VulkanSnapshots`, which costs
+   nothing once Home settles (90.0 frames a second, p99 12.7 ms); with it a save of Home takes 19 s
+   (315 MB). Loaded in place (`adb emu avd snapshot load`), the guest resumes but surfaceflinger
+   dies at once (SIGFPE, an integer division by zero), the framework restarts, and Home is ready
+   50 s after the load. Started from a snapshot (`-snapshot NAME -no-snapshot-save`), the emulator
+   ignores it ("due to the use of -no-snapshot"; `-writable-system` or `-qemu -append`, both of
+   which Prism needs) and boots cold. A cold boot reaches Home in 52 s when the TSC passes, 84 s
+   with one reboot for it: about what a restore costs.
 
 ## Not in M6
 

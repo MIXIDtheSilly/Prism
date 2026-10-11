@@ -137,7 +137,7 @@ emulator through `prism.py` itself.
    full build (compat alone 8.5); a touched source rebuilds only its part. Deploy writes its id to
    `/data/prism/deploy-id` (the next deploy is the first to). `emulator.stage()` (one adb call and
    a second of frames) and `emulator.py ready` reach "ready: 89 frames a second" on a running Home.
-2. **`setup` and `doctor`.** Done when a fresh clone with a new AVD (an `--avd` option, since
+2. **`setup` and `doctor`.** *Done (2026-10-11)*, but for the run from a fresh clone and new AVD. Done when a fresh clone with a new AVD (an `--avd` option, since
    `emulator.py` has the one name, `prism-api34`, today) goes from
    the OTA to Horizon running, and a second `setup` finishes in seconds. `doctor` names a missing
    SDK, system image, SteamVR, OTA or patch, with the command that fixes each one (the system image

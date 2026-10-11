@@ -64,6 +64,8 @@ def main():
     ap.add_argument('--menu-button-is-menu', action='store_true',
                     help="the left menu button is Horizon's menu button, not the Meta button")
     ap.add_argument('--build', action='store_true', help='rebuild even if it looks current')
+    ap.add_argument('--control', action='store_true',
+                    help="also take commands on stdin (recenter, latency MS, meta|menu down|up, quit): the window's")
     args = ap.parse_args()
     if os.name != 'nt':
         sys.exit('prism_vr runs on Windows')
@@ -71,7 +73,8 @@ def main():
     subprocess.run([adb_path(), '-s', SERIAL, 'forward', f'tcp:{PORT}', f'tcp:{PORT}'], check=True,
                    capture_output=True)
     subprocess.run([EXE, '--emulator-port', str(EMULATOR_PORT), '--tracking-port', str(PORT),
-                    '--latency', str(args.latency), '--ipd', str(args.ipd)] + (['--menu-button-is-menu'] if args.menu_button_is_menu else []))
+                    '--latency', str(args.latency), '--ipd', str(args.ipd)] + (['--menu-button-is-menu'] if args.menu_button_is_menu else []) +
+                   (['--control'] if args.control else []))
 
 
 if __name__ == '__main__':

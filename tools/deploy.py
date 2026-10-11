@@ -487,6 +487,8 @@ def build(args):
     overrides = {}
     for base, _dirs, files in os.walk(args.compat):
         for name in files:
+            if name == stamp.NAME:  # compat's own record, not a device file
+                continue
             host = os.path.join(base, name)
             overrides['/' + os.path.relpath(host, args.compat).replace(os.sep, '/')] = host
     if not overrides:

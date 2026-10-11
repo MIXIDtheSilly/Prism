@@ -102,19 +102,28 @@ This repository contains no Horizon OS files and never will. You supply a full O
 headset; Prism unpacks and analyses it locally. Everything derived from it goes to `work/`, which
 is ignored by git.
 
-Requirements: Python 3.10+, and the Android SDK with
-`system-images;android-34;google_apis;x86_64` (the stock baseline Prism compares against and builds
-on).
+Requirements: Windows with the Windows Hypervisor Platform, Python 3.10+, the Android SDK (the
+emulator, platform-tools, the NDK and `system-images;android-34;google_apis;x86_64`, the stock
+baseline Prism builds on), Visual Studio's C++ tools and Git; SteamVR for a headset.
+
+Open **`Prism.cmd`**: a small window that does the rest. Under *Setup and settings*, pick your
+OTA, then *Check this PC* (what's missing and how to get it) and *Set up*. The first setup extracts
+the OTA, creates the emulator, builds Prism's parts and deploys Horizon onto it, which takes a
+while; after that, setting up again does only what changed. Then *Start VR* (or *Desktop*): it waits
+until Horizon's home is drawing and opens it in the headset, with the latency, recenter and the
+Meta and menu buttons in the window.
+
+The same from a terminal:
 
 ```powershell
-python tools\prepare.py path\to\horizon-ota.zip
+python tools\prism.py doctor
+python tools\prism.py setup path\to\horizon-ota.zip
+python tools\prism.py vr        # or: desktop; stop shuts Horizon down
 ```
 
-This extracts the partitions, files and APEX modules, unpacks the stock emulator image, and writes
-an inventory to `work\inventory\report.md`.
-
-The steps that then build Prism's parts, deploy Horizon onto the emulator and open the viewer are
-in [docs/m1-progress.md](docs/m1-progress.md#running-it).
+`setup` extracts the partitions, files and APEX modules, unpacks the stock emulator image and writes
+an inventory to `work\inventory\report.md`, then runs the steps in
+[docs/m1-progress.md](docs/m1-progress.md#running-it), each only when it isn't already current.
 
 ## Repository layout
 
@@ -137,6 +146,8 @@ tools/guest_media.py  Builds the arm64 media functions Meta's libraries expect
 tools/head.py         Moves the headset from the PC: mouse and keys drive the head pose
 tools/perf.py         Measures shared frame rate, jitter and guest CPU (the benchmark for frame-rate work)
 tools/stamp.py        Whether a build is current: a stamp of what it was made from
+tools/prism.py        The launcher: doctor, setup (each step only when not current), vr, desktop, stop
+tools/prism_ui.pyw    The launcher's window (Prism.cmd opens it)
 tools/viewer.py       Horizon in a desktop window: the mouse points and clicks, keys move
 tools/steamvr.py      Horizon in a PC headset through SteamVR (OpenXR): its tracking and frames
 tools/xrprobe.py      Builds and runs Prism's OpenXR test apps (xrprobe, xrdemo, xrgame)

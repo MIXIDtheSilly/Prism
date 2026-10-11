@@ -38,6 +38,10 @@
 // runtime sets it ("haptic l|r amplitude"), played until it's set to 0 (and renewed while it lasts,
 // so a lost stop ends within a second), and pulses ("haptic l|r amplitude seconds": VrShell's UI).
 //
+// With --control it also takes commands, a line each, on stdin: what tools/prism_ui.pyw sends from
+// its buttons. "recenter", "latency MS", "meta down|up" and "menu down|up" (held as F7 and F8 hold
+// them), "quit"; stdin's end quits too, so the bridge goes with the window that started it.
+//
 // Built and started by tools/steamvr.py.
 #define _USE_MATH_DEFINES
 #define XR_USE_GRAPHICS_API_D3D11
@@ -64,7 +68,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -99,6 +107,10 @@ struct VideoInfo {
 static_assert(sizeof(VideoInfo) == 24);
 
 std::atomic<bool> g_quit{false};
+// --control: the buttons held from stdin, and the other commands, waiting for the main loop.
+std::atomic<bool> g_metaHeld{false}, g_menuHeld{false};
+std::mutex g_commandsLock;
+std::deque<std::string> g_commands;
 
 // --- OpenXR functions, from the loader ---------------------------------------------------------
 
@@ -510,9 +522,10 @@ public:
     }
 
     void recenter() { recenterRequested_ = true; }
-    void change_latency(double ms)
+    void change_latency(double ms) { set_latency(latencyMs_ + ms); }
+    void set_latency(double ms)
     {
-        latencyMs_ = std::max(0.0, latencyMs_ + ms);
+        latencyMs_ = std::max(0.0, ms);
         std::printf("prism_vr: latency %.0f ms\n", latencyMs_);
     }
 
@@ -743,7 +756,8 @@ private:
             synced = xrSyncActions(session_, &sync) == XR_SUCCESS;  // not while the PC runtime's dashboard has focus
         }
         // The keyboard's buttons, whichever window has focus: they work with the headset on.
-        const bool metaKey = GetAsyncKeyState(kMetaKey) & 0x8000, menuKey = GetAsyncKeyState(kMenuKey) & 0x8000;
+        const bool metaKey = (GetAsyncKeyState(kMetaKey) & 0x8000) || g_metaHeld;
+        const bool menuKey = (GetAsyncKeyState(kMenuKey) & 0x8000) || g_menuHeld;
         const bool meta = metaKey || (synced && metaFromMenu_ && menu_held());
         for (int hand = 0; hand < 2; ++hand) {
             XrSpaceLocation aim{XR_TYPE_SPACE_LOCATION};
@@ -956,22 +970,56 @@ BOOL WINAPI on_console(DWORD)
     return TRUE;
 }
 
+// --control's reader: stdin's lines, queued for the main loop (the buttons are set at once).
+void read_commands()
+{
+    for (std::string line; std::getline(std::cin, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line == "meta down" || line == "meta up") { g_metaHeld = line == "meta down"; continue; }
+        if (line == "menu down" || line == "menu up") { g_menuHeld = line == "menu down"; continue; }
+        std::lock_guard<std::mutex> lock(g_commandsLock);
+        g_commands.push_back(line);
+    }
+    g_quit = true;  // the window that started it is gone
+}
+
+// The commands read since the last look: recenter, latency MS, quit.
+void run_commands(Vr& vr)
+{
+    std::deque<std::string> commands;
+    {
+        std::lock_guard<std::mutex> lock(g_commandsLock);
+        commands.swap(g_commands);
+    }
+    for (const std::string& command : commands) {
+        double ms = 0;
+        if (command == "recenter") vr.recenter();
+        else if (command == "quit") g_quit = true;
+        else if (std::sscanf(command.c_str(), "latency %lf", &ms) == 1) vr.set_latency(ms);
+        else if (!command.empty()) std::printf("prism_vr: unknown command \"%s\"\n", command.c_str());
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     int emulatorPort = 5590, trackingPort = 7340;
     double latencyMs = 45, ipd = 0.063;
-    bool metaFromMenu = true;
+    bool metaFromMenu = true, control = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--menu-button-is-menu") { metaFromMenu = false; continue; }
+        if (arg == "--control") { control = true; continue; }
         if (i + 1 == argc) break;  // the rest take a value
         if (arg == "--emulator-port") emulatorPort = std::atoi(argv[++i]);
         else if (arg == "--tracking-port") trackingPort = std::atoi(argv[++i]);
         else if (arg == "--latency") latencyMs = std::atof(argv[++i]);
         else if (arg == "--ipd") ipd = std::atof(argv[++i]) / 1000;  // mm
     }
+    // Each line as it's printed, also into a pipe (the window's log), not when a buffer fills.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (control) std::thread(read_commands).detach();  // from now on: closing stdin quits while waiting for a headset too
     SetConsoleCtrlHandler(on_console, TRUE);
     timeBeginPeriod(1);
     WSADATA wsa{};
@@ -988,6 +1036,7 @@ int main(int argc, char** argv)
 
     auto reported = Clock::now();
     while (vr.tick()) {
+        run_commands(vr);
         while (_kbhit()) {
             switch (_getch()) {
             case 'r': case 'R': vr.recenter(); break;

@@ -7,11 +7,14 @@ doctor), whose output goes to the Log; so the window shows what those commands w
 crash in one never takes the window down. Its status lines poll the same functions the commands
 use: emulator.stage() for Horizon, and setup's steps for whether setup is current. While VR runs,
 the Headset controls go to the bridge (tools/steamvr.py --control): latency, recenter, and the Meta
-and menu buttons held while pressed. --vr starts VR as the window opens.
+and menu buttons held while pressed. A VR bridge it didn't start (SteamVR's library starts prism.py vr
+--from-steamvr) it follows too: its log (work/logs/steamvr-run.log) goes to the Log, and the controls
+to prism.py's control port. --vr starts VR as the window opens.
 """
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -99,6 +102,9 @@ class Window:
         self.updates = queue.Queue()   # from the pollers: (what, value)
         self.command = None
         self.stopping = False
+        self.external = False  # a VR bridge this window didn't start: SteamVR's
+        self.control = None    # its control port, connected
+        self.registered = None
         root.title('Prism')
         root.resizable(False, False)
         # Buttons take no keyboard focus: a key meant for another window (focus moves when the emulator
@@ -108,6 +114,7 @@ class Window:
         self.build()
         threading.Thread(target=self.poll_horizon, daemon=True).start()
         threading.Thread(target=self.poll_setup, daemon=True).start()
+        threading.Thread(target=self.follow_steamvr, daemon=True).start()
         self.root.after(100, self.drain)
         if start_vr:
             self.root.after(500, lambda: self.start('vr'))
@@ -209,7 +216,9 @@ class Window:
         self.setup_button = ttk.Button(actions, text='Set up', command=lambda: self.start('setup'))
         self.setup_button.pack(side='left', padx=(0, 6))
         self.doctor_button = ttk.Button(actions, text='Check this PC', command=lambda: self.start('doctor'))
-        self.doctor_button.pack(side='left')
+        self.doctor_button.pack(side='left', padx=(0, 6))
+        self.library_button = ttk.Button(actions, text="Add to SteamVR's library", command=self.library)
+        self.library_button.pack(side='left')
         body.columnconfigure(1, weight=1)
 
     def build_log(self, body):
@@ -253,12 +262,29 @@ class Window:
     def send(self, line):
         if self.vr_running():
             self.command.send(line)
+        elif self.external:
+            for _ in range(2):  # once more on a new connection, if the last one went with its bridge
+                try:
+                    if self.control is None:
+                        self.control = socket.create_connection(('127.0.0.1', prism.CONTROL_PORT), timeout=1)
+                    self.control.sendall((line + '\n').encode())
+                    return
+                except OSError:
+                    self.disconnect()
 
-    def start(self, what):
+    def disconnect(self):
+        if self.control:
+            self.control.close()
+            self.control = None
+
+    def library(self):
+        self.start('steamvr', 'unregister' if self.registered else 'register')
+
+    def start(self, what, *more):
         if self.command and self.command.running():
             return
         self.save()
-        args = [what]
+        args = [what, *more]
         if what == 'vr':
             args.append('--control')
         if what == 'setup' and self.settings.get('ota'):
@@ -282,11 +308,16 @@ class Window:
 
     def update_buttons(self):
         busy = bool(self.command and self.command.running())
-        for b in (self.vr_button, self.desktop_button, self.setup_button, self.doctor_button):
+        for b in (self.setup_button, self.doctor_button, self.library_button):
             b.state(['disabled'] if busy else ['!disabled'])
+        for b in (self.vr_button, self.desktop_button):
+            b.state(['disabled'] if busy or self.external else ['!disabled'])
         for b in self.headset_buttons:
-            b.state(['!disabled'] if self.vr_running() else ['disabled'])
-        if not busy:
+            b.state(['!disabled'] if self.vr_running() or self.external else ['disabled'])
+        if self.external and not busy:
+            if self.bridge.cget('text') == 'Not running':
+                self.bridge.configure(text='VR: started from SteamVR', foreground=AMBER)
+        elif not busy:
             self.bridge.configure(text='Not running', foreground=GREY)
 
     def write(self, line):
@@ -339,6 +370,7 @@ class Window:
             vr = prism.bridge_running('vrserver.exe')
             self.updates.put(('horizon', stage))
             self.updates.put(('steamvr', vr))
+            self.updates.put(('bridge', prism.bridge_running(prism.BRIDGES['vr'])))
             time.sleep(3)
 
     refresh_setup = True
@@ -356,7 +388,39 @@ class Window:
                         current = None
                     (todo if current is False else unknown if current is None else []).append(name)
                 self.updates.put(('setup', (todo, unknown)))
+                self.updates.put(('library', prism.steamvr_registered()))
             time.sleep(1)
+
+    def follow_steamvr(self):
+        """While a bridge SteamVR started runs, its log's new lines go where a command's would."""
+        log, offset, partial = None, 0, ''
+        while True:
+            if not self.external:
+                if log:
+                    log.close()
+                    log = None
+                time.sleep(0.5)
+                continue
+            if log is None:
+                try:
+                    log, offset, partial = open(prism.STEAMVR_LOG, encoding='utf-8', errors='replace'), 0, ''
+                    self.lines.put('> started from SteamVR (work/logs/steamvr-run.log)')
+                except OSError:
+                    time.sleep(0.5)
+                    continue
+            try:
+                rewritten = os.path.getsize(prism.STEAMVR_LOG) < offset  # by a new start
+            except OSError:
+                rewritten = False
+            if rewritten:
+                log.seek(0)
+                partial = ''
+            partial += log.read()
+            offset = log.tell()
+            *whole, partial = partial.split('\n')
+            for line in whole:
+                self.lines.put(line.rstrip('\r'))
+            time.sleep(0.25)
 
     def drain(self):
         while True:
@@ -378,6 +442,16 @@ class Window:
                 text, color = STAGES.get(stage, (stage, GREY))
                 self.dot.itemconfigure(self.dot_id, fill=color)
                 self.horizon.configure(text=f'{text}{" · " + detail if detail else ""}')
+            elif what == 'bridge':
+                external = value and not self.vr_running()
+                if external != self.external:
+                    self.external = external
+                    if not external:
+                        self.disconnect()
+                    self.update_buttons()
+            elif what == 'library':
+                self.registered = value
+                self.library_button.configure(text="Remove from SteamVR's library" if value else "Add to SteamVR's library")
             elif what == 'steamvr':
                 self.steamvr.configure(text='SteamVR on' if value else 'SteamVR off', foreground=GREEN if value else GREY)
             elif what == 'setup' and not (self.command and self.command.running() and self.command.args[0] == 'setup'):

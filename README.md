@@ -44,7 +44,7 @@ reporting what breaks helps too.
 | M3: Home in a desktop window | Done |
 | M4: More than one app at a time | In progress |
 | M5: PC VR headset | Working: Horizon in a headset through SteamVR |
-| M6: Launcher and packaging | Not started |
+| M6: Launcher and packaging | In progress: the launcher, its window and SteamVR's library |
 
 What works:
 
@@ -78,8 +78,6 @@ Not yet:
 - Passthrough (black: there are no cameras).
 - The Store, Meta accounts and other online features. These are out of scope (see
   [Scope](#scope)).
-- Setting up and starting Prism in one step (M6): today it is the commands in
-  [docs/m1-progress.md](docs/m1-progress.md#running-it).
 
 ## How it works
 
@@ -113,12 +111,18 @@ while; after that, setting up again does only what changed. Then *Start VR* (or 
 until Horizon's home is drawing and opens it in the headset, with the latency, recenter and the
 Meta and menu buttons in the window.
 
+*Add to SteamVR's library* (under *Setup and settings*) lists Prism in SteamVR as **Horizon OS
+(Prism)**, so it starts from the headset too: the window, if it is open, shows that run and its
+controls work on it. Quitting it from SteamVR leaves the emulator running, so the next start is
+quick.
+
 The same from a terminal:
 
 ```powershell
 python tools\prism.py doctor
 python tools\prism.py setup path\to\horizon-ota.zip
 python tools\prism.py vr        # or: desktop; stop shuts Horizon down
+python tools\prism.py steamvr register   # Prism in SteamVR's library
 ```
 
 `setup` extracts the partitions, files and APEX modules, unpacks the stock emulator image and writes

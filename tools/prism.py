@@ -6,6 +6,7 @@
     python tools/prism.py vr [--latency MS] [--ipd MM] [--menu-button-is-menu] [--stop-after]
     python tools/prism.py desktop [--stop-after]
     python tools/prism.py stop
+    python tools/prism.py steamvr register|unregister   # Prism in SteamVR's library, or not
 
 setup runs each step that isn't current, in order (STEPS): the workspace from the OTA, the AVD and
 its display rate, the emulator's frame sharing, the builds, the PC apps and the deploy. Each step
@@ -13,7 +14,13 @@ knows whether it's current (the builds by their stamps, the deploy by the id it 
 guest), so setup run again with nothing changed does nothing, and after a pull does only what the
 change needs. vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready)
 and run tools/steamvr.py or tools/viewer.py; the emulator keeps running when they exit, since a boot
-takes minutes (--stop-after, or stop, shuts it down).
+takes minutes (--stop-after, or stop, shuts it down). While vr runs, the bridge takes commands
+(recenter, latency MS, meta|menu down|up) on 127.0.0.1:CONTROL_PORT, a line each: the window's, for a
+bridge it didn't start.
+
+steamvr register puts Prism in SteamVR's library (work/steamvr/prism.vrmanifest), which runs
+vr --from-steamvr: the bridge starts at once, since SteamVR waits for its app's session, and shows
+Horizon once the emulator is up; with no console, the output goes to work/logs/steamvr-run.log.
 
 Settings given once are kept in work/prism.json (the OTA, the refresh rate, the headset's latency and
 IPD): later runs, and tools/prism_ui.pyw, use them. Progress lines start with "==" for the window.
@@ -23,8 +30,10 @@ import importlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -39,6 +48,9 @@ PREPARED = os.path.join(ROOT, 'work', 'prepared.json')  # which OTA work/ was pr
 REPORT = os.path.join(ROOT, 'work', 'inventory', 'report.md')  # prepare's last output
 BIONIC = os.path.join(ROOT, 'work', 'device', 'bionic')
 BRIDGES = {'vr': 'prism_vr.exe', 'desktop': 'prism_viewer.exe'}
+CONTROL_PORT = 7341  # the VR bridge's commands, from a window that didn't start it (7340 is tracking's)
+STEAMVR_LOG = os.path.join(ROOT, 'work', 'logs', 'steamvr-run.log')
+NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 # The builds, in deploy's order: (step, the tool's module, its output directory). The translator
 # checks its imports against stock bionic, pulled from the emulator.
 BUILDS = [('jni', 'build', 'jni'), ('compat', 'compat', 'compat'), ('translator', 'translator', 'translator'),
@@ -85,14 +97,19 @@ def found(fn):
         return None
 
 
-def steamvr_runtime():
-    """SteamVR's install directory, as OpenVR's registry of paths has it; None without one."""
+def openvr_path(key):
+    """A directory OpenVR's registry of paths has (runtime: SteamVR's install, config: its
+    settings); None without SteamVR."""
     try:
         with open(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'openvr', 'openvrpaths.vrpath'), encoding='utf-8') as f:
-            runtimes = json.load(f).get('runtime') or []
+            paths = json.load(f).get(key) or []
     except (OSError, ValueError):
         return None
-    return next((r for r in runtimes if os.path.isdir(r)), None)
+    return next((p for p in paths if os.path.isdir(p)), None)
+
+
+def steamvr_runtime():
+    return openvr_path('runtime')
 
 
 def doctor_checks(settings):
@@ -131,6 +148,10 @@ def doctor_checks(settings):
     runtime = steamvr_runtime()
     add('SteamVR (for vr; desktop works without)', True if runtime else None, runtime or 'not found',
         'install SteamVR from Steam')
+    if runtime:
+        listed = steamvr_registered()
+        add("Prism in SteamVR's library", True if listed else None, 'registered' if listed else 'not registered',
+            'python tools/prism.py steamvr register (or start VR from here)')
     prepared = os.path.exists(REPORT)
     ota = settings.get('ota')
     add('Horizon OS OTA', prepared or bool(ota and os.path.exists(ota)),
@@ -368,26 +389,110 @@ def stop_bridges():
             print(f'stopped {name}')
 
 
+class Bridge:
+    """prism_vr, its commands (stdin, --control) ours to send: from our own stdin when the window
+    started us (its end quits the bridge, as the window's closing should), and from CONTROL_PORT."""
+
+    def __init__(self, settings, from_window):
+        import steamvr
+        self.process = subprocess.Popen(steamvr.command(settings['latency'], settings['ipd'],
+                                                        settings['menu_button_is_menu'], control=True),
+                                        stdin=subprocess.PIPE, text=True, bufsize=1)
+        self.lock = threading.Lock()
+        if from_window:
+            threading.Thread(target=self.relay_stdin, daemon=True).start()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def send(self, line):
+        with self.lock:
+            try:
+                self.process.stdin.write(line.strip() + '\n')
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def relay_stdin(self):
+        for line in sys.stdin:
+            self.send(line)
+        self.send('quit')
+
+    def serve(self):
+        try:
+            server = socket.create_server(('127.0.0.1', CONTROL_PORT))
+        except OSError as e:
+            print(f'no control port: {e}', flush=True)
+            return
+        while True:
+            connection, _ = server.accept()
+            threading.Thread(target=self.relay, args=(connection,), daemon=True).start()
+
+    def relay(self, connection):
+        with connection, connection.makefile('r', encoding='utf-8', errors='replace') as lines:
+            for line in lines:
+                self.send(line)
+
+    def wait(self):
+        while True:
+            try:
+                return self.process.wait()
+            except KeyboardInterrupt:  # Ctrl+C reaches the bridge too, which then quits
+                pass
+
+    def quit(self):
+        self.send('quit')
+        try:
+            self.process.wait(10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+
+
+def logged():
+    """vr --from-steamvr under pythonw (SteamVR's launch): no console, so this runs again under
+    python.exe with its output, its children's included, in STEAMVR_LOG (as the window runs
+    commands). The emulator breaks away from SteamVR's job when it starts."""
+    os.makedirs(os.path.dirname(STEAMVR_LOG), exist_ok=True)
+    console = os.path.join(os.path.dirname(sys.executable), 'python.exe')
+    with open(STEAMVR_LOG, 'w', encoding='utf-8') as log:
+        return subprocess.run([console, '-u', os.path.abspath(__file__), *sys.argv[1:]], cwd=ROOT,
+                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                              creationflags=NO_WINDOW).returncode
+
+
 def launch(args, settings, mode):
     exe = BRIDGES[mode]
     if bridge_running(exe):
         sys.exit(f'{exe} is already running; close it first (or python tools/prism.py stop)')
+    # From SteamVR the bridge starts first: SteamVR waits for its app's session (a boot takes
+    # minutes), and the bridge waits for the frames and the tracking service by itself.
+    bridge = None
+    if mode == 'vr' and args.from_steamvr:
+        import steamvr
+        say('starting vr')
+        steamvr.build()
+        bridge = Bridge(settings, from_window=False)
     if not args.no_setup and not setup(args, settings):
+        if bridge:
+            bridge.quit()
         sys.exit(1)
     say('waiting for Home')
     if not python('emulator.py', 'ready'):
+        if bridge:
+            bridge.quit()
         sys.exit('Horizon did not get ready; python tools/emulator.py status says what it got to')
-    say(f'starting {mode}')
     if mode == 'vr':
-        tool = ['steamvr.py', '--latency', settings['latency'], '--ipd', settings['ipd'],
-                *(['--menu-button-is-menu'] if settings['menu_button_is_menu'] else []),
-                *(['--control'] if args.control else [])]
+        import steamvr
+        steamvr.forward()
+        if not bridge:
+            say('starting vr')
+            steamvr.build()  # current after setup; with --no-setup, as steamvr.py would
+            bridge = Bridge(settings, from_window=args.control)
+        bridge.wait()
     else:
-        tool = ['viewer.py']
-    try:
-        python(*tool)
-    except KeyboardInterrupt:
-        pass
+        say('starting desktop')
+        try:
+            python('viewer.py')
+        except KeyboardInterrupt:
+            pass
     if args.stop_after:
         python('emulator.py', 'stop')
     else:
@@ -397,6 +502,106 @@ def launch(args, settings, mode):
 def stop(args, settings):
     stop_bridges()
     python('emulator.py', 'stop')
+
+
+# --- SteamVR's library ----------------------------------------------------------------------------
+
+APP_KEY = 'prism.horizon'
+MANIFEST = os.path.join(ROOT, 'work', 'steamvr', 'prism.vrmanifest')
+
+
+def write_manifest():
+    pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    app = {'app_key': APP_KEY, 'launch_type': 'binary',
+           'binary_path_windows': pythonw if os.path.exists(pythonw) else sys.executable,
+           'arguments': f'"{os.path.join(HERE, "prism.py")}" vr --from-steamvr',
+           'working_directory': ROOT, 'image_path': os.path.join(ROOT, 'img', 'prism_banner.png'),
+           'strings': {'en_us': {'name': 'Horizon OS (Prism)',
+                                 'description': 'Horizon OS in the emulator, through Prism'}}}
+    os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
+    with open(MANIFEST + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump({'source': 'Prism', 'applications': [app]}, f, indent=1)
+    os.replace(MANIFEST + '.tmp', MANIFEST)
+
+
+def appconfig_path():
+    config = openvr_path('config')
+    return config and os.path.join(config, 'appconfig.json')
+
+
+def steamvr_registered():
+    """Whether SteamVR's list of app manifests (appconfig.json) has Prism's."""
+    try:
+        with open(appconfig_path(), encoding='utf-8') as f:
+            paths = json.load(f).get('manifest_paths') or []
+    except (OSError, TypeError, ValueError):
+        return False
+    return os.path.normcase(MANIFEST) in map(os.path.normcase, paths)
+
+
+def openvr_call(add):
+    """Adds Prism's manifest (or removes it) through SteamVR's IVRApplications, which also saves it
+    in appconfig.json; None if SteamVR isn't running (as a background app this never starts it),
+    else SteamVR's EVRApplicationError (0: done)."""
+    import ctypes
+    runtime = steamvr_runtime()
+    if not runtime or not bridge_running('vrserver.exe'):
+        return None
+    api = ctypes.CDLL(os.path.join(runtime, 'bin', 'win64', 'openvr_api.dll'))
+    api.VR_InitInternal2.restype = ctypes.c_uint32
+    api.VR_InitInternal2.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p]
+    api.VR_GetGenericInterface.restype = ctypes.c_void_p
+    api.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    error = ctypes.c_int()
+    api.VR_InitInternal2(ctypes.byref(error), 3, None)  # VRApplication_Background
+    if error.value:
+        return None
+    try:
+        table = api.VR_GetGenericInterface(b'FnTable:IVRApplications_007', ctypes.byref(error))
+        if error.value or not table:
+            return None
+        # The table's first two: AddApplicationManifest(path, temporary), RemoveApplicationManifest(path).
+        functions = ctypes.cast(table, ctypes.POINTER(ctypes.c_void_p * 2)).contents
+        path = MANIFEST.encode('utf-8')
+        if add:
+            return ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_bool)(functions[0])(path, False)
+        return ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_char_p)(functions[1])(path)
+    finally:
+        api.VR_ShutdownInternal()
+
+
+def edit_appconfig(add):
+    """The same in appconfig.json while SteamVR is stopped (it reads the file when it starts)."""
+    path = appconfig_path()
+    if not path:
+        sys.exit('SteamVR not found: install it from Steam, and run it once')
+    try:
+        with open(path, encoding='utf-8') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        config = {}
+    paths = [p for p in config.get('manifest_paths') or [] if os.path.normcase(p) != os.path.normcase(MANIFEST)]
+    config['manifest_paths'] = paths + ([MANIFEST] if add else [])
+    with open(path + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=3)
+    os.replace(path + '.tmp', path)
+
+
+def steamvr_library(args, settings):
+    add = args.action == 'register'
+    if add:
+        write_manifest()
+    elif not os.path.exists(MANIFEST) and not steamvr_registered():
+        print("Prism isn't in SteamVR's library")
+        return True
+    error = openvr_call(add)
+    if error is None:
+        edit_appconfig(add)
+    elif error:
+        print(f'SteamVR refused it (EVRApplicationError {error})')
+        return False
+    print("Prism is in SteamVR's library as Horizon OS (Prism)" if add else "Prism is out of SteamVR's library")
+    return True
 
 
 def main():
@@ -421,9 +626,16 @@ def main():
     vr.add_argument('--menu-button-is-menu', action='store_true', default=None,
                     help="the left menu button is Horizon's menu button, not the Meta button (kept)")
     vr.add_argument('--control', action='store_true',
-                    help="the bridge also takes commands on stdin (tools/steamvr.py's --control): the window's")
+                    help="commands for the bridge on stdin, its end quitting it (tools/steamvr.py's --control): the window's")
+    vr.add_argument('--from-steamvr', action='store_true',
+                    help="as SteamVR's library starts it: the bridge first, and with no console, the output in "
+                         "work/logs/steamvr-run.log")
+    library = sub.add_parser('steamvr', help="Prism in SteamVR's library")
+    library.add_argument('action', choices=('register', 'unregister'))
     args = ap.parse_args()
     os.chdir(ROOT)
+    if getattr(args, 'from_steamvr', False) and os.path.basename(sys.executable).lower() == 'pythonw.exe':
+        sys.exit(logged())
 
     settings = load_settings()
     given = {k: getattr(args, k, None) for k in ('ota', 'refresh', 'latency', 'ipd', 'menu_button_is_menu')}
@@ -438,6 +650,8 @@ def main():
         sys.exit(0 if doctor(args, settings) else 1)
     if args.command == 'setup':
         sys.exit(0 if setup(args, settings) else 1)
+    if args.command == 'steamvr':
+        sys.exit(0 if steamvr_library(args, settings) else 1)
     if args.command in BRIDGES:
         launch(args, settings, args.command)
         return

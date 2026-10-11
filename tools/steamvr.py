@@ -56,6 +56,20 @@ def build(force=False):
     print(f'built {os.path.relpath(EXE, ROOT)}')
 
 
+def forward():
+    """The tracking service's port on the PC, through adb (gone when the emulator restarts)."""
+    subprocess.run([adb_path(), '-s', SERIAL, 'forward', f'tcp:{PORT}', f'tcp:{PORT}'], check=True,
+                   capture_output=True)
+
+
+def command(latency, ipd, menu_button_is_menu=False, control=False):
+    """prism_vr's command line. It waits for the emulator's frames and the tracking service by
+    itself, so it can start before either is there."""
+    return ([EXE, '--emulator-port', str(EMULATOR_PORT), '--tracking-port', str(PORT),
+             '--latency', str(latency), '--ipd', str(ipd)] + (['--menu-button-is-menu'] if menu_button_is_menu else []) +
+            (['--control'] if control else []))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--latency', type=float, default=45, help='ms from the pose a frame is rendered with to the PC')
@@ -70,11 +84,8 @@ def main():
     if os.name != 'nt':
         sys.exit('prism_vr runs on Windows')
     build(args.build)
-    subprocess.run([adb_path(), '-s', SERIAL, 'forward', f'tcp:{PORT}', f'tcp:{PORT}'], check=True,
-                   capture_output=True)
-    subprocess.run([EXE, '--emulator-port', str(EMULATOR_PORT), '--tracking-port', str(PORT),
-                    '--latency', str(args.latency), '--ipd', str(args.ipd)] + (['--menu-button-is-menu'] if args.menu_button_is_menu else []) +
-                   (['--control'] if args.control else []))
+    forward()
+    subprocess.run(command(args.latency, args.ipd, args.menu_button_is_menu, args.control))
 
 
 if __name__ == '__main__':

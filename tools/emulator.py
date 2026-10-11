@@ -296,7 +296,13 @@ def start(args):
     if os.name == 'nt' and not args.any_core:
         pin_to_performance_cores()
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS if os.name == 'nt' else 0
-    subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
+    try:
+        # Out of any job we're in too: a launcher (SteamVR, for prism.py vr --from-steamvr) may end
+        # its app's whole job when the app quits, and the emulator outlives the app.
+        subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                         creationflags=flags | getattr(subprocess, 'CREATE_BREAKAWAY_FROM_JOB', 0))
+    except PermissionError:  # a job that allows no breakaway
+        subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
     print(f'starting {AVD} as {SERIAL} (log: {log.name})')
     if args.wait and wait(args):
         ensure_tsc(args)

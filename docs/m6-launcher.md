@@ -142,16 +142,26 @@ emulator through `prism.py` itself.
    the OTA to Horizon running, and a second `setup` finishes in seconds. `doctor` names a missing
    SDK, system image, SteamVR, OTA or patch, with the command that fixes each one (the system image
    through `sdkmanager`).
-3. **`vr`, `desktop`, `stop`.** Done when `vr` from a stopped emulator reaches the headset with no
+3. **`vr`, `desktop`, `stop`.** *Built (2026-10-11).* To check in the headset. Done when `vr` from a stopped emulator reaches the headset with no
    other command; closing the bridge and running `vr` again reconnects without a boot; and a
    source changed, then `vr`, rebuilds and redeploys only that part.
-4. **The window.** The status, Start VR, Desktop and Stop first, then Set up with its OTA picker and
+4. **The window.** *Built (2026-10-11)*, the headset controls included; it also follows a VR
+   bridge SteamVR started (2026-10-12). To check in the headset. The status, Start VR, Desktop and Stop first, then Set up with its OTA picker and
    progress, then the headset controls (with `prism_vr`'s `--control`). Done when everything from
    a fresh clone to Horizon in the headset, the controls included, works from the window without a
    console.
-5. **SteamVR's library.** Done when Prism starts from the library in the headset, and quitting it
+5. **SteamVR's library.** *Built (2026-10-12).* `prism.py steamvr register` writes
+   `work/steamvr/prism.vrmanifest` (pythonw running `prism.py vr --from-steamvr`) and adds it through
+   `IVRApplications_007` while SteamVR runs, or to `appconfig.json` while it doesn't; the window has
+   the button, and `doctor` says whether it's there. Launched from it, the bridge starts before setup
+   and the boot, so SteamVR gets its session at once, and its controls come over `CONTROL_PORT`
+   (7341), which the window uses for a bridge it didn't start. The emulator breaks away from the
+   launcher's job. Tested without a headset: the launch as SteamVR makes it (pythonw, the log, setup,
+   ready at 88 frames a second, the bridge started) and the window driving a stand-in bridge over the
+   port. Still to check in the headset: whether SteamVR counts `prism_vr.exe`, a grandchild, as the
+   app. Done when Prism starts from the library in the headset, and quitting it
    from SteamVR's dashboard leaves the emulator running for the next start.
-6. **Docs.** README's quick start becomes: open `Prism.cmd`, pick the OTA, Set up, Start VR. The
+6. **Docs.** *Done (2026-10-12).* README's quick start becomes: open `Prism.cmd`, pick the OTA, Set up, Start VR. The
    commands are listed under it, and [m1-progress.md](m1-progress.md)'s commands stay as what
    `setup` does underneath.
 7. **Experiment: boot from a snapshot.** A quick-boot snapshot taken once Home is drawn would skip

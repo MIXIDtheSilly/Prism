@@ -120,7 +120,31 @@ static ANativeWindow *create_host_window(JNIEnv *env, const char *name, int widt
   return window;
 }
 
-static ANativeWindow *host_window(const char *name, int width, int height) {
+// The default display's size into width and height; whether it got it.
+static int display_size(JNIEnv *env, int *width, int *height) {
+  jclass global_class = (*env)->FindClass(env, "android/hardware/display/DisplayManagerGlobal");
+  jclass display_class = (*env)->FindClass(env, "android/view/Display");
+  jclass point_class = (*env)->FindClass(env, "android/graphics/Point");
+  if (failed(env, "FindClass")) return 0;
+  jobject global = (*env)->CallStaticObjectMethod(
+      env, global_class,
+      (*env)->GetStaticMethodID(env, global_class, "getInstance", "()Landroid/hardware/display/DisplayManagerGlobal;"));
+  if (failed(env, "DisplayManagerGlobal.getInstance") || !global) return 0;
+  jobject display = (*env)->CallObjectMethod(
+      env, global, (*env)->GetMethodID(env, global_class, "getRealDisplay", "(I)Landroid/view/Display;"), 0);
+  if (failed(env, "DisplayManagerGlobal.getRealDisplay") || !display) return 0;
+  jobject point = (*env)->NewObject(env, point_class, (*env)->GetMethodID(env, point_class, "<init>", "()V"));
+  (*env)->CallVoidMethod(env, display, (*env)->GetMethodID(env, display_class, "getRealSize", "(Landroid/graphics/Point;)V"),
+                         point);
+  if (failed(env, "Display.getRealSize")) return 0;
+  *width = (*env)->GetIntField(env, point, (*env)->GetFieldID(env, point_class, "x", "I"));
+  *height = (*env)->GetIntField(env, point, (*env)->GetFieldID(env, point_class, "y", "I"));
+  return *width > 0 && *height > 0;
+}
+
+// A host window of width x height; without a size, the display's (the compositor's output window
+// reports none: its buffers take the size of the display it scans out to).
+static ANativeWindow *host_window(int width, int height) {
   typedef jint (*GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
   GetCreatedJavaVMs get_vms = (GetCreatedJavaVMs)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
   JavaVM *vm = NULL;
@@ -133,6 +157,14 @@ static ANativeWindow *host_window(const char *name, int width, int height) {
     attached = 1;
   }
   (*env)->PushLocalFrame(env, 32);
+  if (width <= 0 || height <= 0) {
+    int known = display_size(env, &width, &height);
+    LOGW("arm64 window: no size, using %s, %d x %d", known ? "the display's" : "a default", known ? width : 1920,
+         known ? height : 1080);
+    if (!known) width = 1920, height = 1080;
+  }
+  char name[64];
+  snprintf(name, sizeof name, "Prism arm64 window %dx%d", width, height);
   ANativeWindow *window = create_host_window(env, name, width, height);
   (*env)->PopLocalFrame(env, NULL);
   if (attached) (*vm)->DetachCurrentThread(vm);
@@ -154,13 +186,7 @@ static void *host_window_for(void *win) {
       query(win, NATIVE_WINDOW_DEFAULT_WIDTH, &width);
       query(win, NATIVE_WINDOW_DEFAULT_HEIGHT, &height);
     }
-    if (width <= 0 || height <= 0) {
-      LOGW("arm64 window %p: no size (%d x %d), using 1920 x 1080", win, width, height);
-      width = 1920, height = 1080;
-    }
-    char name[64];
-    snprintf(name, sizeof name, "Prism arm64 window %dx%d", width, height);
-    host = host_window(name, width, height);
+    host = host_window(width, height);
     if (host && g_window_count < MAX_WINDOWS) {
       g_windows[g_window_count].guest = win;
       g_windows[g_window_count++].host = host;

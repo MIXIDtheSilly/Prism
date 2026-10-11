@@ -68,8 +68,9 @@ constexpr double kAimDepth = 1.08;
 // What each eye's half of the display shows, as tangents of its edges' angles (left, right, up,
 // down), from the head's center: the compositor draws the display's halves without the eyes'
 // offsets. Fitted to where the pointer's dot lands, within a pixel or two: the middle of what apps
-// render (their FOV reaches -1.1504..1.0 across), undistorted.
-constexpr double kViews[2][4] = {{-0.7128, 0.6559, 0.7357, -0.8040}, {-0.6559, 0.7128, 0.7357, -0.8040}};
+// render (their FOV reaches -1.1504..1.0 across), undistorted: deploy's metersPerTanAngCtr makes
+// the halves nearly that wide (1.48 times what the compositor's default shows, which was fitted first).
+constexpr double kViews[2][4] = {{-1.0546, 0.9704, 1.0885, -1.1895}, {-0.9704, 1.0546, 1.0885, -1.1895}};
 // The runtime's aim pose is the published pose turned this many degrees left (xrprobe: q 0 .0436
 // 0 .999) and moved this far (xrprobe: p -.009 0 0); the viewer publishes it turned back.
 constexpr double kAimTurn = 5.0;
@@ -219,6 +220,8 @@ struct Frames {
     std::atomic<uint32_t> count{0};  // new frames since the stats last looked
 };
 Frames g_frames;
+// One frame's time at the rate the emulator says it shares (VideoInfo.fps), for the stats colors.
+std::atomic<float> g_budget_ms{1000.0f / 60.0f};
 
 // Opens the emulator's frames (waiting for the emulator if need be) and signals each new one.
 void frames_thread(int emulatorPort)
@@ -240,6 +243,7 @@ void frames_thread(int emulatorPort)
         }
         const auto* info = reinterpret_cast<const volatile VideoInfo*>(base);
         const uint32_t frame = info->frame;
+        if (const uint32_t fps = info->fps; fps >= 10 && fps <= 240) g_budget_ms = 1000.0f / fps;
         if (frame != last && info->width && info->height) {
             last = frame;
             ++g_frames.count;
@@ -509,10 +513,11 @@ D3D11_VIEWPORT fit(float w, float h, float aspect)
     return {(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
 }
 
-// Frame-time bar color: within a 60 fps budget green, within 30 fps yellow, else red.
+// Frame-time bar color: within a frame at the shared rate (5% slack) green, within two frames yellow, else red.
 D2D1_COLOR_F frame_color(float ms)
 {
-    return ms <= 17.5f ? D2D1::ColorF(0.3f, 0.85f, 0.4f) : ms <= 33.4f ? D2D1::ColorF(0.95f, 0.8f, 0.2f) : D2D1::ColorF(0.95f, 0.3f, 0.25f);
+    const float budget = g_budget_ms;
+    return ms <= budget * 1.05f ? D2D1::ColorF(0.3f, 0.85f, 0.4f) : ms <= budget * 2.0f + 0.1f ? D2D1::ColorF(0.95f, 0.8f, 0.2f) : D2D1::ColorF(0.95f, 0.3f, 0.25f);
 }
 
 void draw_overlay()
@@ -566,7 +571,7 @@ void draw_overlay()
         d2d.FillRectangle(D2D1::RectF(left, std::max(graphTop, graphBottom - frames[i] * scale), left + barWidth, graphBottom), g_app.brush.Get());
     }
     g_app.brush->SetColor(D2D1::ColorF(1, 1, 1, 0.35f));
-    for (float ms : {16.7f, 33.3f})
+    for (float ms : {g_budget_ms.load(), g_budget_ms.load() * 2})
         d2d.DrawLine(D2D1::Point2F(x + 10, graphBottom - ms * scale), D2D1::Point2F(x + width - 10, graphBottom - ms * scale), g_app.brush.Get());
     d2d.EndDraw();
 }

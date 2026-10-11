@@ -3,8 +3,10 @@
 Prism uses its own AVD (prism-api34) on its own port, so it never touches other AVDs.
 
     python tools/emulator.py create            # write the AVD (stock API 34 x86_64 image)
-    python tools/emulator.py start [--headless] [--wait]  # boot it in a window: writable system, SELinux permissive
+    python tools/emulator.py config [--display WxH] [--memory MB] [--cores N]  # change the AVD; next start
+    python tools/emulator.py start [--headless|--window] [--wait]  # boot it: writable system, SELinux permissive; windowless above 60 Hz
     python tools/emulator.py wait              # until Android reports boot completed
+    python tools/emulator.py patch-share-vid [--rate HZ] [--undo]  # -share-vid shares more than 60 frames a second
     python tools/emulator.py clock             # reboot until the guest's clock is the TSC (start --wait does this)
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
@@ -15,6 +17,7 @@ Prism uses its own AVD (prism-api34) on its own port, so it never touches other 
 """
 import argparse
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -29,6 +32,16 @@ LOG_DIR = os.path.join('work', 'logs')
 # The display's refresh rate. The emulator shares at most 60 frames a second (-share-vid, a frame within
 # 1/60 s of the last skipped), and deploy runs Meta's compositor at this rate.
 DISPLAY_HZ = 60
+# The display's size. Each half is an eye, shown over the same angles whatever the size (deploy's
+# metersPerTanAngCtr), so more pixels make it sharper: 2560x1440 gives about 630 pixels a tangent
+# unit, near what a Quest renders at the middle of its view (1920x1080 gave 474). Keep it 16:9.
+DISPLAY = (2560, 1440)
+# Android's density buckets; the display takes the one nearest 320 at 1080 rows, so its 2D UI keeps its size.
+DENSITIES = (160, 213, 240, 280, 320, 360, 400, 420, 440, 480, 560, 640)
+
+
+def density(height):
+    return min(DENSITIES, key=lambda d: abs(d - 320 * height / 1080))
 
 
 def sdk_root():
@@ -79,8 +92,8 @@ def create(args):
         'abi.type': 'x86_64', 'hw.cpu.arch': 'x86_64', 'hw.cpu.ncore': str(args.cores),
         'hw.ramSize': str(args.memory), 'vm.heapSize': '512M', 'disk.dataPartition.size': '24G',
         'hw.gpu.enabled': 'yes', 'hw.gpu.mode': 'host', 'hw.gltransport': 'asg',
-        # A landscape 1080p display, the shape a desktop window of Horizon will have.
-        'hw.lcd.width': '1920', 'hw.lcd.height': '1080', 'hw.lcd.density': '320',
+        # A landscape 16:9 display, the shape a desktop window of Horizon will have: see DISPLAY.
+        'hw.lcd.width': str(DISPLAY[0]), 'hw.lcd.height': str(DISPLAY[1]), 'hw.lcd.density': str(density(DISPLAY[1])),
         # At 72 Hz only every other frame (36 a second) reached the viewer: see DISPLAY_HZ.
         'hw.lcd.vsync': str(DISPLAY_HZ),
         'hw.initialOrientation': 'landscape', 'hw.keyboard': 'yes', 'hw.mainKeys': 'no',
@@ -117,13 +130,137 @@ def running():
     return listed()
 
 
+def config_path():
+    return os.path.join(avd_home(), AVD + '.avd', 'config.ini')
+
+
+def avd_config():
+    try:
+        with open(config_path()) as f:
+            return dict(line.rstrip('\n').split('=', 1) for line in f if '=' in line)
+    except OSError:
+        return {}
+
+
+def refresh_rate():
+    """The AVD's display refresh rate in Hz: what deploy sets the compositor and apps to."""
+    try:
+        return int(avd_config().get('hw.lcd.vsync', DISPLAY_HZ))
+    except ValueError:
+        return DISPLAY_HZ
+
+
 def cores():
     try:
-        with open(os.path.join(avd_home(), AVD + '.avd', 'config.ini')) as f:
-            config = dict(line.rstrip('\n').split('=', 1) for line in f if '=' in line)
-        return int(config.get('hw.cpu.ncore', '1'))
-    except (OSError, ValueError):
+        return int(avd_config().get('hw.cpu.ncore', '1'))
+    except ValueError:
         return 1
+
+
+def display():
+    """The AVD's display size (width, height)."""
+    config = avd_config()
+    try:
+        return int(config['hw.lcd.width']), int(config['hw.lcd.height'])
+    except (KeyError, ValueError):
+        return DISPLAY
+
+
+def configure(args):
+    """Changes the existing AVD's display, memory or CPUs from its next start; with none given,
+    prints them. The emulator's frame mapping keeps the size it was made with while anything has it
+    open, so tools/viewer.py and tools/steamvr.py are closed before it restarts at another size."""
+    config = avd_config()
+    if not config:
+        sys.exit(f'{config_path()} is missing; run create first')
+    changes = {}
+    if args.display:
+        try:
+            width, height = (int(n) for n in args.display.lower().split('x'))
+        except ValueError:
+            sys.exit(f'--display takes WIDTHxHEIGHT, not {args.display!r}')
+        if width * 9 != height * 16:
+            print(f'warning: {width}x{height} is not 16:9, which the fitted view edges (kViews) assume')
+        changes.update({'hw.lcd.width': str(width), 'hw.lcd.height': str(height),
+                        'hw.lcd.density': str(density(height))})
+    if args.refresh:
+        changes['hw.lcd.vsync'] = str(args.refresh)
+    if args.memory:
+        changes['hw.ramSize'] = str(args.memory)
+    if args.cores:
+        changes['hw.cpu.ncore'] = str(args.cores)
+    if not changes:
+        print(f'display {config.get("hw.lcd.width")}x{config.get("hw.lcd.height")} at {refresh_rate()} Hz '
+              f'(density {config.get("hw.lcd.density")}), memory {config.get("hw.ramSize")} MB, '
+              f'{config.get("hw.cpu.ncore")} cores')
+        return
+    config.update(changes)
+    with open(config_path(), 'w', newline='\n') as f:
+        f.writelines(f'{k}={v}\n' for k, v in config.items())
+    print('set ' + ', '.join(f'{k}={v}' for k, v in changes.items()))
+    if args.refresh:
+        print('the compositor and apps take the rate from deploy: run python tools/deploy.py after the restart')
+    if running():
+        if args.display:
+            # Deploy's frontbufferHeight follows the display; set it now so the restart needs no deploy.
+            root(argparse.Namespace(timeout=300))
+            shell(f"sed -i 's/^{FRONTBUFFER}=.*/{FRONTBUFFER}={height}/' {PRODUCT_PROPS}", check=False)
+        print('from the next start: close the viewer and prism_vr, then '
+              'python tools/emulator.py stop, python tools/emulator.py start --wait')
+
+
+# The emulator's frame sharing (-share-vid, VideoFrameSharer) skips a frame that comes within 1/fps of
+# the last, and its constructor starts fps at 60: `mov dword ptr [rcx + 8], 60`, the field VideoInfo
+# also reports. At 72 Hz only every other frame (36 a second) got through. Patching that immediate is
+# the whole change, made only where the instructions around it match (emulator 37.1.11), in both
+# builds; the SDK's originals are kept beside them as <name>.orig. Nothing of the emulator is in the repo.
+SHARER_BINARIES = ('qemu-system-x86_64.exe', 'qemu-system-x86_64-headless.exe')
+SHARER_BEFORE = bytes.fromhex('44894104c74108')  # mov [rcx + 4], r8d; mov dword ptr [rcx + 8], imm32
+SHARER_AFTER = bytes.fromhex('0f57c0')  # xorps xmm0, xmm0
+
+
+def sharer_path(name):
+    return os.path.join(sdk_root(), 'emulator', 'qemu', 'windows-x86_64', name)
+
+
+def sharer_site(data):
+    """The offset of the rate's immediate in a binary's image, or None unless exactly one place fits."""
+    pattern = re.escape(SHARER_BEFORE) + rb'[\x01-\xff]\x00\x00\x00' + re.escape(SHARER_AFTER)
+    sites = [m.start() + len(SHARER_BEFORE) for m in re.finditer(pattern, bytes(data), re.DOTALL)]
+    return sites[0] if len(sites) == 1 else None
+
+
+def patch_share_vid(args):
+    """Sets the most frames a second the emulator shares (the AVD's refresh rate, or --rate); --undo
+    restores the installed builds. The emulator has to be stopped: Windows locks a running executable."""
+    if running():
+        sys.exit('stop the emulator first (python tools/emulator.py stop)')
+    rate = args.rate or refresh_rate()
+    if not 1 <= rate <= 255:
+        sys.exit('the rate has to fit in one byte (1-255)')
+    for name in SHARER_BINARIES:
+        path = sharer_path(name)
+        if args.undo:
+            if os.path.exists(path + '.orig'):
+                shutil.copyfile(path + '.orig', path)
+                print(f'{name}: restored')
+            else:
+                print(f'{name}: nothing to restore')
+            continue
+        with open(path, 'rb') as f:
+            data = bytearray(f.read())
+        site = sharer_site(data)
+        if site is None:
+            sys.exit(f'{name}: not a build whose frame sharing this knows (emulator 37.1.11 is); nothing changed')
+        if data[site] == rate:
+            print(f'{name}: already shares up to {rate} frames a second')
+            continue
+        if not os.path.exists(path + '.orig'):
+            shutil.copyfile(path, path + '.orig')
+        was, data[site] = data[site], rate
+        with open(path, 'wb') as f:
+            f.write(data)
+        print(f'{name}: shares up to {rate} frames a second (was {was})')
 
 
 def start(args):
@@ -141,7 +278,9 @@ def start(args):
                # the display (and the viewer) lost frames while the compositor kept 60. With this the
                # HAL composes asynchronously (rcComposeAsync).
                '-feature', 'AsyncComposeSupport']
-    if args.headless:
+    # The emulator's own window composites every frame on the host; at 90 Hz that cost the guest half
+    # its frames (the viewer reads the shared frames, so nothing needs the window).
+    if args.headless or (refresh_rate() > 60 and not args.window):
         command.append('-no-window')
     if args.wipe:
         command.append('-wipe-data')
@@ -288,6 +427,7 @@ def status(args):
 # changes only with a reboot.
 FLAG = 'ro.kernel.qemu'
 PRODUCT_PROPS = '/product/etc/build.prop'
+FRONTBUFFER = 'debug.oculus.frontbufferHeight'  # deploy sets it to the display's height
 
 
 def emulator_flag(args):
@@ -338,9 +478,18 @@ def main():
     c = sub.add_parser('create')
     c.add_argument('--force', action='store_true')
     c.add_argument('--cores', type=int, default=6)
-    c.add_argument('--memory', type=int, default=8192)
+    c.add_argument('--memory', type=int, default=12288)  # with 8192, Horizon's home had 3 GB in swap
+    cf = sub.add_parser('config')
+    cf.add_argument('--display', metavar='WxH', help=f'e.g. {DISPLAY[0]}x{DISPLAY[1]} (16:9)')
+    cf.add_argument('--refresh', type=int, metavar='HZ', help='the display refresh rate; deploy again after')
+    cf.add_argument('--memory', type=int, metavar='MB')
+    cf.add_argument('--cores', type=int)
+    ps = sub.add_parser('patch-share-vid')
+    ps.add_argument('--rate', type=int, help="frames a second (default: the AVD's refresh rate)")
+    ps.add_argument('--undo', action='store_true', help='restore the emulator builds as installed')
     s = sub.add_parser('start')
-    s.add_argument('--headless', action='store_true', help='no emulator window')
+    s.add_argument('--headless', action='store_true', help='no emulator window (the default above 60 Hz)')
+    s.add_argument('--window', action='store_true', help='keep the emulator window above 60 Hz too')
     s.add_argument('--wipe', action='store_true', help='reset /data on this boot')
     s.add_argument('--wait', action='store_true', help='until boot completes, then until the clock is the TSC')
     s.add_argument('--idle-poll', action='store_true', help='idle vCPUs spin instead of halting (faster wake-ups, a busy host thread per vCPU)')
@@ -360,8 +509,8 @@ def main():
     if args.command == 'adb':
         subprocess.run([adb_path(), '-s', SERIAL, *args.rest])
         return
-    {'create': create, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
-     'stop': stop, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
+    {'create': create, 'config': configure, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
+     'stop': stop, 'patch-share-vid': patch_share_vid, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
 
 
 if __name__ == '__main__':

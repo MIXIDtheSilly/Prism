@@ -145,6 +145,9 @@ DEVICE_PROPS = '/system/etc/device_props.json'  # vrdevice: chipset, default ref
 SCHED_FEATURES = ('mount -t debugfs debugfs /sys/kernel/debug; '
                   'echo NO_TTWU_QUEUE > /sys/kernel/debug/sched/features; umount /sys/kernel/debug')
 DATA_ROOT = '/data/prism'
+# debug.oculus.metersPerTanAngCtr: the compositor's window per eye (see prism_props); viewer.cpp's and
+# prism_vr.cpp's kViews are fitted to it.
+METERS_PER_TAN_ANGLE = '0.0264'
 
 # ARM64 code runs through Digitalis (tools/translator.py), which replaces the stock image's
 # libndk_translation: Horizon is built with ARMv8.1 atomics that the stock translator lacks.
@@ -400,6 +403,9 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
     # Digitalis moves a hot region to its optimizing tier only from 20 instructions up by default;
     # VrShell's and the compositor's hot loops are many short regions. 0 lets any hot region gear up.
     props['berberis.gearup_min_insns'] = '0'
+    # Digitalis logs every region it translates at debug level (~12,000 lines a minute while apps
+    # start, 311,000 of one hour's log): each one is formatted in translated code and sent to logd.
+    props['log.tag.berberis'] = 'I'
     props['ro.hardware.vulkan'] = VULKAN_DRIVER  # overrides /vendor/build.prop's: product loads last
     # Meta's compositor on Vulkan, which shares clients' swapchains through Prism's Vulkan driver.
     # On GL, VrShell aborts at its first surface swapchain: the compositor's surface reaches the
@@ -415,13 +421,20 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
     # image first; on one screen the last slice's clear erased the others. One slice, the height of
     # the window, renders the frame in one pass.
     props['ro.ovr.sliceCountY'] = '1'
-    props['debug.oculus.frontbufferHeight'] = '1080'
+    props[emulator.FRONTBUFFER] = str(emulator.display()[1])
     # The compositor's vsync starts at the device's default rate (72) whatever the display reports,
-    # and the emulator's display is 60 Hz (emulator.DISPLAY_HZ), so 72 frames a second became 60 on
+    # and the emulator's display has its own rate (emulator.refresh_rate()), 60 by default, so 72 frames a second became 60 on
     # screen and in the viewer, one dropped in six, unevenly. "<rate>[:2 for half]" forces a rate; it
     # must be one the display offers (the runtime logs them, SupportedDisplayRefreshRates). Clients
     # take theirs from vrdevice's default instead (DEVICE_PROPS), which deploy sets to match.
-    props['debug.oculus.refreshRate'] = str(emulator.DISPLAY_HZ)
+    props['debug.oculus.refreshRate'] = str(emulator.refresh_rate())
+    # Each eye's half of the window is a physical screen seen through the compositor's default
+    # headset (Quest 1's, which it takes the emulator for): metersPerTanAngCtr sets how many meters
+    # of it make a tangent unit, so the half shows 1.37 across with its default (~0.041) and the
+    # whole of what apps render (2.15 across, as xrprobe logs) with 0.0264, with a little black
+    # round it. Properties are read from "headsetOverride" 1 on, when the runtime starts.
+    props['debug.oculus.headsetOverride'] = '1'
+    props['debug.oculus.metersPerTanAngCtr'] = METERS_PER_TAN_ANGLE
     # VrShell gives its environment 15 s to load, times the device's timeout multiplier when Meta's
     # switch allows it. Under translation the load takes 15 s to well over a minute, so it failed on
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
@@ -671,7 +684,7 @@ def build(args):
     # vrdevice's device properties, with the display's rate as the default refresh rate. Apps take
     # their rate from it: VrShell restarted alone timed its frames for 72 against a 60 Hz compositor.
     text = images['system'].read(images['system'].lookup(DEVICE_PROPS)).decode()
-    text, n = re.subn(r'("device_default_refresh_rate"\s*:\s*")[^"]*"', rf'\g<1>{emulator.DISPLAY_HZ}.0"', text)
+    text, n = re.subn(r'("device_default_refresh_rate"\s*:\s*")[^"]*"', rf'\g<1>{emulator.refresh_rate()}.0"', text)
     if n != 1:
         sys.exit(f'{DEVICE_PROPS} has no device_default_refresh_rate; check its format')
     overlay.add(DEVICE_PROPS, 'f', 0o644, data=text.encode())
@@ -713,7 +726,15 @@ def build(args):
               '# Apps render only while the headset is worn. There is no proximity sensor, so Prism tells',
               '# VrPowerManagerService the headset is on (its virtual proximity, a developer setting).',
               'on property:sys.boot_completed=1',
-              f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close']
+              f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/am broadcast -a com.oculus.vrpowermanager.prox_close',
+              '',
+              '# SurfaceFlinger renders at half the display\'s rate (45 of 90 Hz: its scheduler lists the time it',
+              '# spends at each) unless something asks for more, and nothing in Horizon does: the display is',
+              '# one 90 Hz mode, but the compositor\'s layer then gets half of its frames. These Settings are',
+              '# Android\'s minimum and peak refresh rates; with both at the display\'s rate it stays there.',
+              f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/sh -c '
+              f'"settings put system min_refresh_rate {emulator.refresh_rate()}.0; '
+              f'settings put system peak_refresh_rate {emulator.refresh_rate()}.0"']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())
     overlay.add(META_PARAMS_SCRIPT, 'f', 0o755, data=meta_params_script().encode())
 
@@ -809,7 +830,13 @@ def apply(args, replaced):
         sys.exit(f'applying failed:\n{out}')
     if not args.no_reboot:
         adb('reboot')
-        print('rebooting into Horizon\'s framework')
+        print('rebooting into Horizon\'s framework', flush=True)
+        # As `emulator.py start --wait` does: a boot on HPET runs everything slower (90 Hz drops
+        # to about 81 shared frames a second), which would pass for a regression.
+        time.sleep(5)
+        adb('wait-for-device')
+        if emulator.wait(args):
+            emulator.ensure_tsc(args)
 
 
 def main():

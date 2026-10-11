@@ -192,6 +192,41 @@ RESOLVE_EMPTY_FETCH = Splice(
     sget-object v0, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}''',
     reason='an empty fetch is resolved too (no Meta account: the library has only local apps)')
 
+# The Library app's system bar waits for the signed-in user's id (ActiveImmersiveRepositoryImpl's
+# active immersive app flow) by asking for it again at once while it's empty: without a Meta account,
+# a dispatcher thread at 55% of a vCPU and system_server's binder threads at about as much again
+# answering getDefaultAccount, for good. It asks once a second instead. (X/28c is R8's name for the
+# flow's coroutine, one of many it merged into that class.)
+ACTIVE_IMMERSIVE = 'Lcom/oculus/userdata/activeimmersive/impl/ActiveImmersiveRepositoryImpl;'
+WAIT_FOR_USER_ID = Splice(
+    'LX/28c;', 'invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;',
+    f'''iget-object v2, v0, LX/28c;->A03:Ljava/lang/Object;
+    check-cast v2, {ACTIVE_IMMERSIVE}
+    iget-object v2, v2, {ACTIVE_IMMERSIVE}->A03:LX/00O;
+    invoke-interface {{v2}}, LX/00O;->invoke()Ljava/lang/Object;
+    move-result-object v3
+    check-cast v3, Ljava/lang/String;
+    if-eqz v3, :cond_33
+    invoke-virtual {{v3}}, Ljava/lang/String;->length()I
+    move-result v2
+    if-eqz v2, :cond_33''',
+    f'''    iget-object v2, v0, LX/28c;->A03:Ljava/lang/Object;
+    check-cast v2, {ACTIVE_IMMERSIVE}
+    iget-object v2, v2, {ACTIVE_IMMERSIVE}->A03:LX/00O;
+    invoke-interface {{v2}}, LX/00O;->invoke()Ljava/lang/Object;
+    move-result-object v3
+    check-cast v3, Ljava/lang/String;
+    if-eqz v3, :prism_no_user
+    invoke-virtual {{v3}}, Ljava/lang/String;->length()I
+    move-result v2
+    if-nez v2, :prism_user
+    :prism_no_user
+    const-wide/16 v4, 0x3e8
+    invoke-static {{v4, v5}}, Ljava/lang/Thread;->sleep(J)V
+    goto :cond_33
+    :prism_user''',
+    reason="the system bar asks for the user's id once a second, not continuously (no Meta account)")
+
 # Meta's SurfaceFlinger gives each window's input handle an XrWindowInfo (its volumetric window, pose,
 # size and shape), which the volumetric window service follows. Stock SurfaceFlinger has none to give,
 # and the listener threw on the first window, once for every change of windows. Windows without one
@@ -272,6 +307,7 @@ BRIDGES = {
     '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO,
                                                        TO_MIRROR_DISPLAY],
     '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH],
+    '/system_ext/priv-app/LibraryPanelApp/LibraryPanelApp.apk': [WAIT_FOR_USER_ID],
 }
 
 
@@ -389,7 +425,7 @@ def patch_jar(data, bridges, workdir):
         smali.run('baksmali', 'd', dex_path, '-o', out_dir)
         patched = set()
         for cls in defined:
-            path = os.path.join(out_dir, *cls[1:-1].split('/')) + '.smali'
+            path = class_file(out_dir, cls)
             with open(path, encoding='utf-8') as f:
                 text = f.read()
             for b in by_class.pop(cls):
@@ -430,6 +466,23 @@ def patch_jar(data, bridges, workdir):
     if unused:
         sys.exit(f'members to rewrite that the jar never uses: {", ".join(sorted(unused))}')
     return replaced
+
+
+def class_file(out_dir, cls):
+    """The smali file baksmali wrote cls to. On a case-insensitive file system classes whose names
+    differ only in case (R8's X/28c and X/28C) can't share a name; baksmali numbers the later ones
+    (28c.1.smali), so the file is the one whose .class line names cls."""
+    path = os.path.join(out_dir, *cls[1:-1].split('/'))
+    folder, base = os.path.split(path)
+    for name in [base + '.smali'] + sorted(n for n in os.listdir(folder)
+                                          if re.fullmatch(re.escape(base) + r'\.\d+\.smali', n, re.I)):
+        candidate = os.path.join(folder, name)
+        if not os.path.exists(candidate):
+            continue
+        with open(candidate, encoding='utf-8') as f:
+            if f.readline().split()[-1] == cls:
+                return candidate
+    sys.exit(f'{cls}: no smali file declares it under {folder}')
 
 
 def repack_jar(data, replaced):

@@ -1,6 +1,7 @@
 """Build Prism's tracking service (native/tracking_prism): hosts Meta's MemoryBroker and keeps the
 head tracker's and controllers' shared memory, which a headset's trackingservice fills from its
-cameras and IMUs, and serves CMSHeadset's controller tracking service.
+cameras and IMUs, and serves CMSHeadset's controller tracking service and the runtime's haptics
+service.
 An arm64 binary: it loads Meta's arm64 libraries, and runs through the translator.
 
     work/build/tracking/prism_tracking   installed in /system_ext/bin
@@ -17,7 +18,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, 'jni'))
 from build import API, find_ndk  # noqa: E402
 
-SOURCES = [os.path.join(ROOT, 'native', 'tracking_prism', name) for name in ('tracking_prism.c', 'controller_tracking.c')]
+SOURCES = [os.path.join(ROOT, 'native', 'tracking_prism', name) for name in ('tracking_prism.c', 'controller_tracking.c', 'haptics.c')]
 BINARY = 'prism_tracking'
 
 

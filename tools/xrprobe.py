@@ -104,20 +104,29 @@ def signing_key(out):
     return key, cert
 
 
-def khronos_loader(ndk):
-    """Khronos's OpenXR loader for arm64 Android, built from the SDK's source (Apache 2.0)."""
-    top = os.path.join(ROOT, 'work', 'build', 'openxr-sdk')
-    lib = os.path.join(top, 'build-arm64', 'src', 'loader', 'libopenxr_loader.so')
-    if os.path.exists(lib):
-        return lib
-    source = os.path.join(top, f'OpenXR-SDK-{LOADER}')
+SDK_TOP = os.path.join(ROOT, 'work', 'build', 'openxr-sdk')
+
+
+def openxr_sdk():
+    """The OpenXR SDK's source (headers and loader), downloaded once."""
+    source = os.path.join(SDK_TOP, f'OpenXR-SDK-{LOADER}')
     if not os.path.isdir(source):
-        os.makedirs(top, exist_ok=True)
-        archive = os.path.join(top, 'sdk.tar.gz')
+        os.makedirs(SDK_TOP, exist_ok=True)
+        archive = os.path.join(SDK_TOP, 'sdk.tar.gz')
         urllib.request.urlretrieve(f'https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/{LOADER}.tar.gz', archive)
         import tarfile
         with tarfile.open(archive) as t:
-            t.extractall(top)
+            t.extractall(SDK_TOP)
+    return source
+
+
+def khronos_loader(ndk):
+    """Khronos's OpenXR loader for arm64 Android, built from the SDK's source (Apache 2.0)."""
+    top = SDK_TOP
+    lib = os.path.join(top, 'build-arm64', 'src', 'loader', 'libopenxr_loader.so')
+    if os.path.exists(lib):
+        return lib
+    source = openxr_sdk()
     sdk = os.path.dirname(os.path.dirname(adb_path()))
     cmake_bin = os.path.join(sorted(glob.glob(os.path.join(sdk, 'cmake', '*')))[-1], 'bin')
     exe = '.exe' if os.name == 'nt' else ''

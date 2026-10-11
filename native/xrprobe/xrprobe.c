@@ -1,9 +1,11 @@
 /*
  * xrprobe: an OpenXR app that reports what Horizon's runtime gives it, for seeing why an app's
  * controllers aren't there. It binds the controllers as VrShell does (grip and aim poses, the
- * trigger's value, for Touch Plus and Touch), runs a session, and logs (tag XrProbe) every event
- * and, once a second: xrSyncActions's result, each hand's current interaction profile, the grip
- * and aim locations' flags in LOCAL space, the trigger, and the headset's own location. The runtime
+ * trigger's value and the thumbstick, for Touch Plus and Touch), runs a session, and logs (tag XrProbe)
+ * every event and, once a second: xrSyncActions's result, each hand's current interaction profile, the
+ * grip and aim locations' flags in LOCAL space, the trigger, the thumbstick (right and up positive, as
+ * OpenXR has it: for checking tracking_prism's axes) and the headset's own location. A trigger
+ * pressed past half vibrates its controller for 0.2 s (xrApplyHapticFeedback, logged). The runtime
  * runs in this process, so it also reads the runtime's own state (libvrapiimpl.so's, by address):
  * which way sync went, the controller snapshot it built, the session's selected profiles, each
  * input device's in-hand flag, and what the tracking client reads as in hand.
@@ -41,8 +43,8 @@ static XrInstance instance;
   F(xrBeginSession) F(xrEndSession) F(xrPollEvent) F(xrWaitFrame) F(xrBeginFrame) F(xrEndFrame)             \
   F(xrCreateReferenceSpace) F(xrCreateActionSpace) F(xrLocateSpace) F(xrStringToPath) F(xrPathToString)     \
   F(xrCreateActionSet) F(xrCreateAction) F(xrSuggestInteractionProfileBindings) F(xrAttachSessionActionSets) \
-  F(xrSyncActions) F(xrGetActionStateFloat) F(xrGetActionStatePose) F(xrGetCurrentInteractionProfile)       \
-  F(xrResultToString) F(xrGetOpenGLESGraphicsRequirementsKHR) F(xrLocateViews)
+  F(xrSyncActions) F(xrGetActionStateFloat) F(xrGetActionStateVector2f) F(xrGetActionStatePose) F(xrGetCurrentInteractionProfile)       \
+  F(xrResultToString) F(xrGetOpenGLESGraphicsRequirementsKHR) F(xrLocateViews) F(xrApplyHapticFeedback)
 
 #define DECLARE(name) static PFN_##name name;
 XR_FUNCTIONS(DECLARE)
@@ -114,7 +116,7 @@ static XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 static bool running;
 static XrSpace local, view, stage;
 static XrActionSet set;
-static XrAction grip, aim, trigger;
+static XrAction grip, aim, trigger, stick, buzzer;
 static XrPath hands[2];
 static XrSpace grip_space[2], aim_space[2];
 
@@ -198,7 +200,9 @@ static bool create_actions(void) {
     const char *name;
   } actions[] = {{&grip, XR_ACTION_TYPE_POSE_INPUT, "grip"},
                  {&aim, XR_ACTION_TYPE_POSE_INPUT, "aim"},
-                 {&trigger, XR_ACTION_TYPE_FLOAT_INPUT, "trigger"}};
+                 {&trigger, XR_ACTION_TYPE_FLOAT_INPUT, "trigger"},
+                 {&stick, XR_ACTION_TYPE_VECTOR2F_INPUT, "stick"},
+                 {&buzzer, XR_ACTION_TYPE_VIBRATION_OUTPUT, "buzzer"}};
   for (size_t i = 0; i < sizeof actions / sizeof *actions; i++) {
     XrActionCreateInfo info = {XR_TYPE_ACTION_CREATE_INFO, NULL, "", actions[i].type, 2, hands};
     strcpy(info.actionName, actions[i].name);
@@ -211,6 +215,8 @@ static bool create_actions(void) {
         {grip, path("/user/hand/left/input/grip/pose")},      {grip, path("/user/hand/right/input/grip/pose")},
         {aim, path("/user/hand/left/input/aim/pose")},        {aim, path("/user/hand/right/input/aim/pose")},
         {trigger, path("/user/hand/left/input/trigger/value")}, {trigger, path("/user/hand/right/input/trigger/value")},
+        {stick, path("/user/hand/left/input/thumbstick")},       {stick, path("/user/hand/right/input/thumbstick")},
+        {buzzer, path("/user/hand/left/output/haptic")},         {buzzer, path("/user/hand/right/output/haptic")},
     };
     XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, NULL, path(profiles[p]),
                                                       sizeof bindings / sizeof *bindings, bindings};
@@ -466,12 +472,30 @@ static void dump_session(void) {
   frames = engaged[0] = engaged[1] = engaged[2] = engaged[3] = read_ok[0] = read_ok[1] = 0;
 }
 
+// A trigger pressed past half vibrates its controller for 0.2 s.
+static void buzz(void) {
+  static bool pressed[2];
+  for (int h = 0; h < 2; h++) {
+    XrActionStateGetInfo get = {XR_TYPE_ACTION_STATE_GET_INFO, NULL, trigger, hands[h]};
+    XrActionStateFloat value = {XR_TYPE_ACTION_STATE_FLOAT};
+    bool now = xrGetActionStateFloat(session, &get, &value) == XR_SUCCESS && value.isActive && value.currentState > 0.5f;
+    if (now && !pressed[h]) {
+      XrHapticActionInfo info = {XR_TYPE_HAPTIC_ACTION_INFO, NULL, buzzer, hands[h]};
+      XrHapticVibration vibration = {XR_TYPE_HAPTIC_VIBRATION, NULL, 200000000, XR_FREQUENCY_UNSPECIFIED, 1.0f};
+      XrResult r = xrApplyHapticFeedback(session, &info, (const XrHapticBaseHeader *)&vibration);
+      LOG("%s trigger pressed: xrApplyHapticFeedback 0.2 s: %s", h ? "right" : "left", result(r));
+    }
+    pressed[h] = now;
+  }
+}
+
 static void report(XrTime time) {
   XrActiveActionSet active = {set, XR_NULL_PATH};
   XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO, NULL, 1, &active};
   before_sync();
   XrResult synced = xrSyncActions(session, &sync);
   after_sync();
+  if (synced == XR_SUCCESS) buzz();
   static int64_t last;
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -504,7 +528,11 @@ static void report(XrTime time) {
     XrActionStateFloat value = {XR_TYPE_ACTION_STATE_FLOAT};
     get.action = trigger;
     xrGetActionStateFloat(session, &get, &value);
-    LOG("  grip active %d, aim active %d, trigger active %d value %.2f", pose.isActive, aim_pose.isActive, value.isActive, value.currentState);
+    XrActionStateVector2f axes = {XR_TYPE_ACTION_STATE_VECTOR2F};
+    get.action = stick;
+    xrGetActionStateVector2f(session, &get, &axes);
+    LOG("  grip active %d, aim active %d, trigger active %d value %.2f, stick active %d %.2f %.2f", pose.isActive,
+        aim_pose.isActive, value.isActive, value.currentState, axes.isActive, axes.currentState.x, axes.currentState.y);
     locate("grip", grip_space[h], local, time);
     locate("aim", aim_space[h], local, time);
   }

@@ -16,13 +16,21 @@
  *   hand l|r px py pz qx qy qz qw       a controller's pose; until one comes it follows the head,
  *                                       held ahead of it and pointing where it looks
  *   follow l|r                          the controller follows the head again
- *   input l|r buttons trigger grip      its buttons (a mask of BUTTON_*) and its analog triggers (0-1)
+ *   input l|r buttons trigger grip [x y]
+ *                                       its buttons (a mask of BUTTON_*), its analog triggers (0-1) and
+ *                                       its thumbstick (-1 to 1, right and up positive; centered if not
+ *                                       given)
  * The last of each stays when the client goes. A short press of the right Meta button also goes to
- * VrShell as its system button press (see system_button).
+ * VrShell as its system button press (see system_button). Back to the client go the controllers'
+ * haptics (haptics.c), as lines:
+ *   haptic l|r amplitude [seconds]      its vibration (0-1): from now on (0 stops it), or a pulse of
+ *                                       that long
  *
  * Most regions hold snapshots as two copies behind two counters, started (+0) and completed (+4):
- * a writer counts the write started, writes the copy readers aren't taking and counts it done, and
- * a reader takes copy[completed & 1] and checks started hasn't moved (publish()).
+ * a writer counts the write started, writes copy[started & 1] and counts it done (publish()). A
+ * reader (libtrackingserviceclients) takes copy[completed & 1] and keeps it if started then equals
+ * completed; while a write is under way it takes copy[~started & 1], the one not being written,
+ * and starts again if started has moved since.
  *
  * The head tracker's region (libtrackingserviceclients' HeadTrackerSharedMemory, 0x1680 bytes):
  *   0x0000  the latest HeadState (two copies)
@@ -41,7 +49,10 @@
  *     their count and a generation (two copies at 8, 0x60 each)
  *   CONTROLLER, left and right (0x7f8 bytes): its capabilities (0x000), live input (0x040),
  *     thumbstick (0x250), descriptor (0x3d0: device id, model, firmware, handedness, strings) and
- *     battery (0x4a0). Buttons are counters of transitions, odd while down.
+ *     battery (0x4a0). Buttons are counters of transitions, odd while down. The thumbstick is a
+ *     snapshot of 7 bytes, 8 apart, as the tracking client reads them: touched, a byte not known, x
+ *     and y (u16s, over the capabilities' range of 65535, centered at 0x7fff; right is the larger x,
+ *     up the smaller y, as xrprobe's log of the thumbstick an app sees showed) and valid.
  *   CONTROLLER_TRACKING, left and right (0xe48 bytes): the latest pose sample (two copies of 0x78
  *     at 8), and a history of 32 (a sequence word at 0xf8, odd while a slot is written; slots at
  *     0x100). A sample is valid with its flag set, a nonzero quaternion and a time, and readers
@@ -51,7 +62,8 @@
  *   whose times, -1, mean no sample yet. Without a host, their clients ask the broker again and again.
  *
  * The host also serves CMSHeadset's controller tracking service (controller_tracking.c): the
- * controllers are tracked and in hand.
+ * controllers are tracked and in hand; and the haptics service (haptics.c): the runtime's vibration
+ * of the controllers, which goes to the client.
  *
  * The binder thread-pool calls are platform APIs the NDK doesn't declare, so they're looked up.
  */
@@ -73,6 +85,7 @@
 #include <unistd.h>
 
 int serve_controller_tracking(void);  // controller_tracking.c
+int serve_haptics(void);              // haptics.c
 
 #define TAG "PrismTracking"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -158,6 +171,18 @@ enum {
 #define DESCRIPTOR 0x3d0
 #define DESCRIPTOR_SIZE 0x64
 #define BATTERY 0x4a0
+// Haptic channels: three snapshots, 0x118 apart, of 0x85 bytes (copies 0x88 apart), as
+// libtrackingserviceclients' getDeviceChannelProperties reads them: the location (0), four
+// actuator entries of 0x20 bytes from 4 {u8 present, u32 type at +4, float sample rate at +8, u32
+// samples at +0xc, u32 at +0x10, u32 at +0x14 if the u8 at +0x18 is set, u32 at +0x1c} and valid
+// (0x84). The runtime's haptics plugin plays parametric effects (VrShell's) only at a location with
+// an entry of type 2 (buffered: amplitude samples) or 3; otherwise "Parametric haptics is not
+// supported for the location".
+#define HAPTIC_CHANNELS 0x4b0
+#define HAPTIC_CHANNEL_STRIDE 0x118
+#define HAPTIC_CHANNEL_SIZE 0x85
+#define HAPTIC_CHANNEL_COPY 0x88
+#define HAPTIC_BUFFERED 2
 
 struct pose_sample {
   uint8_t valid;
@@ -198,6 +223,7 @@ struct controller {
   int64_t last_ns;
   uint32_t buttons;
   float trigger, grip;
+  float stick[2];  // x y, -1 to 1
   uint64_t counters[BUTTONS];
   int64_t system_down_ns;  // when the Meta button went down
   int input_changed;
@@ -210,6 +236,7 @@ static float g_position[3], g_orientation[4] = {0, 0, 0, 1};  // the head's pose
 static struct controller g_controllers[2] = {{.hand = LEFT, .follow = 1}, {.hand = RIGHT, .follow = 1}};
 static uint8_t *g_input_map;
 static int g_map_published;  // the map in g_input_map lists the controllers
+static int g_client = -1;    // the pose client's socket, while connected
 
 static int64_t now_ns(void) {
   struct timespec ts;
@@ -323,6 +350,13 @@ static void publish_pose(struct controller *c) {
   append_history(c->tracking, &latest.sample);
 }
 
+// A thumbstick axis, -1 to 1, over the range 0-65535 centered at 0x7fff.
+static uint16_t stick_axis(float v) {
+  if (!(v > -1)) return 0;  // and NaN
+  if (v >= 1) return 0xffff;
+  return (uint16_t)lroundf(0x7fff + v * (v > 0 ? 0x8000 : 0x7fff));
+}
+
 // Counts each button's transitions since the last input: odd counts are buttons down.
 static void publish_input(struct controller *c) {
   uint8_t input[INPUT_SIZE] = {0};
@@ -335,6 +369,9 @@ static void publish_input(struct controller *c) {
   memcpy(input + 0x90, &c->trigger, sizeof c->trigger);
   memcpy(input + 0x94, &c->grip, sizeof c->grip);
   publish(c->input + INPUT, input, sizeof input, INPUT_STRIDE);
+  uint16_t x = stick_axis(c->stick[0]), y = stick_axis(-c->stick[1]);  // up is the smaller y
+  const uint8_t stick[7] = {c->stick[0] != 0 || c->stick[1] != 0, 0, x & 0xff, x >> 8, y & 0xff, y >> 8, 1};
+  publish(c->input + STICK, stick, sizeof stick, 8);
   c->input_changed = 0;
 }
 
@@ -360,6 +397,20 @@ static void controller_ready(void *context, void *memory) {
   seed(region + DESCRIPTOR, descriptor, sizeof descriptor, sizeof descriptor);
   const uint8_t battery[2] = {1, 100};  // valid, percent
   seed(region + BATTERY, battery, sizeof battery, sizeof battery);
+  // Each channel buffered, as Touch's haptics were: 320 Hz, up to 25 samples a submission.
+  for (int i = 0; i < 3; i++) {
+    uint8_t channel[HAPTIC_CHANNEL_SIZE] = {0};
+    const uint32_t type = HAPTIC_BUFFERED, samples = 25, optimal = 20;
+    const float rate = 320;
+    channel[0] = (uint8_t)i;  // its location
+    channel[4] = 1;
+    memcpy(channel + 4 + 0x04, &type, sizeof type);
+    memcpy(channel + 4 + 0x08, &rate, sizeof rate);
+    memcpy(channel + 4 + 0x0c, &samples, sizeof samples);
+    memcpy(channel + 4 + 0x10, &optimal, sizeof optimal);
+    channel[0x84] = 1;
+    seed(region + HAPTIC_CHANNELS + i * HAPTIC_CHANNEL_STRIDE, channel, sizeof channel, HAPTIC_CHANNEL_COPY);
+  }
   pthread_mutex_lock(&g_lock);
   c->input = region;
   publish_input(c);
@@ -490,7 +541,7 @@ static void system_button(struct controller *c, uint32_t buttons) {
 
 static void take_line(const char *line) {
   char name[8];
-  float p[3], q[4], trigger, grip;
+  float p[3], q[4], trigger, grip, stick[2] = {0, 0};
   unsigned buttons;
   struct controller *c;
   if (sscanf(line, "hand %7s %f %f %f %f %f %f %f", name, &p[0], &p[1], &p[2], &q[0], &q[1], &q[2], &q[3]) == 8) {
@@ -500,18 +551,35 @@ static void take_line(const char *line) {
     memcpy(c->orientation, q, sizeof q);
   } else if (sscanf(line, "follow %7s", name) == 1) {
     if ((c = controller_named(name))) c->follow = 1;
-  } else if (sscanf(line, "input %7s %i %f %f", name, (int *)&buttons, &trigger, &grip) == 4) {
+  } else if (sscanf(line, "input %7s %i %f %f %f %f", name, (int *)&buttons, &trigger, &grip, &stick[0], &stick[1]) >= 4) {
     if (!(c = controller_named(name))) return;
     system_button(c, buttons);
     c->buttons = buttons & ALL_BUTTONS;
     c->trigger = trigger;
     c->grip = grip;
+    memcpy(c->stick, stick, sizeof stick);
     c->input_changed = 1;
   } else if (sscanf(line, "%f %f %f %f %f %f %f", &p[0], &p[1], &p[2], &q[0], &q[1], &q[2], &q[3]) == 7) {
     if (!unit(q)) return;
     memcpy(g_position, p, sizeof p);
     memcpy(g_orientation, q, sizeof q);
   }
+}
+
+// A controller's vibration (haptics.c), to the client: by device id, as the input map has them;
+// seconds < 0: until the next.
+void haptic(uint64_t device, float amplitude, float seconds) {
+  const char *name = device == LEFT ? "l" : device == RIGHT ? "r" : NULL;
+  if (!name) {
+    ERR("haptics for device %llu, not a controller", (unsigned long long)device);
+    return;
+  }
+  char line[48];
+  int size = seconds < 0 ? snprintf(line, sizeof line, "haptic %s %.3f\n", name, amplitude)
+                         : snprintf(line, sizeof line, "haptic %s %.3f %.4f\n", name, amplitude, seconds);
+  pthread_mutex_lock(&g_lock);
+  if (g_client >= 0) send(g_client, line, size, MSG_NOSIGNAL | MSG_DONTWAIT);
+  pthread_mutex_unlock(&g_lock);
 }
 
 // Reads from one client at a time.
@@ -530,12 +598,18 @@ static void *serve_poses(void *unused) {
     FILE *in = client >= 0 ? fdopen(client, "r") : NULL;
     if (!in) continue;
     LOG("pose client connected");
+    pthread_mutex_lock(&g_lock);
+    g_client = client;
+    pthread_mutex_unlock(&g_lock);
     char line[256];
     while (fgets(line, sizeof line, in)) {
       pthread_mutex_lock(&g_lock);
       take_line(line);
       pthread_mutex_unlock(&g_lock);
     }
+    pthread_mutex_lock(&g_lock);
+    g_client = -1;
+    pthread_mutex_unlock(&g_lock);
     fclose(in);
     LOG("pose client gone");
   }
@@ -625,6 +699,7 @@ static int run_host(void) {
   for (size_t i = 0; i < sizeof others / sizeof *others; i++)
     if (!register_region(host, &others[i])) ERR("can't register region type %u/%u", others[i].type, others[i].specifier);
   serve_controller_tracking();  // CMSHeadset's: whether the controllers are tracked
+  serve_haptics();              // the runtime's: the controllers' vibration
   pthread_t poses;
   pthread_create(&poses, NULL, serve_poses, NULL);
   for (;;) {

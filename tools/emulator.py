@@ -1,6 +1,8 @@
 """Prism's Android Emulator: create the AVD, start/stop it, and run adb against it.
 
-Prism uses its own AVD (prism-api34) on its own port, so it never touches other AVDs.
+Prism uses its own AVD (prism-api34) on its own port, so it never touches other AVDs. Another of
+Prism's AVDs (a test one) is named by PRISM_AVD, which the tools run by prism.py --avd inherit; it
+uses the same port, so one of them runs at a time.
 
     python tools/emulator.py create            # write the AVD (stock API 34 x86_64 image)
     python tools/emulator.py config [--display WxH] [--memory MB] [--cores N]  # change the AVD; next start
@@ -25,7 +27,8 @@ import subprocess
 import sys
 import time
 
-AVD = 'prism-api34'
+DEFAULT_AVD = 'prism-api34'
+AVD = os.environ.get('PRISM_AVD') or DEFAULT_AVD
 PORT = 5590
 SERIAL = f'emulator-{PORT}'
 IMAGE = os.path.join('system-images', 'android-34', 'google_apis', 'x86_64')
@@ -52,6 +55,12 @@ def sdk_root():
         if candidate and os.path.isdir(os.path.join(candidate, 'emulator')):
             return candidate
     sys.exit('Android SDK not found; set ANDROID_SDK_ROOT')
+
+
+def use_avd(name):
+    """Makes `name` the AVD this process, and every tool it runs, uses."""
+    global AVD
+    AVD = os.environ['PRISM_AVD'] = name or DEFAULT_AVD
 
 
 def avd_home():
@@ -129,6 +138,17 @@ def running():
         return False
     time.sleep(1)
     return listed()
+
+
+def running_avd():
+    """The name of the AVD running on Prism's port (`adb emu avd name`), or None."""
+    if not running():
+        return None
+    try:
+        out = adb('emu', 'avd', 'name', check=False, timeout=10)
+    except subprocess.TimeoutExpired:
+        return None
+    return next((line.strip() for line in out.splitlines() if line.strip() and line.strip() != 'OK'), None)
 
 
 def config_path():
@@ -266,6 +286,9 @@ def patch_share_vid(args):
 
 def start(args):
     if running():
+        other = running_avd()
+        if other and other != AVD:
+            sys.exit(f'{SERIAL} is running another AVD ({other}); stop it first (python tools/emulator.py stop)')
         print(f'{SERIAL} is already running')
         return
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -461,7 +484,8 @@ def root(args):
         print('verity disabled; rebooting once so the system partitions become writable')
         adb('reboot')
         adb('wait-for-device')
-        args.timeout = max(args.timeout, 300)
+        # Deploy passes its own arguments, which have no timeout; only a new AVD gets here.
+        args.timeout = max(getattr(args, 'timeout', 0), 300)
         wait(args)
         adb('root')
         adb('wait-for-device')
@@ -526,10 +550,16 @@ def model(args):
 
 
 def stop(_args):
+    """Stops the emulator and returns once it's gone: `emu kill` returns while it's still shutting
+    down, and what comes next (another start, a config change, patching its locked binaries) needs
+    it gone."""
     if running():
         adb('shell', 'sync', check=False, timeout=30)  # a kill drops what's still in the guest's page cache
         adb('emu', 'kill', check=False)
-        print('stopped')
+        deadline = time.time() + 60
+        while running() and time.time() < deadline:
+            time.sleep(1)
+        print('stopped' if not running() else f'{SERIAL} is still shutting down after 60 s')
 
 
 def main():

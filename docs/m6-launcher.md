@@ -137,11 +137,22 @@ emulator through `prism.py` itself.
    full build (compat alone 8.5); a touched source rebuilds only its part. Deploy writes its id to
    `/data/prism/deploy-id` (the next deploy is the first to). `emulator.stage()` (one adb call and
    a second of frames) and `emulator.py ready` reach "ready: 89 frames a second" on a running Home.
-2. **`setup` and `doctor`.** *Done (2026-10-11)*, but for the run from a fresh clone and new AVD. Done when a fresh clone with a new AVD (an `--avd` option, since
-   `emulator.py` has the one name, `prism-api34`, today) goes from
+2. **`setup` and `doctor`.** *Done (2026-10-12).* Done when a fresh clone with a new AVD goes from
    the OTA to Horizon running, and a second `setup` finishes in seconds. `doctor` names a missing
    SDK, system image, SteamVR, OTA or patch, with the command that fixes each one (the system image
    through `sdkmanager`).
+   Each command takes `--avd NAME` (kept in `work/prism.json`; the tools get it as `PRISM_AVD`), so
+   a test leaves `prism-api34` alone. The AVDs share the emulator's port: setup stops another one
+   that's running, and `emulator.py start` refuses to start over it. From a fresh clone,
+   `setup OTA --avd prism-test` reached Home at 90 frames a second, and the second `setup` took
+   under a second. The run found four things a set-up PC never hits: `emulator.py stop` returned
+   while the emulator was still shutting down (now it waits until it's gone); the first `root` of a
+   new AVD, which reboots to turn verity off, read a timeout deploy's arguments don't have; `setup
+   --force avd` recreated the AVD under a running emulator (now it stops it first); and prism.rc's
+   refresh-rate Settings, written as the system user, never took (see
+   [m1-progress.md](m1-progress.md#running-it)), so a new AVD composed at 45 of 90. The window's
+   commands now write to `work/logs/window-COMMAND.log`, which it reads, so a setup left running
+   when the window closes keeps going; through a pipe it died at its next line.
 3. **`vr`, `desktop`, `stop`.** *Built (2026-10-11).* To check in the headset. Done when `vr` from a stopped emulator reaches the headset with no
    other command; closing the bridge and running `vr` again reconnects without a boot; and a
    source changed, then `vr`, rebuilds and redeploys only that part.

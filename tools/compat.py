@@ -193,6 +193,29 @@ RESOLVE_EMPTY_FETCH = Splice(
     sget-object v0, {FETCH_STATUS}->SUCCESS:{FETCH_STATUS}''',
     reason='an empty fetch is resolved too (no Meta account: the library has only local apps)')
 
+# The library's apps are the Store's entitlements plus the device's own (LocalAppDataRepository:
+# installed apps with a launcher activity). A system app counts only if it's on a whitelist (empty)
+# or its manifest says com.oculus.is_launcher_visible. On a headset Meta's own apps (Browser,
+# Gallery, TV, ...) are entitlements; with no Meta account they had no tile. They're the whitelist,
+# so they show as installed apps. An app the OTA has only a placeholder of (TV, Media Player)
+# has no launcher activity and stays hidden until its full APK is installed.
+LIBRARY_SYSTEM_APPS = (
+    'com.oculus.browser', 'com.oculus.hzosgallery', 'com.oculus.store', 'com.oculus.tv',
+    'com.oculus.avatareditor', 'com.oculus.horizonmediaplayer', 'com.oculus.remotedesktop',
+    'com.microsoft.rdc.androidx', 'com.meta.HyperscapeHmdCapture', 'com.facebook.horizon',
+    'com.meta.worlds', 'com.oculus.explore', 'com.oculus.guidebook', 'com.oculus.helpcenter',
+    'com.oculus.accountscenter', 'com.meta.AccountsCenter.pwa',
+)
+OCMS_LOCAL_APPS = 'Lcom/oculus/ocms/am/init/LocalAppDataRepository;'
+LIBRARY_WHITELIST = Splice(
+    OCMS_LOCAL_APPS, '<init>(Landroid/app/Application;)V',
+    'sget-object v0, LX/1FD;->A00:LX/1FD;',
+    '\n'.join(['    new-instance v0, Ljava/util/HashSet;',
+               '    invoke-direct {v0}, Ljava/util/HashSet;-><init>()V']
+              + [f'    const-string v1, "{name}"\n    invoke-virtual {{v0, v1}}, Ljava/util/HashSet;->add(Ljava/lang/Object;)Z'
+                 for name in LIBRARY_SYSTEM_APPS]),
+    reason="Meta's own apps in the library without the Store's entitlements")
+
 # The Library app's system bar waits for the signed-in user's id (ActiveImmersiveRepositoryImpl's
 # active immersive app flow) by asking for it again at once while it's empty: without a Meta account,
 # a dispatcher thread at 55% of a vCPU and system_server's binder threads at about as much again
@@ -307,7 +330,7 @@ BRIDGES = {
     ],
     '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO,
                                                        TO_MIRROR_DISPLAY],
-    '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH],
+    '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH, LIBRARY_WHITELIST],
     '/system_ext/priv-app/LibraryPanelApp/LibraryPanelApp.apk': [WAIT_FOR_USER_ID],
 }
 

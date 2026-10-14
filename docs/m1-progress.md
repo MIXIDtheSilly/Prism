@@ -567,9 +567,11 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
     for more, it composes every other vsync, and the compositor's layer got 45 buffers a second
     (`dumpsys SurfaceFlinger --latency <layer>`: frameReady 22 ms apart). Android's minimum and peak
     refresh rate Settings pin it (`settings put system min_refresh_rate 90.0`, peak the same; deploy's
-    prism.rc does it at boot): then 89.7 shared frames a second, mean 11.2 ms, p99 14.6 ms, the
-    compositor 83-89 of 90.
-    From a fresh deploy and boot (the prism.rc action, nothing set by hand): both Settings 90.0,
+    prism.rc does it at boot, as the shell user: from system, uid 1000 with no package, `settings
+    put` throws in getCallingPackage, which went unseen until a new AVD stayed at 45 (2026-10-12);
+    the Settings set by hand had stayed in /data): then 89.7 shared frames a second, mean 11.2 ms,
+    p99 14.6 ms, the compositor 83-89 of 90.
+    From a fresh deploy and boot: both Settings 90.0,
     SurfaceFlinger only ever at 90 Hz, 89.4 shared frames a second, but p99 18.5 ms, 39 gaps over
     1.5 frames in 30 s and the compositor at 72 of 90: the average is 90, the jitter is not yet
     (VrShell's frame loop below).

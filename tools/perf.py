@@ -5,9 +5,11 @@
 Watches the emulator's shared frames (`-share-vid`: mapping SHM_videmulator<port>, a VideoInfo
 {u32 width, height, fps, frame; u64 time (Unix microseconds)}, then BGRA) and prints the shared
 frame rate, the interval between frames (mean, p50, p95, p99, max), and how many gaps are longer
-than 1.5 frames. With --guest it also reads the compositor's own frame rate from logcat (the VrApi
-`FPS=` line) and the busiest guest threads from `top`, so a run says whether the export, the GPU or
-the CPU is what's short. Results are appended to work/logs/perf.csv (--label names the run).
+than 1.5 frames. With --guest it also reads, from the VrApi line each app logs once a second, the
+frames the app submitted over the run (FPS=, its mean and minimum) and the runtime's Stale= count,
+and the busiest guest threads from `top`, so a run says
+whether the export, the app, the GPU or the CPU is what's short: 89 shared frames a second can be
+VrShell's 58. Results are appended to work/logs/perf.csv (--label names the run).
 """
 import argparse
 import csv
@@ -110,11 +112,28 @@ def summarize(seen, seconds):
             'long_gaps': sum(g > 1.5 * mean for g in gaps), 'frames': len(seen), 'counter_skips': skipped}
 
 
-def compositor_fps():
-    """The last FPS=x/y the compositor logged, if any."""
-    out = shell('logcat -d -t 3000 | grep -E "FPS=[0-9]+" | tail -n 3', check=False)
-    found = re.findall(r'FPS=(\d+)/(\d+)', out)
-    return f'{found[-1][0]}/{found[-1][1]}' if found else 'n/a'
+def guest_time():
+    """The guest's clock as logcat -T takes it, so a run reads only what was logged during it."""
+    return shell("date +'%m-%d %H:%M:%S.000'", check=False).strip()
+
+
+def app_frames(since):
+    """What each app logged in its VrApi line once a second since `since`: {process: summary}.
+    FPS= is the frames the app submitted (VrShell's, in Home), out of the display's rate. Stale= is
+    the runtime's own count, recorded as is: it isn't the display's repeated frames (73 a second
+    with FPS=87). The shared frames can be at the display's rate while the app is far below it,
+    the compositor re-showing its last frame."""
+    out = shell(f"logcat -d -v brief -s VrApi:I -T '{since}'", check=False) if since else ''
+    runs = {}
+    for pid, fps, rate, stale in re.findall(r'\(\s*(\d+)\): FPS=(\d+)/(\d+),.*?Stale=(\d+)', out):
+        runs.setdefault(pid, []).append((int(fps), int(rate), int(stale)))
+    summaries = {}
+    for pid, seconds in runs.items():
+        name = shell(f'cat /proc/{pid}/cmdline', check=False).split('\0')[0].strip() or f'pid {pid}'
+        fps = [f for f, _, _ in seconds]
+        summaries[name] = {'fps': sum(fps) / len(fps), 'min': min(fps), 'rate': seconds[-1][1],
+                           'stale': sum(s for _, _, s in seconds) / len(seconds), 'seconds': len(seconds)}
+    return summaries
 
 
 def busiest_threads(count=10):
@@ -127,7 +146,7 @@ def busiest_threads(count=10):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--seconds', type=float, default=30)
-    parser.add_argument('--guest', action='store_true', help='also read the compositor FPS and guest CPU over adb')
+    parser.add_argument('--guest', action='store_true', help="also read apps' VrApi FPS= and guest CPU over adb")
     parser.add_argument('--label', default='', help='names this run in work/logs/perf.csv')
     parser.add_argument('--port', type=int, default=PORT)
     args = parser.parse_args()
@@ -135,6 +154,7 @@ def main():
     base = open_frames(args.port)
     if not base:
         sys.exit(f'SHM_videmulator{args.port} is missing: start the emulator with python tools/emulator.py start')
+    since = guest_time() if args.guest else ''
     print(f'watching shared frames for {args.seconds:g} s ...')
     width, height, fps, seen = watch(base, args.seconds)
     result = summarize(seen, args.seconds)
@@ -146,23 +166,49 @@ def main():
           f"({result['counter_skips']} frame numbers skipped)")
     print(f"interval ms: mean {result['mean_ms']:.2f}  p50 {result['p50_ms']:.2f}  p95 {result['p95_ms']:.2f}  "
           f"p99 {result['p99_ms']:.2f}  max {result['max_ms']:.2f}  long gaps {result['long_gaps']}")
-    comp = 'n/a'
+    app = None
     if args.guest:
-        comp = compositor_fps()
-        print(f'compositor (logcat FPS=): {comp}')
+        apps = app_frames(since)
+        for name, a in sorted(apps.items(), key=lambda item: -item[1]['seconds']):
+            print(f"{name} (VrApi FPS=): mean {a['fps']:.1f}/{a['rate']}  min {a['min']}  "
+                  f"stale {a['stale']:.0f}/{a['rate']} a second, over {a['seconds']} s")
+        if not apps:
+            print('no VrApi FPS= lines were logged during the run')
+        # The app the row records: the one that logged longest (VrShell in Home, an immersive app over it).
+        app = max(apps.items(), key=lambda item: item[1]['seconds'], default=None)
         print(busiest_threads())
 
+    columns = ['time', 'label', 'size', 'emulator_fps', 'shared_fps', 'mean_ms', 'p50_ms', 'p95_ms',
+               'p99_ms', 'max_ms', 'long_gaps', 'compositor', 'app', 'app_fps_min', 'app_stale']
+    row = [time.strftime('%Y-%m-%d %H:%M:%S'), args.label, f'{width}x{height}', fps,
+           f"{result['fps']:.1f}", f"{result['mean_ms']:.2f}", f"{result['p50_ms']:.2f}",
+           f"{result['p95_ms']:.2f}", f"{result['p99_ms']:.2f}", f"{result['max_ms']:.2f}", result['long_gaps']]
+    if app:
+        name, a = app
+        # compositor: the app's mean FPS= over the run (before 2026-10-12, its last line).
+        row += [f"{a['fps']:.1f}/{a['rate']}", name, a['min'], f"{a['stale']:.1f}"]
+    else:
+        row += ['n/a', '', '', '']
+    write_row(columns, row)
+
+
+def write_row(columns, row):
+    """Appends a run to perf.csv; a file with an older, shorter header gets the current one first."""
     os.makedirs(os.path.dirname(CSV), exist_ok=True)
+    if os.path.exists(CSV):
+        with open(CSV, newline='', encoding='utf-8') as f:
+            rows = list(csv.reader(f))
+        if rows and rows[0] != columns:
+            temp = CSV + '.tmp'
+            with open(temp, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows([columns] + rows[1:])
+            os.replace(temp, CSV)
     new = not os.path.exists(CSV)
-    with open(CSV, 'a', newline='') as f:
+    with open(CSV, 'a', newline='', encoding='utf-8') as f:
         out = csv.writer(f)
         if new:
-            out.writerow(['time', 'label', 'size', 'emulator_fps', 'shared_fps', 'mean_ms', 'p50_ms', 'p95_ms',
-                          'p99_ms', 'max_ms', 'long_gaps', 'compositor'])
-        out.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), args.label, f'{width}x{height}', fps,
-                      f"{result['fps']:.1f}", f"{result['mean_ms']:.2f}", f"{result['p50_ms']:.2f}",
-                      f"{result['p95_ms']:.2f}", f"{result['p99_ms']:.2f}", f"{result['max_ms']:.2f}",
-                      result['long_gaps'], comp])
+            out.writerow(columns)
+        out.writerow(row)
 
 
 if __name__ == '__main__':

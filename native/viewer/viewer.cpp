@@ -8,9 +8,10 @@
 // is shown at the next refresh after it arrives.
 //
 // The right controller points where the mouse is: its ray goes through the pixel under the mouse,
-// so hovering and clicking work as they look. The left button pulls its trigger. Drag with the
-// right button to look around; W/S move forward and back, A/D sideways, R/F up and down (Shift:
-// faster), Space faces ahead again and Home also returns to the origin. Tab presses the Meta
+// so hovering and clicking work as they look (the left one is held low at the side, pointing
+// behind, out of the way). The left button pulls its trigger. Drag with the right button to look
+// around (the controllers stay put meanwhile); W/S move forward and back, A/D sideways, R/F up
+// and down (Shift: faster), Space faces ahead again and Home also returns to the origin. Tab presses the Meta
 // button (the Universal Menu), E and Q press A and B, G (or the middle button) squeezes the grip.
 // Poses and buttons go to Prism's tracking service (native/tracking_prism) as tools/head.py sends
 // them, from a thread of their own at 90 Hz.
@@ -65,6 +66,9 @@ constexpr double kHeld[3] = {0.0, -0.06, -0.02};
 // Meters ahead: the ray goes through the mouse's pixel this far in front, where VrShell places
 // panels; nearer or farther, it misses by a few pixels.
 constexpr double kAimDepth = 1.08;
+// Where the left controller is, from the head turned only by its yaw: low at the left side, below
+// the view, and pointing behind (see tracking_thread).
+constexpr double kLeftHeld[3] = {-0.2, -0.45, -0.2};
 // What each eye's half of the display shows, as tangents of its edges' angles (left, right, up,
 // down), from the head's center: the compositor draws the display's halves without the eyes'
 // offsets. Fitted to where the pointer's dot lands, within a pixel or two: the middle of what apps
@@ -121,6 +125,7 @@ struct Input {
     int eye = 0;
     bool keys[256]{};
     bool trigger = false, middle = false;
+    bool looking = false;  // right-dragging: the controller stays where it was (see tracking_thread)
     std::atomic<bool> connected{false};
 };
 Input g_input;
@@ -146,6 +151,21 @@ void tracking_thread(int port)
     timeBeginPeriod(1);
     SOCKET sock = INVALID_SOCKET;
     std::string sentInput;
+    // While the view turns (right-drag), the controller holds still in the room, as a hand does when
+    // a head turns, instead of sweeping its ray with the view: VrShell traces its ray against every
+    // panel's shapes again whenever it moves (translated, about three times a still ray's cost a
+    // frame), and the panels it crosses redraw for each hover. With a panel open, looking around
+    // took Home from about 75 to 40 frames a second. Holding the trigger keeps it following (a
+    // drag), and letting go of the right button points it at the mouse again.
+    // The left controller, which the mouse doesn't drive, goes low at the left side pointing behind:
+    // the tracking service otherwise holds it ahead of the head, pointing where it looks, so every
+    // turn swept its ray across the panels as well (Home's looking around at 70 frames a second
+    // rather than 81). Behind, its ray meets nothing: resting on the floor, a ray costs Home about
+    // 9 frames a second even held still (76 against 85). It turns with the view only when the
+    // right button lets go.
+    Vec heldAt{}, leftAt{};
+    Quat heldHand{0, 0, 0, 1}, leftHand{0, 0, 0, 1};
+    bool holding = false;
     auto last = Clock::now(), retry = Clock::time_point{};
     for (;;) {
         std::this_thread::sleep_for(std::chrono::microseconds(1000000 / kTrackingHz));
@@ -170,10 +190,27 @@ void tracking_thread(int port)
             const Quat head = quaternion(in.yaw, in.pitch);
             Vec at;
             Quat hand;
-            aim(in, head, at, hand);
-            std::snprintf(lines, sizeof(lines), "%.6f %.6f %.6f %.6f %.6f %.6f %.6f\nhand r %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+            if (!in.looking || !holding) {
+                const Quat body = quaternion(in.yaw, 0);
+                const Vec side = rotate(body, {kLeftHeld[0], kLeftHeld[1], kLeftHeld[2]});
+                leftAt = {in.position.x + side.x, in.position.y + side.y, in.position.z + side.z};
+                leftHand = quaternion(in.yaw + 180, 0);
+            }
+            if (in.looking && !in.trigger && holding) {
+                at = heldAt;
+                hand = heldHand;
+            } else {
+                aim(in, head, at, hand);
+                heldAt = at;
+                heldHand = hand;
+                holding = true;
+            }
+            std::snprintf(lines, sizeof(lines),
+                          "%.6f %.6f %.6f %.6f %.6f %.6f %.6f\nhand r %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n"
+                          "hand l %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
                           in.position.x, in.position.y, in.position.z, head.x, head.y, head.z, head.w,
-                          at.x, at.y, at.z, hand.x, hand.y, hand.z, hand.w);
+                          at.x, at.y, at.z, hand.x, hand.y, hand.z, hand.w,
+                          leftAt.x, leftAt.y, leftAt.z, leftHand.x, leftHand.y, leftHand.z, leftHand.w);
             const unsigned buttons = (in.trigger ? kTrigger : 0) | (in.keys['E'] ? kButtonA : 0) | (in.keys['Q'] ? kButtonB : 0) |
                                      (in.keys['G'] || in.middle ? kGrip : 0) | (in.keys[VK_TAB] ? kMeta : 0);
             char buffer[64];
@@ -650,16 +687,25 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l)
     case WM_KILLFOCUS: {  // keys released elsewhere never come back up here
         std::lock_guard lock(g_input.mutex);
         std::fill(std::begin(g_input.keys), std::end(g_input.keys), false);
-        g_input.trigger = g_input.middle = false;
+        g_input.trigger = g_input.middle = g_input.looking = false;
         g_app.dragging = false;
         return 0;
     }
-    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDOWN: {
         g_app.dragging = true;
         g_app.drag = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         SetCapture(window);
+        std::lock_guard lock(g_input.mutex);
+        g_input.looking = true;
         return 0;
-    case WM_RBUTTONUP: g_app.dragging = false; ReleaseCapture(); return 0;
+    }
+    case WM_RBUTTONUP: {
+        g_app.dragging = false;
+        ReleaseCapture();
+        std::lock_guard lock(g_input.mutex);
+        g_input.looking = false;
+        return 0;
+    }
     case WM_MOUSEMOVE: {
         const POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         if (g_app.dragging) {

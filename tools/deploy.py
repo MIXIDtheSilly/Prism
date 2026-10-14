@@ -177,6 +177,10 @@ VULKAN_DRIVER = 'prism'
 # Prism's GLES layer (tools/gles.py): GL_EXT_memory_object_fd, for OpenGL ES apps' swapchains.
 GLES_LAYER = 'libgles_prism.so'
 GLES_LAYER_DIR = '/data/local/debug/gles'  # the EGL loader's one system layer directory
+# Chromium's switches, which Chrome builds read from this file on a debuggable device (Prism's is).
+# Meta's Browser composites with Vulkan by default, and some of its raster tiles come out black
+# there (full-width bands across the page); with GLES it draws them all.
+CHROME_COMMAND_LINE = ('/data/local/chrome-command-line', '_ --disable-features=Vulkan')
 # Meta daemons Prism runs: Horizon's init script for each, and the VINTF manifest fragments that
 # declare its stable-AIDL services (servicemanager refuses undeclared ones). Only these fragments
 # are installed: a declared service nobody serves makes clients wait for it forever.
@@ -714,6 +718,9 @@ def build(args):
               f'    mkdir {GLES_LAYER_DIR} 0755 root root',
               f'    copy /system_ext/lib64/{GLES_LAYER} {GLES_LAYER_DIR}/{GLES_LAYER}',
               f'    chmod 0644 {GLES_LAYER_DIR}/{GLES_LAYER}',
+              "    # Meta's Browser draws with GLES (CHROME_COMMAND_LINE).",
+              f'    write {CHROME_COMMAND_LINE[0]} "{CHROME_COMMAND_LINE[1]}"',
+              f'    chmod 0644 {CHROME_COMMAND_LINE[0]}',
               '    # Meta config parameters Prism sets (META_PARAMS).',
               f'    exec {DAEMON_SECLABEL} root root -- /system/bin/sh {META_PARAMS_SCRIPT}',
               '    # The emulator makes each vCPU its own package, so with TTWU_QUEUE every cross-CPU wake-up',
@@ -735,7 +742,8 @@ def build(args):
               '# spends at each) unless something asks for more, and nothing in Horizon does: the display is',
               '# one 90 Hz mode, but the compositor\'s layer then gets half of its frames. These Settings are',
               '# Android\'s minimum and peak refresh rates; with both at the display\'s rate it stays there.',
-              f'    exec_background {DAEMON_SECLABEL} system system -- /system/bin/sh -c '
+              '# As shell: from system (uid 1000, no package) settings put throws in getCallingPackage.',
+              f'    exec_background {DAEMON_SECLABEL} shell shell -- /system/bin/sh -c '
               f'"settings put system min_refresh_rate {emulator.refresh_rate()}.0; '
               f'settings put system peak_refresh_rate {emulator.refresh_rate()}.0"']
     overlay.add('/system/etc/init/prism.rc', 'f', 0o644, data=('\n'.join(lines) + '\n').encode())

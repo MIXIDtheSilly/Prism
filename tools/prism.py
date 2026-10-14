@@ -8,8 +8,12 @@
     python tools/prism.py stop
     python tools/prism.py steamvr register|unregister   # Prism in SteamVR's library, or not
 
+Each command takes --avd NAME: another of Prism's AVDs than prism-api34, as a test from a fresh clone
+uses so it leaves the working one alone (kept, as the settings are).
+
 setup runs each step that isn't current, in order (STEPS): the workspace from the OTA, the AVD and
-its display rate, the emulator's frame sharing, the builds, the PC apps and the deploy. Each step
+its display rate, the emulator's frame sharing, the builds, the PC apps, the deploy and the Meta
+apps copied from your headset (tools/apps.py pull), installed again after a deploy. Each step
 knows whether it's current (the builds by their stamps, the deploy by the id it leaves on the
 guest), so setup run again with nothing changed does nothing, and after a pull does only what the
 change needs. vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready)
@@ -22,8 +26,8 @@ steamvr register puts Prism in SteamVR's library (work/steamvr/prism.vrmanifest)
 vr --from-steamvr: the bridge starts at once, since SteamVR waits for its app's session, and shows
 Horizon once the emulator is up; with no console, the output goes to work/logs/steamvr-run.log.
 
-Settings given once are kept in work/prism.json (the OTA, the refresh rate, the headset's latency and
-IPD): later runs, and tools/prism_ui.pyw, use them. Progress lines start with "==" for the window.
+Settings given once are kept in work/prism.json (the OTA, the AVD, the refresh rate, the headset's
+latency and IPD): later runs, and tools/prism_ui.pyw, use them. Progress lines start with "==" for the window.
 """
 import argparse
 import importlib
@@ -43,7 +47,7 @@ import emulator  # noqa: E402
 import stamp  # noqa: E402
 
 SETTINGS = os.path.join(ROOT, 'work', 'prism.json')
-DEFAULTS = {'ota': None, 'refresh': 90, 'latency': 45.0, 'ipd': 63.0, 'menu_button_is_menu': False}
+DEFAULTS = {'ota': None, 'avd': emulator.DEFAULT_AVD, 'refresh': 90, 'latency': 45.0, 'ipd': 63.0, 'menu_button_is_menu': False}
 PREPARED = os.path.join(ROOT, 'work', 'prepared.json')  # which OTA work/ was prepared from
 REPORT = os.path.join(ROOT, 'work', 'inventory', 'report.md')  # prepare's last output
 BIONIC = os.path.join(ROOT, 'work', 'device', 'bionic')
@@ -193,11 +197,18 @@ def ota_identity(path):
     return {'ota': os.path.abspath(path), 'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
 
 
+def same_ota(was, path):
+    """Whether work/ was prepared from this OTA. Paths compare without case: a terminal's c:\\ and the
+    file dialog's C:\\ are the same file."""
+    now = ota_identity(path)
+    return was == {**now, 'ota': was.get('ota')} and os.path.normcase(was.get('ota') or '') == os.path.normcase(now['ota'])
+
+
 def workspace_state(settings):
     ota, was = settings.get('ota'), prepared_from()
     if not os.path.exists(REPORT):
         return False, 'not prepared' + ('' if ota else ': choose your OTA')
-    if ota and os.path.exists(ota) and was and was != ota_identity(ota):
+    if ota and os.path.exists(ota) and was and not same_ota(was, ota):
         return False, f'prepared from another OTA ({was["ota"]})'
     return True, f'prepared from {os.path.basename(was["ota"]) if was else "an OTA"}'
 
@@ -208,7 +219,7 @@ def workspace_run(settings, force):
         sys.exit("no OTA: python tools/prism.py setup path\\to\\horizon-ota.zip (your own headset's full OTA)")
     was = prepared_from()
     # The same OTA, or a workspace prepared before Prism recorded which: what's there is kept.
-    same = not force and (was is None or was == ota_identity(ota))
+    same = not force and (was is None or same_ota(was, ota))
     if not python('prepare.py', ota, *(['--skip-done'] if same else [])):
         return False
     with open(PREPARED, 'w', encoding='utf-8') as f:
@@ -222,7 +233,7 @@ def avd_state(settings):
 
 
 def avd_run(settings, force):
-    return python('emulator.py', 'create', *(['--force'] if force else []))
+    return stopped() and python('emulator.py', 'create', *(['--force'] if force else []))
 
 
 def refresh_state(settings):
@@ -263,13 +274,22 @@ def sharing_run(settings, force):
     return stopped() and python('emulator.py', 'patch-share-vid', '--rate', settings['refresh'])
 
 
+def other_avd():
+    """The AVD on Prism's port when it isn't this one (they share the port), else None."""
+    running = emulator.running_avd()
+    return running if running and running != emulator.AVD else None
+
+
 def emulator_state(settings):
     up = emulator.running()
+    other = up and other_avd()
+    if other:
+        return False, f'{emulator.SERIAL} runs another AVD ({other})'
     return up, emulator.SERIAL + (' running' if up else ' stopped')
 
 
 def emulator_run(settings, force):
-    return python('emulator.py', 'start', '--wait')
+    return (not other_avd() or python('emulator.py', 'stop')) and python('emulator.py', 'start', '--wait')
 
 
 def bionic_state(settings):
@@ -319,6 +339,8 @@ def deploy_args():
 def deploy_state(settings):
     if not emulator.running():
         return None, 'unknown while the emulator is stopped'
+    if other_avd():
+        return None, 'unknown while another AVD runs'
     deploy, args = deploy_args()
     try:
         on_guest = deploy.deployed_id()
@@ -333,6 +355,25 @@ def deploy_run(settings, force):
     return python('deploy.py')
 
 
+def apps_state(settings):
+    apps = importlib.import_module('apps')
+    if not apps.load_record():
+        return True, 'none copied from a headset (python tools/apps.py pull)'
+    if not emulator.running() or other_avd():
+        return None, 'unknown while the emulator is stopped'
+    try:
+        todo = apps.missing()
+    except RuntimeError:
+        return None, 'the emulator is not answering yet'
+    if todo:
+        return False, f'to install: {", ".join(sorted(todo))}'
+    return True, 'the emulator has the apps copied from your headset (python tools/apps.py status)'
+
+
+def apps_run(settings, force):
+    return python('apps.py', 'install')
+
+
 STEPS = [('workspace', workspace_state, workspace_run),
          ('avd', avd_state, avd_run),
          ('refresh', refresh_state, refresh_run),
@@ -341,7 +382,8 @@ STEPS = [('workspace', workspace_state, workspace_run),
          ('bionic', bionic_state, bionic_run),
          *[(name, *build_step(module, out)) for name, module, out in BUILDS],
          ('pc apps', pc_apps_state, pc_apps_run),
-         ('deploy', deploy_state, deploy_run)]
+         ('deploy', deploy_state, deploy_run),
+         ('apps', apps_state, apps_run)]
 STEP_NAMES = [name for name, _, _ in STEPS]
 
 
@@ -606,16 +648,21 @@ def steamvr_library(args, settings):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--avd', help=f'the AVD to use (kept; default {emulator.DEFAULT_AVD})')
     sub = ap.add_subparsers(dest='command', required=True)
-    sub.add_parser('doctor')
-    s = sub.add_parser('setup')
+
+    def command(name, **kw):
+        return sub.add_parser(name, parents=[common], **kw)
+    command('doctor')
+    s = command('setup')
     s.add_argument('ota', nargs='?', help="your headset's full OTA (kept for later runs)")
     s.add_argument('--refresh', type=int, choices=(60, 90), help='the display rate (kept; default 90)')
-    for p in (s, *[sub.add_parser(m) for m in ('vr', 'desktop')]):
+    for p in (s, *[command(m) for m in ('vr', 'desktop')]):
         p.add_argument('--force', action='append', choices=STEP_NAMES, metavar='STEP',
                        help='run this step even if current (repeatable)')
-    sub.add_parser('status')
-    sub.add_parser('stop')
+    command('status')
+    command('stop')
     for mode in ('vr', 'desktop'):
         p = sub.choices[mode]
         p.add_argument('--no-setup', action='store_true', help="start as things are, without bringing setup up to date")
@@ -630,7 +677,7 @@ def main():
     vr.add_argument('--from-steamvr', action='store_true',
                     help="as SteamVR's library starts it: the bridge first, and with no console, the output in "
                          "work/logs/steamvr-run.log")
-    library = sub.add_parser('steamvr', help="Prism in SteamVR's library")
+    library = command('steamvr', help="Prism in SteamVR's library")
     library.add_argument('action', choices=('register', 'unregister'))
     args = ap.parse_args()
     os.chdir(ROOT)
@@ -638,13 +685,14 @@ def main():
         sys.exit(logged())
 
     settings = load_settings()
-    given = {k: getattr(args, k, None) for k in ('ota', 'refresh', 'latency', 'ipd', 'menu_button_is_menu')}
+    given = {k: getattr(args, k, None) for k in ('ota', 'avd', 'refresh', 'latency', 'ipd', 'menu_button_is_menu')}
     if given['ota']:
         given['ota'] = os.path.abspath(given['ota'])
     changed = {k: v for k, v in given.items() if v is not None and settings.get(k) != v}
     if changed:
         settings.update(changed)
         save_settings(settings)
+    emulator.use_avd(settings['avd'])
 
     if args.command == 'doctor':
         sys.exit(0 if doctor(args, settings) else 1)

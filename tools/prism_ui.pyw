@@ -3,8 +3,8 @@
     Prism.cmd (in the repository's root), or: pythonw tools/prism_ui.pyw [--vr]
 
 Everything it does is a tools/prism.py command run in the background (setup, vr, desktop, stop,
-doctor), whose output goes to the Log; so the window shows what those commands would print, and a
-crash in one never takes the window down. Its status lines poll the same functions the commands
+doctor), whose output goes to the Log (and work/logs/window-COMMAND.log); so the window shows what
+those commands would print, and a crash in one never takes the window down. Its status lines poll the same functions the commands
 use: emulator.stage() for Horizon, and setup's steps for whether setup is current. While VR runs,
 the Headset controls go to the bridge (tools/steamvr.py --control): latency, recenter, and the Meta
 and menu buttons held while pressed. A VR bridge it didn't start (SteamVR's library starts prism.py vr
@@ -30,6 +30,7 @@ import emulator  # noqa: E402
 import prism  # noqa: E402
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+LOGS = os.path.join(ROOT, 'work', 'logs')
 
 
 class _WindowlessPopen(subprocess.Popen):
@@ -57,20 +58,35 @@ VR_LATENCY = re.compile(r'prism_vr: latency (\d+) ms')
 
 class Command:
     """A tools/prism.py command running in the background: its output lines go to `lines`, then
-    (self, exit code) when it ends."""
+    (self, exit code) when it ends. The output goes through a file (work/logs/window-COMMAND.log),
+    not a pipe, so a command left running when the window closes (a setup) can still print."""
 
     def __init__(self, args, lines):
         self.args, self.lines = args, lines
-        self.process = subprocess.Popen([PYTHON, '-u', os.path.join(HERE, 'prism.py'), *args], cwd=ROOT,
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        text=True, encoding='utf-8', errors='replace', bufsize=1,
-                                        creationflags=NO_WINDOW)
+        os.makedirs(LOGS, exist_ok=True)
+        self.log = os.path.join(LOGS, f'window-{args[0]}.log')
+        with open(self.log, 'w', encoding='utf-8') as out:
+            self.process = subprocess.Popen([PYTHON, '-u', os.path.join(HERE, 'prism.py'), *args], cwd=ROOT,
+                                            stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                            text=True, encoding='utf-8', bufsize=1, creationflags=NO_WINDOW,
+                                            env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
-        for line in self.process.stdout:
-            self.lines.put(line.rstrip('\r\n'))
-        self.lines.put((self, self.process.wait()))
+        partial = ''
+        with open(self.log, encoding='utf-8', errors='replace') as log:
+            while True:
+                ended = self.process.poll() is not None  # before the read, so nothing written last is missed
+                partial += log.read()
+                *whole, partial = partial.split('\n')
+                for line in whole:
+                    self.lines.put(line.rstrip('\r'))
+                if ended:
+                    break
+                time.sleep(0.1)
+        if partial:
+            self.lines.put(partial.rstrip('\r'))
+        self.lines.put((self, self.process.returncode))
 
     def running(self):
         return self.process.poll() is None
@@ -98,6 +114,7 @@ class Window:
     def __init__(self, root, start_vr=False):
         self.root = root
         self.settings = prism.load_settings()
+        emulator.use_avd(self.settings['avd'])
         self.lines = queue.Queue()     # from commands: str, or (command, exit code)
         self.updates = queue.Queue()   # from the pollers: (what, value)
         self.command = None
@@ -225,7 +242,7 @@ class Window:
         self.log = ScrolledText(body, width=62, height=14, font=('Consolas', 9), state='disabled', wrap='none')
         self.log.grid(row=0, column=0, sticky='ew')
         ttk.Button(body, text='Open logs folder',
-                   command=lambda: os.startfile(os.path.join(ROOT, 'work', 'logs'))).grid(row=1, column=0, sticky='w', pady=(4, 0))
+                   command=lambda: os.startfile(LOGS)).grid(row=1, column=0, sticky='w', pady=(4, 0))
 
     # --- settings -------------------------------------------------------------------------------
 
@@ -480,7 +497,7 @@ class Window:
                     self.command.kill()
                 subprocess.Popen([PYTHON, os.path.join(HERE, 'prism.py'), 'stop'], cwd=ROOT, creationflags=NO_WINDOW)
             elif busy:
-                self.command.close_input()  # the VR bridge quits with its input; a build or setup runs on
+                self.command.close_input()  # the VR bridge quits with its input; a build or setup runs on, into its log
         self.root.destroy()
 
 

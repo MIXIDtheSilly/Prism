@@ -47,7 +47,7 @@ def fingerprint(inputs, extra=()):
 def recorded(out):
     """The fingerprint out's build was made from, or None."""
     try:
-        with open(os.path.join(out, NAME)) as f:
+        with open(os.path.join(out, NAME), encoding='utf-8', errors='replace') as f:
             return f.read().strip() or None
     except OSError:
         return None

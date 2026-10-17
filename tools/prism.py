@@ -122,7 +122,8 @@ def doctor_checks(settings):
     from viewer import vcvars
     checks = []
     add = lambda what, ok, detail='', fix='': checks.append((what, ok, detail, fix))  # noqa: E731
-    add('Python 3.10 or later', sys.version_info >= (3, 10), sys.version.split()[0], 'install Python from python.org')
+    add('Python 3.10 or later', sys.version_info >= (3, 10), sys.version.split()[0],
+        'winget install Python.Python.3.13 (or python.org)')
     sdk = found(emulator.sdk_root)
     add('Android SDK', bool(sdk), sdk or 'not found',
         'install Android Studio (or its command-line tools) and set ANDROID_SDK_ROOT')
@@ -147,8 +148,11 @@ def doctor_checks(settings):
     add('Android NDK', bool(ndk), ndk or 'not found', 'sdkmanager "ndk;27.3.13750724"')
     vs = found(vcvars)
     add("Visual Studio's C++ tools", bool(vs), vs or 'not found',
-        'install Visual Studio (Community is fine) with "Desktop development with C++"')
-    add('git', bool(shutil.which('git')), shutil.which('git') or 'not found', 'install Git for Windows')
+        'Visual Studio (Community is fine) with "Desktop development with C++", or just its build tools: '
+        'winget install Microsoft.VisualStudio.2022.BuildTools --override '
+        '"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
+    add('git', bool(shutil.which('git')), shutil.which('git') or 'not found',
+        'winget install Git.Git, then open a new terminal')
     runtime = steamvr_runtime()
     add('SteamVR (for vr; desktop works without)', True if runtime else None, runtime or 'not found',
         'install SteamVR from Steam')
@@ -420,7 +424,7 @@ def status(args, settings):
 def bridge_running(name):
     """Whether a bridge (prism_vr.exe, prism_viewer.exe) is running, anyone's."""
     out = subprocess.run(['tasklist', '/fi', f'imagename eq {name}', '/fo', 'csv', '/nh'],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, errors='replace').stdout
     return name.lower() in out.lower()
 
 

@@ -129,6 +129,18 @@ python tools\prism.py steamvr register   # Prism in SteamVR's library
 an inventory to `work\inventory\report.md`, then runs the steps in
 [docs/m1-progress.md](docs/m1-progress.md#running-it), each only when it isn't already current.
 
+### When it doesn't work
+
+- Run *Check this PC* (`python tools\prism.py doctor`) first: each line that isn't `ok` says how to
+  fix it.
+- A failed *Set up* names the step that failed. What it printed is in the Log and in
+  `work\logs\window-setup.log`; run *Set up* again after fixing it, and it picks up from there.
+- If the emulator doesn't start or Horizon doesn't reach Home, `python tools\emulator.py status`
+  says how far it got, and `work\logs\emulator.log` has the emulator's own output.
+
+To report a problem, [open an issue](../../issues/new?template=setup-problem.md) with what
+*Check this PC* prints and the log of the step that failed.
+
 ## Repository layout
 
 ```text

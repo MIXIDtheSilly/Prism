@@ -46,7 +46,7 @@ def adb(serial, *args, check=True, stderr=False):
 
 def headset(serial):
     """The connected headset's serial: the one asked for, or the only adb device that isn't an emulator."""
-    out = subprocess.run([emulator.adb_path(), 'devices'], capture_output=True, text=True).stdout
+    out = subprocess.run([emulator.adb_path(), 'devices'], capture_output=True, text=True, errors='replace').stdout
     devices = [line.split()[0] for line in out.splitlines()[1:]
                if line.strip().endswith('device') and not line.startswith('emulator-')]
     if serial:

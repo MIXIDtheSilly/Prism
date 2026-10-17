@@ -40,7 +40,7 @@ def vcvars():
     if os.path.exists(vswhere):
         out = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
                               'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
-                             capture_output=True, text=True).stdout.strip()
+                             capture_output=True, text=True, errors='replace').stdout.strip()
         candidate = os.path.join(out, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat') if out else ''
         if os.path.exists(candidate):
             return candidate
@@ -56,7 +56,7 @@ def build(force=False):
     compile_ = ('cl /nologo /O2 /MT /EHsc /std:c++20 /W3 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX '
                 f'"{os.path.join(SOURCE_DIR, "viewer.cpp")}" /Fe"{EXE}" /Fo"{OUT}\\\\" '
                 f'/link {" ".join(lib + ".lib" for lib in LIBS)}')
-    result = subprocess.run(f'"{vcvars()}" >nul && {compile_}', shell=True, capture_output=True, text=True)
+    result = subprocess.run(f'"{vcvars()}" >nul && {compile_}', shell=True, capture_output=True, text=True, errors='replace')
     if result.returncode != 0:
         sys.exit(f'building the viewer failed:\n{result.stdout}{result.stderr}')
     print(f'built {os.path.relpath(EXE, ROOT)}')

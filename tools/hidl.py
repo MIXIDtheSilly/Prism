@@ -70,7 +70,7 @@ def fetch_headers():
             url = f'https://android.googlesource.com/platform/{repo}'
             print(f'fetching {url}')
             subprocess.run(['git', 'clone', '-q', '--depth', '1', '--branch', AOSP_TAG, '--filter=blob:none',
-                            '--sparse', url, dest], check=True, stderr=subprocess.DEVNULL)
+                            '--sparse', url, dest], check=True)
         subprocess.run(['git', '-C', dest, 'sparse-checkout', 'set', '--no-cone', *paths], check=True)
 
 

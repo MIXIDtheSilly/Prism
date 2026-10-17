@@ -94,7 +94,7 @@ def create(args):
         sys.exit(f'{content} already exists (use --force to recreate it)')
     shutil.rmtree(content, ignore_errors=True)
     os.makedirs(content)
-    with open(os.path.join(avd_home(), AVD + '.ini'), 'w', newline='\n') as f:
+    with open(os.path.join(avd_home(), AVD + '.ini'), 'w', encoding='utf-8', newline='\n') as f:
         f.write(f'avd.ini.encoding=UTF-8\npath={content}\npath.rel=avd\\{AVD}.avd\ntarget=android-34\n')
     config = {
         'avd.ini.encoding': 'UTF-8', 'AvdId': AVD, 'avd.ini.displayname': 'Prism (Horizon OS)',
@@ -110,13 +110,13 @@ def create(args):
         'hw.audioInput': 'yes', 'hw.audioOutput': 'yes', 'hw.sdCard': 'no', 'PlayStore.enabled': 'no',
         'fastboot.forceColdBoot': 'yes', 'showDeviceFrame': 'no', 'hw.useext4': 'yes',
     }
-    with open(os.path.join(content, 'config.ini'), 'w', newline='\n') as f:
+    with open(os.path.join(content, 'config.ini'), 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(f'{k}={v}\n' for k, v in config.items())
     print(f'created {AVD} in {content}')
 
 
 def listed():
-    out = subprocess.run([adb_path(), 'devices'], capture_output=True, text=True).stdout
+    out = subprocess.run([adb_path(), 'devices'], capture_output=True, text=True, errors='replace').stdout
     return any(line.startswith(SERIAL) for line in out.splitlines())
 
 
@@ -157,7 +157,7 @@ def config_path():
 
 def avd_config():
     try:
-        with open(config_path()) as f:
+        with open(config_path(), encoding='utf-8', errors='replace') as f:
             return dict(line.rstrip('\n').split('=', 1) for line in f if '=' in line)
     except OSError:
         return {}
@@ -216,7 +216,7 @@ def configure(args):
               f'{config.get("hw.cpu.ncore")} cores')
         return
     config.update(changes)
-    with open(config_path(), 'w', newline='\n') as f:
+    with open(config_path(), 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(f'{k}={v}\n' for k, v in config.items())
     print('set ' + ', '.join(f'{k}={v}' for k, v in changes.items()))
     if args.refresh:

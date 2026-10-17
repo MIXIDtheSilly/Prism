@@ -19,18 +19,34 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+LOGS = os.path.join(ROOT, 'work', 'logs')
+
+
+def fail(message):
+    """A message box, as pythonw has no console to say why it stopped; it needs no tkinter."""
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(None, message, 'Prism', 0x10)  # MB_ICONERROR
+    sys.exit(1)
+
+
+if sys.version_info < (3, 10):
+    fail(f'Prism needs Python 3.10 or later, and this is {sys.version.split()[0]} ({sys.executable}).\n\n'
+         'Install a newer one: winget install Python.Python.3.13, or python.org.')
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+except ImportError:
+    fail(f"Prism's window needs tkinter, which this Python ({sys.executable}) was installed without.\n\n"
+         'Run its installer again, choose Modify, and tick "tcl/tk and IDLE".')
 sys.path.insert(0, HERE)
 import emulator  # noqa: E402
 import prism  # noqa: E402
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-LOGS = os.path.join(ROOT, 'work', 'logs')
 
 
 class _WindowlessPopen(subprocess.Popen):
@@ -508,4 +524,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        os.makedirs(LOGS, exist_ok=True)
+        with open(os.path.join(LOGS, 'window-crash.log'), 'w', encoding='utf-8') as f:
+            traceback.print_exc(file=f)
+        fail(f"Prism's window stopped: {sys.exc_info()[1]}\n\nThe details are in work\\logs\\window-crash.log.")

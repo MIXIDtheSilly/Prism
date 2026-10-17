@@ -50,7 +50,7 @@ def build(force=False):
     compile_ = ('cl /nologo /O2 /MT /EHsc /std:c++20 /W3 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS '
                 f'/I"{include}" "{os.path.join(SOURCE_DIR, "prism_vr.cpp")}" /Fe"{EXE}" /Fo"{OUT}\\\\" '
                 f'/link {" ".join(lib + ".lib" for lib in LIBS)}')
-    result = subprocess.run(f'"{vcvars()}" >nul && {compile_}', shell=True, capture_output=True, text=True)
+    result = subprocess.run(f'"{vcvars()}" >nul && {compile_}', shell=True, capture_output=True, text=True, errors='replace')
     if result.returncode != 0:
         sys.exit(f'building prism_vr failed:\n{result.stdout}{result.stderr}')
     print(f'built {os.path.relpath(EXE, ROOT)}')

@@ -161,8 +161,9 @@ an inventory to `work\inventory\report.md`, then runs the steps in
 - Paths with characters outside plain ASCII (a user name with accents or another alphabet, for
   instance) can trip up the emulator and the NDK. *Check this PC* warns about them.
 
-To report a problem, [open an issue](../../issues/new?template=setup-problem.md) with what
-*Check this PC* prints and the log of the step that failed.
+To report a problem, [open an issue](../../issues/new?template=setup-problem.md) and attach
+the zip *Make a report* (`python tools\prism.py report`) makes right after the failure: it has
+what *Check this PC* says and the logs, with your user and computer names replaced.
 
 ## Repository layout
 

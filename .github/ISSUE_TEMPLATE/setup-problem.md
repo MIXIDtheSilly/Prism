@@ -19,12 +19,17 @@ says which GPU the emulator drew with.
 
 ```
 
-**The log**
+**The report**
 
-Paste the end of the log of what failed: `work\logs\window-setup.log` for Set up,
-`work\logs\window-vr.log` or `window-desktop.log` for Start, `work\logs\steamvr-run.log` from
-SteamVR's library, and `work\logs\emulator.log` if the emulator didn't start. Leave out anything you
-don't want public: logs have your Windows user name in their paths.
+Right after it fails, click *Make a report* under the Log (or run `python tools\prism.py report`)
+and attach the zip it makes in `work\reports`. It has what *Check this PC* and *status* say, the
+window's and the emulator's logs and, if the emulator is still running, Horizon's crash logs. Your
+Windows user and computer names are replaced in it; look through it first if you're unsure.
+
+If the report itself fails, paste the end of the log of what failed instead:
+`work\logs\window-setup.log` for Set up, `window-vr.log` or `window-desktop.log` for Start,
+`steamvr-run.log` from SteamVR's library, and `emulator.log` if the emulator didn't start (they
+have your Windows user name in their paths).
 
 ```text
 
@@ -33,4 +38,4 @@ don't want public: logs have your Windows user name in their paths.
 **Your headset's OTA**
 
 The headset and the Horizon OS version (the OTA file's name is enough). Don't attach the OTA or
-anything from `work\`.
+anything else from `work\`.

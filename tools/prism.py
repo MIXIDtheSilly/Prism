@@ -7,6 +7,7 @@
     python tools/prism.py desktop [--stop-after]
     python tools/prism.py stop
     python tools/prism.py steamvr register|unregister   # Prism in SteamVR's library, or not
+    python tools/prism.py report                   # a zip of checks and logs for an issue (work/reports)
 
 Each command takes --avd NAME: another of Prism's AVDs than prism-api34, as a test from a fresh clone
 uses so it leaves the working one alone (kept, as the settings are).
@@ -260,16 +261,22 @@ def doctor_checks(settings):
     return checks
 
 
-def doctor(args, settings):
-    checks = doctor_checks(settings)
+def doctor_lines(checks):
+    lines = []
     for what, ok, detail, fix in checks:
         mark = {True: 'ok  ', False: 'FAIL', None: 'warn'}[ok]
-        print(f'{mark}  {what}: {detail}')
+        lines.append(f'{mark}  {what}: {detail}')
         if ok is not True:
-            print(f'        fix: {fix}')
+            lines.append(f'        fix: {fix}')
     failed = [c for c in checks if c[1] is False]
-    print('everything Prism needs is here' if not failed else f'{len(failed)} thing(s) missing')
-    return not failed
+    lines.append('everything Prism needs is here' if not failed else f'{len(failed)} thing(s) missing')
+    return lines
+
+
+def doctor(args, settings):
+    checks = doctor_checks(settings)
+    print('\n'.join(doctor_lines(checks)))
+    return not [c for c in checks if c[1] is False]
 
 
 # --- setup's steps --------------------------------------------------------------------------------
@@ -516,12 +523,18 @@ def setup(args, settings):
     return True
 
 
-def status(args, settings):
+def status_lines(settings):
+    lines = []
     for name, state, _ in STEPS:
         current, detail = state(settings)
-        print(f'{ {True: "ok  ", False: "todo", None: "?   "}[current]}  {name}: {detail}')
+        lines.append(f'{ {True: "ok  ", False: "todo", None: "?   "}[current]}  {name}: {detail}')
     now, detail = emulator.stage()
-    print(f'Horizon: {now}{": " + detail if detail else ""}')
+    lines.append(f'Horizon: {now}{": " + detail if detail else ""}')
+    return lines
+
+
+def status(args, settings):
+    print('\n'.join(status_lines(settings)))
 
 
 # --- running --------------------------------------------------------------------------------------
@@ -755,6 +768,96 @@ def steamvr_library(args, settings):
     return True
 
 
+# --- report ---------------------------------------------------------------------------------------
+# A zip to attach to an issue: what doctor and status say, the window's and the emulator's logs and,
+# with the emulator running, Horizon's crash logs, the log's end and its properties. The PC's user
+# and computer names are replaced throughout (paths have them); nothing of the OTA is in it.
+
+REPORTS = os.path.join(ROOT, 'work', 'reports')
+REPORT_LOGS = ('window-*.log', 'steamvr-run.log', 'emulator.log', 'perf.csv')
+TAIL_BYTES = 2 << 20  # of each log, its end
+
+
+def private(text):
+    """text with the user's home, user name and computer name replaced."""
+    home = os.path.expanduser('~')
+    for value, name in ((home, '%USERPROFILE%'), (home.replace('\\', '/'), '%USERPROFILE%'),
+                        (os.environ.get('USERNAME', ''), '<user>'), (os.environ.get('COMPUTERNAME', ''), '<pc>')):
+        if len(value) >= 3:  # a shorter name would hit ordinary words
+            text = re.sub(r'(?<![A-Za-z0-9])' + re.escape(value) + r'(?![A-Za-z0-9])', lambda m, n=name: n, text,
+                          flags=re.I)
+    return text
+
+
+def tail(path, size=TAIL_BYTES):
+    with open(path, 'rb') as f:
+        end = f.seek(0, 2)
+        f.seek(max(0, end - size))
+        data = f.read()
+    return (f'[the first {end - size} bytes left out]\n' if end > size else '') + data.decode('utf-8', 'replace')
+
+
+def guest_files():
+    """{path in the zip: text} from the running emulator; {} when it isn't running."""
+    if not emulator.running():
+        return {}
+    files = {}
+    try:
+        emulator.adb('root', check=False, timeout=30)
+        emulator.adb('wait-for-device', timeout=30)
+        files['guest/status.txt'] = subprocess.run(
+            [sys.executable, os.path.join(HERE, 'emulator.py'), 'status'], capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=120, cwd=ROOT).stdout
+        files['guest/logcat-crash.txt'] = emulator.adb('logcat', '-d', '-b', 'crash', check=False, timeout=60)
+        files['guest/logcat.txt'] = emulator.adb('logcat', '-d', '-t', '20000', check=False, timeout=120)
+        files['guest/dmesg.txt'] = emulator.shell('dmesg | tail -n 3000', check=False, timeout=30)
+        props = emulator.shell('getprop', check=False, timeout=30).splitlines()
+        files['guest/getprop.txt'] = '\n'.join(p for p in props if 'serial' not in p.lower())
+        files['guest/tombstones.txt'] = emulator.shell('date; ls -lt /data/tombstones /data/anr', check=False, timeout=30)
+        stones = emulator.shell('ls -t /data/tombstones', check=False, timeout=30).split()
+        for name in [s for s in stones if s.startswith('tombstone_') and not s.endswith('.pb')][:5]:
+            files[f'guest/{name}.txt'] = emulator.shell(f'cat /data/tombstones/{name}', check=False, timeout=30)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        files['guest/error.txt'] = f'reading the emulator stopped: {e}'
+    return files
+
+
+def report(args, settings):
+    import glob
+    import platform
+    import time
+    import zipfile
+
+    def run(*command):
+        return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace').stdout.strip()
+    print('looking at this PC', flush=True)
+    commit = run('git', '-C', ROOT, 'log', '-1', '--format=%h (%ad)', '--date=short')
+    changed = run('git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no').splitlines()
+    shown = {**settings, 'ota': os.path.basename(settings['ota']) if settings.get('ota') else None}
+    summary = [f'Prism report, {time.strftime("%Y-%m-%d %H:%M")}',
+               f'Prism: {commit or "not a git checkout"}' + (f', {len(changed)} file(s) changed' if changed else ''),
+               f'Windows: {platform.platform()}', f'Python: {sys.version.split()[0]}',
+               f'settings: {json.dumps(shown)}', '', '== Check this PC (doctor)', *doctor_lines(doctor_checks(settings))]
+    print("looking at setup's steps and Horizon", flush=True)
+    summary += ['', "== Setup's steps and Horizon (status)", *status_lines(settings),
+                '', f'== {emulator.AVD} (config.ini)', *[f'{k}={v}' for k, v in emulator.avd_config().items()]]
+    files = {'report.txt': '\n'.join(summary) + '\n'}
+    for pattern in REPORT_LOGS:
+        for path in glob.glob(os.path.join(ROOT, emulator.LOG_DIR, pattern)):
+            files[f'logs/{os.path.basename(path)}'] = tail(path)
+    print("reading Horizon's logs from the emulator (if it's running)", flush=True)
+    files.update(guest_files())
+    os.makedirs(REPORTS, exist_ok=True)
+    out = os.path.join(REPORTS, f'prism-report-{time.strftime("%Y%m%d-%H%M%S")}.zip')
+    with zipfile.ZipFile(out + '.tmp', 'w', zipfile.ZIP_DEFLATED) as z:
+        for name, text in files.items():
+            z.writestr(name, private(text))
+    os.replace(out + '.tmp', out)
+    print(f'wrote {out} ({os.path.getsize(out) // 1024} KB): attach it to your issue. Your user and computer '
+          "names are replaced in it; look through it first if you're unsure what else it has")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
@@ -771,6 +874,7 @@ def main():
         p.add_argument('--force', action='append', choices=STEP_NAMES, metavar='STEP',
                        help='run this step even if current (repeatable)')
     command('status')
+    command('report', help='a zip of logs and checks to attach to an issue')
     command('stop')
     for mode in ('vr', 'desktop'):
         p = sub.choices[mode]
@@ -807,6 +911,8 @@ def main():
         sys.exit(0 if doctor(args, settings) else 1)
     if args.command == 'setup':
         sys.exit(0 if setup(args, settings) else 1)
+    if args.command == 'report':
+        sys.exit(0 if report(args, settings) else 1)
     if args.command == 'steamvr':
         sys.exit(0 if steamvr_library(args, settings) else 1)
     if args.command in BRIDGES:

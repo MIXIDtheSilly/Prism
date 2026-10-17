@@ -11,6 +11,7 @@ and menu buttons held while pressed. A VR bridge it didn't start (SteamVR's libr
 --from-steamvr) it follows too: its log (work/logs/steamvr-run.log) goes to the Log, and the controls
 to prism.py's control port. --vr starts VR as the window opens.
 """
+import glob
 import os
 import queue
 import re
@@ -257,8 +258,12 @@ class Window:
     def build_log(self, body):
         self.log = ScrolledText(body, width=62, height=14, font=('Consolas', 9), state='disabled', wrap='none')
         self.log.grid(row=0, column=0, sticky='ew')
-        ttk.Button(body, text='Open logs folder',
-                   command=lambda: os.startfile(LOGS)).grid(row=1, column=0, sticky='w', pady=(4, 0))
+        row = ttk.Frame(body)
+        row.grid(row=1, column=0, sticky='w', pady=(4, 0))
+        ttk.Button(row, text='Open logs folder', command=lambda: os.startfile(LOGS)).pack(side='left', padx=(0, 6))
+        # prism.py report: a zip of the checks and logs for an issue, shown in Explorer when it's made
+        self.report_button = ttk.Button(row, text='Make a report', command=lambda: self.start('report'))
+        self.report_button.pack(side='left')
 
     # --- settings -------------------------------------------------------------------------------
 
@@ -341,7 +346,7 @@ class Window:
 
     def update_buttons(self):
         busy = bool(self.command and self.command.running())
-        for b in (self.setup_button, self.doctor_button, self.library_button):
+        for b in (self.setup_button, self.doctor_button, self.library_button, self.report_button):
             b.state(['disabled'] if busy else ['!disabled'])
         for b in (self.vr_button, self.desktop_button):
             b.state(['disabled'] if busy or self.external else ['!disabled'])
@@ -389,6 +394,10 @@ class Window:
                 self.log_frame.flip()
         if name == 'stop':
             self.stopping = False
+        if name == 'report' and code == 0:
+            made = sorted(glob.glob(os.path.join(prism.REPORTS, '*.zip')), key=os.path.getmtime)
+            if made:
+                subprocess.Popen(['explorer', '/select,', made[-1]])
         self.update_buttons()
         self.refresh_setup = True
 

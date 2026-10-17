@@ -4,8 +4,8 @@ Prism uses its own AVD (prism-api34) on its own port, so it never touches other 
 Prism's AVDs (a test one) is named by PRISM_AVD, which the tools run by prism.py --avd inherit; it
 uses the same port, so one of them runs at a time.
 
-    python tools/emulator.py create            # write the AVD (stock API 34 x86_64 image)
-    python tools/emulator.py config [--display WxH] [--memory MB] [--cores N]  # change the AVD; next start
+    python tools/emulator.py create [--memory MB] [--cores N]  # write the AVD (stock API 34 x86_64 image), sized to the PC
+    python tools/emulator.py config [--display WxH] [--memory MB] [--cores N] [--fit]  # change the AVD; next start
     python tools/emulator.py start [--headless|--window] [--wait]  # boot it: writable system, SELinux permissive; windowless above 60 Hz
     python tools/emulator.py wait              # until Android reports boot completed
     python tools/emulator.py ready             # until Horizon's home is drawing (on the TSC, VrShell up, frames shared)
@@ -86,6 +86,8 @@ def shell(command, check=True, timeout=None):
 
 
 def create(args):
+    memory, cores_ = fitted()
+    memory, cores_ = args.memory or memory, args.cores or cores_
     image = os.path.join(sdk_root(), IMAGE)
     if not os.path.exists(os.path.join(image, 'system.img')):
         sys.exit(f'{image} is missing; install system-images;android-34;google_apis;x86_64')
@@ -99,8 +101,8 @@ def create(args):
     config = {
         'avd.ini.encoding': 'UTF-8', 'AvdId': AVD, 'avd.ini.displayname': 'Prism (Horizon OS)',
         'image.sysdir.1': IMAGE.replace('/', '\\') + '\\', 'tag.id': 'google_apis', 'tag.display': 'Google APIs',
-        'abi.type': 'x86_64', 'hw.cpu.arch': 'x86_64', 'hw.cpu.ncore': str(args.cores),
-        'hw.ramSize': str(args.memory), 'vm.heapSize': '512M', 'disk.dataPartition.size': '24G',
+        'abi.type': 'x86_64', 'hw.cpu.arch': 'x86_64', 'hw.cpu.ncore': str(cores_),
+        'hw.ramSize': str(memory), 'vm.heapSize': '512M', 'disk.dataPartition.size': '24G',
         'hw.gpu.enabled': 'yes', 'hw.gpu.mode': 'host', 'hw.gltransport': 'asg',
         # A landscape 16:9 display, the shape a desktop window of Horizon will have: see DISPLAY.
         'hw.lcd.width': str(DISPLAY[0]), 'hw.lcd.height': str(DISPLAY[1]), 'hw.lcd.density': str(density(DISPLAY[1])),
@@ -112,7 +114,7 @@ def create(args):
     }
     with open(os.path.join(content, 'config.ini'), 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(f'{k}={v}\n' for k, v in config.items())
-    print(f'created {AVD} in {content}')
+    print(f'created {AVD} in {content}: {memory} MB, {cores_} cores')
 
 
 def listed():
@@ -210,6 +212,11 @@ def configure(args):
         changes['hw.ramSize'] = str(args.memory)
     if args.cores:
         changes['hw.cpu.ncore'] = str(args.cores)
+    if args.fit:
+        changes.update(oversized())
+        if not changes:
+            print('the AVD fits this PC')
+            return
     if not changes:
         print(f'display {config.get("hw.lcd.width")}x{config.get("hw.lcd.height")} at {refresh_rate()} Hz '
               f'(density {config.get("hw.lcd.density")}), memory {config.get("hw.ramSize")} MB, '
@@ -292,6 +299,13 @@ def start(args):
             sys.exit(f'{SERIAL} is running another AVD ({other}); stop it first (python tools/emulator.py stop)')
         print(f'{SERIAL} is already running')
         return
+    try:
+        free, want = pc_memory_mb(available=True), int(avd_config().get('hw.ramSize', 0))
+    except (ValueError, AttributeError, OSError):
+        free = want = 0
+    if want and free < want + 2048:
+        print(f'warning: {free // 1024} GB of memory is free and the AVD takes {want // 1024} GB; close programs '
+              'first, or Windows will page and Horizon will stutter')
     os.makedirs(LOG_DIR, exist_ok=True)
     log = open(os.path.join(LOG_DIR, 'emulator.log'), 'w')
     command = [os.path.join(sdk_root(), 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator'),
@@ -354,12 +368,25 @@ def pin_to_performance_cores():
     doesn't move vCPU threads to efficiency cores, as it does while the window is minimized."""
     import ctypes
     from ctypes import wintypes
+    mask = performance_mask()
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetProcessAffinityMask.argtypes = (wintypes.HANDLE, ctypes.c_size_t)
+    if mask and kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), mask):
+        print(f'emulator pinned to performance cores (mask {mask:#x})')
+
+
+def performance_mask():
+    """The affinity mask of the CPU's performance cores' logical processors (see
+    pin_to_performance_cores); 0 if Windows doesn't say."""
+    import ctypes
+    from ctypes import wintypes
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     length = wintypes.DWORD(0)
     kernel32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(length))  # 0: RelationProcessorCore
     buffer = ctypes.create_string_buffer(length.value)
     if not kernel32.GetLogicalProcessorInformationEx(0, buffer, ctypes.byref(length)):
-        return
+        return 0
     mask, best, offset = 0, -1, 0
     while offset < length.value:
         # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Size at 4; PROCESSOR_RELATIONSHIP's
@@ -372,10 +399,59 @@ def pin_to_performance_cores():
         if efficiency == best:
             mask |= core
         offset += size
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.SetProcessAffinityMask.argtypes = (wintypes.HANDLE, ctypes.c_size_t)
-    if mask and kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), mask):
-        print(f'emulator pinned to performance cores (mask {mask:#x})')
+    return mask
+
+
+# What the AVD gets of the PC. Horizon's home wants 12 GB (with 8 it had 3 GB in swap) and 6 vCPUs;
+# a smaller PC gives less, down to the least Horizon runs with, keeping HOST_MB for Windows, the
+# emulator's own process and the bridge, and HOST_THREADS of the performance cores' threads (which
+# the emulator is pinned to) for gfxstream's render threads.
+MEMORY_MB = (8192, 12288)  # least, wanted
+CORES = (4, 6)
+HOST_MB = 8192
+HOST_THREADS = 2
+
+
+def pc_memory_mb(available=False):
+    """The PC's physical memory in MB (or what's free of it now)."""
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('dwLength', ctypes.c_uint32), ('dwMemoryLoad', ctypes.c_uint32),
+                    ('ullTotalPhys', ctypes.c_uint64), ('ullAvailPhys', ctypes.c_uint64),
+                    ('ullTotalPageFile', ctypes.c_uint64), ('ullAvailPageFile', ctypes.c_uint64),
+                    ('ullTotalVirtual', ctypes.c_uint64), ('ullAvailVirtual', ctypes.c_uint64),
+                    ('ullAvailExtendedVirtual', ctypes.c_uint64)]
+    status = MemoryStatus(dwLength=ctypes.sizeof(MemoryStatus))
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    return (status.ullAvailPhys if available else status.ullTotalPhys) // 2 ** 20
+
+
+def performance_threads():
+    return bin(performance_mask()).count('1') or os.cpu_count() or 1
+
+
+def fitted():
+    """(memory MB, cores) the AVD gets on this PC: what Horizon wants, or less on a smaller PC."""
+    memory = (pc_memory_mb() - HOST_MB) // 1024 * 1024
+    return (max(MEMORY_MB[0], min(MEMORY_MB[1], memory)),
+            max(CORES[0], min(CORES[1], performance_threads() - HOST_THREADS)))
+
+
+def oversized():
+    """The AVD's settings that ask for more than this PC has, as {key: what fits}: memory that leaves
+    Windows less than HOST_MB, or more vCPUs than performance threads. More than Horizon wants on a
+    PC that has it is left alone."""
+    config, (memory, cores_) = avd_config(), fitted()
+    over = {}
+    try:
+        if int(config.get('hw.ramSize', 0)) > max(memory, pc_memory_mb() - HOST_MB):
+            over['hw.ramSize'] = str(memory)
+        if int(config.get('hw.cpu.ncore', 0)) > max(cores_, performance_threads()):
+            over['hw.cpu.ncore'] = str(cores_)
+    except ValueError:
+        pass
+    return over
 
 
 CLOCKSOURCE = '/sys/devices/system/clocksource/clocksource0/current_clocksource'
@@ -568,13 +644,14 @@ def main():
     sub = ap.add_subparsers(dest='command', required=True)
     c = sub.add_parser('create')
     c.add_argument('--force', action='store_true')
-    c.add_argument('--cores', type=int, default=6)
-    c.add_argument('--memory', type=int, default=12288)  # with 8192, Horizon's home had 3 GB in swap
+    c.add_argument('--cores', type=int, help=f'vCPUs (default: {CORES[1]}, fewer on a PC with fewer performance threads)')
+    c.add_argument('--memory', type=int, metavar='MB', help=f'default: {MEMORY_MB[1]}, less on a PC with less memory')
     cf = sub.add_parser('config')
     cf.add_argument('--display', metavar='WxH', help=f'e.g. {DISPLAY[0]}x{DISPLAY[1]} (16:9)')
     cf.add_argument('--refresh', type=int, metavar='HZ', help='the display refresh rate; deploy again after')
     cf.add_argument('--memory', type=int, metavar='MB')
     cf.add_argument('--cores', type=int)
+    cf.add_argument('--fit', action='store_true', help='lower memory and cores that ask for more than this PC has')
     ps = sub.add_parser('patch-share-vid')
     ps.add_argument('--rate', type=int, help="frames a second (default: the AVD's refresh rate)")
     ps.add_argument('--undo', action='store_true', help='restore the emulator builds as installed')

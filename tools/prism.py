@@ -161,6 +161,22 @@ def doctor_checks(settings):
         '"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
     add('git', bool(shutil.which('git')), shutil.which('git') or 'not found',
         'winget install Git.Git, then open a new terminal')
+    gb = emulator.pc_memory_mb() / 1024
+    memory, cores = emulator.fitted()
+    add('Memory (16 GB or more)', True if gb >= 15 else None if gb >= 11 else False,
+        f'{gb:.0f} GB; the AVD gets {memory // 1024} GB',
+        f'with less than 16 GB Horizon runs in {emulator.MEMORY_MB[0] // 1024} GB and swaps; close other programs '
+        'before starting it' if gb >= 11 else f'Prism needs about {(emulator.MEMORY_MB[0] + 4096) // 1024} GB')
+    threads = emulator.performance_threads()
+    add('CPU (8 or more performance threads)', True if threads >= 8 else None if threads >= emulator.CORES[0] else False,
+        f'{threads} performance threads of {os.cpu_count()}; the AVD gets {cores} cores',
+        'with fewer, Horizon runs but its frame rate drops' if threads >= emulator.CORES[0] else
+        f'Prism needs {emulator.CORES[0]} or more')
+    if os.path.exists(emulator.config_path()):
+        over = emulator.oversized()
+        add(f'{emulator.AVD} fits this PC', not over, 'yes' if not over else
+            'asks for ' + ', '.join(f'{k}={emulator.avd_config().get(k)}' for k in over),
+            'Set up lowers it (python tools/emulator.py config --fit)')
     odd = [p for p in (ROOT, emulator.avd_home(), sdk) if not p.isascii()]
     add('Paths in plain ASCII', True if not odd else None, ', '.join(odd) or 'yes',
         "the emulator and the NDK's tools can fail on paths with other characters: move Prism to one "
@@ -254,11 +270,17 @@ def workspace_run(settings, force):
 
 
 def avd_state(settings):
-    exists = os.path.exists(emulator.config_path())
-    return exists, emulator.AVD if exists else 'not created'
+    if not os.path.exists(emulator.config_path()):
+        return False, 'not created'
+    over = emulator.oversized()
+    if over:
+        return False, f'{emulator.AVD} asks for more than this PC has ({", ".join(over)})'
+    return True, emulator.AVD
 
 
 def avd_run(settings, force):
+    if os.path.exists(emulator.config_path()) and not force:
+        return stopped() and python('emulator.py', 'config', '--fit')
     return stopped() and python('emulator.py', 'create', *(['--force'] if force else []))
 
 

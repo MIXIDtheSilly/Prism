@@ -110,6 +110,7 @@ is ignored by git.
 | Visual Studio's C++ tools | Visual Studio with *Desktop development with C++*, or just the build tools: `winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
 | Git | `winget install Git.Git` |
 | SteamVR (for a headset) | From Steam; *Desktop* works without it |
+| 16 GB of memory and 8 CPU threads | Horizon gets 12 GB and 6 cores. With 12 GB, or 4 to 7 threads, setup gives it less (8 GB, 4 cores) and it runs slower |
 | About 60 GB free | The workspace and the emulator's disk |
 
 Open a new terminal after installing, so the new programs are on its PATH.

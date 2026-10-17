@@ -13,16 +13,16 @@ Each command takes --avd NAME: another of Prism's AVDs than prism-api34, as a te
 uses so it leaves the working one alone (kept, as the settings are).
 
 setup runs each step that isn't current, in order (STEPS): the Android SDK's packages Prism needs
-(tools/sdk.py installs what's missing), the workspace from the OTA, the AVD and
-its display rate, the emulator's frame sharing, the builds, the PC apps, the deploy and the Meta
-apps copied from your headset (tools/apps.py pull), installed again after a deploy. Each step
-knows whether it's current (the builds by their stamps, the deploy by the id it leaves on the
-guest), so setup run again with nothing changed does nothing, and after a pull does only what the
-change needs. vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready)
-and run tools/steamvr.py or tools/viewer.py; the emulator keeps running when they exit, since a boot
-takes minutes (--stop-after, or stop, shuts it down). While vr runs, the bridge takes commands
-(recenter, latency MS, meta|menu down|up) on 127.0.0.1:CONTROL_PORT, a line each: the window's, for a
-bridge it didn't start.
+(tools/sdk.py installs what's missing), the workspace from the OTA, the AVD and its display rate,
+the emulator's frame sharing and pbuffer pool, the builds, the PC apps, the deploy and the Meta apps
+copied from your headset (tools/apps.py pull), installed again after a deploy. Each step knows
+whether it's current (the builds by their stamps, the deploy by the id it leaves on the guest), so
+setup run again with nothing changed does nothing, and after a pull does only what the change needs.
+vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready) and run
+tools/steamvr.py or tools/viewer.py; the emulator keeps running when they exit, since a boot takes
+minutes (--stop-after, or stop, shuts it down). While vr runs, the bridge takes commands (recenter,
+latency MS, meta|menu down|up) on 127.0.0.1:CONTROL_PORT, a line each: the window's, for a bridge it
+didn't start.
 
 steamvr register puts Prism in SteamVR's library (work/steamvr/prism.vrmanifest), which runs
 vr --from-steamvr: the bridge starts at once, since SteamVR waits for its app's session, and shows
@@ -199,6 +199,12 @@ def doctor_checks(settings):
                 'a build whose frame sharing Prism knows' if None not in sites else
                 f'emulator {version}, whose frame sharing patch-share-vid does not know',
                 f'install emulator {android_sdk.EMULATOR_TESTED[-1]}, or set the refresh rate to 60')
+        site = pbuffer_site()
+        add("Emulator's pbuffer pool", None if site is None else True,
+            f'emulator {version}, whose pbuffer pool patch-pbuffers does not know' if site is None else
+            'patched' if site[1] else 'a build whose pbuffer pool Prism knows; setup patches it',
+            f'install emulator {android_sdk.EMULATOR_TESTED[-1]}; without it Horizon slows as apps open, '
+            'until the emulator restarts')
     vs = found(vcvars)
     add("Visual Studio's C++ tools", bool(vs), vs or 'not found',
         'Visual Studio (Community is fine) with "Desktop development with C++", or just its build tools: '
@@ -389,6 +395,28 @@ def sharing_run(settings, force):
     return stopped() and python('emulator.py', 'patch-share-vid', '--rate', settings['refresh'])
 
 
+def pbuffer_site():
+    try:
+        with open(emulator.pbuffer_path(), 'rb') as f:
+            return emulator.pbuffer_site(f.read())
+    except OSError:
+        return None
+
+
+def pbuffers_state(settings):
+    site = pbuffer_site()
+    if site is None:
+        return None, 'a gfxstream build patch-pbuffers does not know: Horizon slows as apps open until the emulator restarts'
+    return site[1], 'gfxstream reuses pbuffers' if site[1] else 'gfxstream leaks a pbuffer per surface'
+
+
+def pbuffers_run(settings, force):
+    if pbuffer_site() is None:
+        say('leaving gfxstream as installed')
+        return True
+    return stopped() and python('emulator.py', 'patch-pbuffers')
+
+
 def other_avd():
     """The AVD on Prism's port when it isn't this one (they share the port), else None."""
     running = emulator.running_avd()
@@ -494,6 +522,7 @@ STEPS = [('sdk', sdk_state, sdk_run),
          ('avd', avd_state, avd_run),
          ('refresh', refresh_state, refresh_run),
          ('frame sharing', sharing_state, sharing_run),
+         ('pbuffers', pbuffers_state, pbuffers_run),
          ('emulator', emulator_state, emulator_run),
          ('bionic', bionic_state, bionic_run),
          *[(name, *build_step(module, out)) for name, module, out in BUILDS],

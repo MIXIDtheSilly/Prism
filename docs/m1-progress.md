@@ -600,5 +600,24 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
     p99 14.5 ms and 15 gaps with the PC quiet, so measure with it quiet. The jitter is VrShell's
     ~10.4 ms of translated code a frame in an 11.1 ms budget; shrinking it needs the translator's
     code quality, or less work in the shell, not a driver or emulator change.
+  - *Slower the longer it runs (2026-10-17):* after hours of opening apps the shared frames fell from
+    85 to ~42 a second and stayed there until the emulator restarted. The host's render thread spent
+    ~58% of a core in the kernel's `NtUserWindowFromDC`, which NVIDIA's `DrvSetContext` calls on every
+    `wglMakeCurrent` and which walks the session's own-DC windows, newest first; the emulator had
+    1057 hidden `NVOpenGLPbuffer` windows, one for each WGL pbuffer (holding 500, 1000 or 2000 windows
+    in another process took a fresh emulator from 90 to 84, 71 and 38). gfxstream gives every guest
+    EGL surface a 1x1 pbuffer from a pool (`libgfxstream_backend`'s WGL display; the pool grows by as
+    many as are in use when it runs dry) and puts it back on release only if `wglReleasePbufferDCARB`
+    succeeds. On NVIDIA it mostly doesn't: making a context current rewrites the DC the driver keeps
+    for a list of drawables, so the DC gfxstream got for a pbuffer no longer matches it
+    (`0xC0070591`), and gfxstream gives up on that pbuffer, which stays counted in use. Of 272 in use
+    one evening, 251 were such leftovers. `python tools/emulator.py patch-pbuffers` (a setup step)
+    patches out the jump on that failure, so the pbuffer goes back to the pool; gfxstream binds a
+    pbuffer with the DC it gets when handing it out, so the driver's record isn't needed. Patched:
+    160 guest surfaces made and destroyed, and 24 apps opened and closed, left the count in use where
+    it was (unpatched, each 20 surfaces kept 19), with no failed or retried `wglMakeCurrent`. A
+    30-minute soak from a fresh boot opening an app every 30 s (60 opens, `soak.py`'s new
+    `emulator_windows` column) held 103-107 windows throughout, 88.5 shared frames a second on
+    average, nothing crashed; unpatched, as many opens had taken the count from 49 into the hundreds.
 - **Next:** panels' glass backgrounds; system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

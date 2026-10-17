@@ -4,10 +4,11 @@
 
 Horizon has to be up (python tools/prism.py desktop, or vr). Every --every seconds it records a row:
 the shared frames over 10 s (perf.py's fps, p99 and long gaps), the guest's free memory and swap
-(/proc/meminfo), the emulator's memory on the PC (its working set) and the PC's free memory, and
-what went wrong since the start: crashes (Java's FATAL EXCEPTION and native Fatal signal lines in
-logcat's crash buffer, new tombstones), new ANRs, and system_server or VrShell restarting (a new
-pid). With --launch, between rows it opens one of the apps in turn (the given packages, or LAUNCH)
+(/proc/meminfo), the emulator's memory on the PC (its working set), its windows (NVIDIA's driver
+gives each of gfxstream's pbuffers a hidden one, and every frame pays for them) and the PC's free
+memory, and what went wrong since the start: crashes (Java's FATAL EXCEPTION and native Fatal
+signal lines in logcat's crash buffer, new tombstones), new ANRs, and system_server or VrShell
+restarting (a new pid). With --launch, between rows it opens one of the apps in turn (the given packages, or LAUNCH)
 and closes it again after LAUNCH_SECONDS, so apps start and stop all through the run.
 
 Rows go to the console and work/logs/soak-TIME[-LABEL].csv; the end says how the frame rate and memory
@@ -16,6 +17,8 @@ rate fell below half the display's, or Horizon stopped answering.
 """
 import argparse
 import csv
+import ctypes
+import ctypes.wintypes
 import os
 import re
 import subprocess
@@ -50,6 +53,22 @@ def emulator_working_set_mb():
                          capture_output=True, text=True, errors='replace').stdout
     sizes = [int(re.sub(r'\D', '', fields[-1]) or 0) for fields in csv.reader(out.splitlines()) if len(fields) >= 5]
     return max(sizes, default=0) // 1024
+
+
+def emulator_windows():
+    """How many windows the emulator process has, hidden ones too; 0 if it isn't found."""
+    out = subprocess.run(['tasklist', '/fi', 'imagename eq qemu-system-x86_64*', '/fo', 'csv', '/nh'],
+                         capture_output=True, text=True, errors='replace').stdout
+    emulators = {int(fields[1]) for fields in csv.reader(out.splitlines()) if len(fields) >= 5}
+    user32, count = ctypes.windll.user32, [0]
+
+    def visit(window, _):
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+        count[0] += pid.value in emulators
+        return True
+    user32.EnumWindows(ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)(visit), 0)
+    return count[0]
 
 
 def pids():
@@ -119,7 +138,7 @@ def main():
     name = '-'.join(filter(None, ['soak', time.strftime('%Y%m%d-%H%M%S'), re.sub(r'[^\w.-]', '_', args.label)]))
     out = os.path.join(ROOT, emulator.LOG_DIR, name + '.csv')
     columns = ['minute', 'shared_fps', 'p99_ms', 'long_gaps', 'guest_available_mb', 'guest_swap_used_mb',
-               'emulator_ws_mb', 'pc_free_mb', 'crashes', 'new_tombstones', 'new_anrs', 'restarts', 'app']
+               'emulator_ws_mb', 'emulator_windows', 'pc_free_mb', 'crashes', 'new_tombstones', 'new_anrs', 'restarts', 'app']
     print(f'watching for {args.minutes:g} minutes, a row every {args.every:g} s, into {out}')
     print('  '.join(columns))
     rows, problems, restarted, cycle = [], [], set(), 0
@@ -155,7 +174,7 @@ def main():
             found = crashes(since)
             row = [f'{(time.time() - start) / 60:.1f}', f"{frames['fps']:.1f}", f"{frames['p99_ms']:.1f}",
                    frames['long_gaps'], memory['MemAvailable'], memory['SwapTotal'] - memory['SwapFree'],
-                   emulator_working_set_mb(), emulator.pc_memory_mb(available=True), len(found),
+                   emulator_working_set_mb(), emulator_windows(), emulator.pc_memory_mb(available=True), len(found),
                    len(listing('/data/tombstones') - tombstones), len(listing('/data/anr') - anrs), len(restarted), app]
             rows.append(row)
             writer.writerow(row)
@@ -170,7 +189,8 @@ def main():
         print(f'shared frames: mean {sum(fps) / len(fps):.1f}, lowest {min(fps):.1f} a second (display {rate} Hz); '
               f'worst p99 {max(float(r[2]) for r in rows):.1f} ms')
         print(f"guest memory available: {rows[0][4]} -> {rows[-1][4]} MB, swap used {rows[0][5]} -> {rows[-1][5]} MB")
-        print(f"emulator's working set: {rows[0][6]} -> {rows[-1][6]} MB; PC free: {rows[0][7]} -> {rows[-1][7]} MB")
+        print(f"emulator's working set: {rows[0][6]} -> {rows[-1][6]} MB, windows {rows[0][7]} -> {rows[-1][7]}; "
+              f"PC free: {rows[0][8]} -> {rows[-1][8]} MB")
         if min(fps) < rate / 2:
             problems.append(f'the frame rate fell to {min(fps):.1f} a second')
     problems += [f'crashed: {c}' for c in found] + [f'restarted: {r}' for r in sorted(restarted)]

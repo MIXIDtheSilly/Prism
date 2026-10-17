@@ -10,6 +10,7 @@ uses the same port, so one of them runs at a time.
     python tools/emulator.py wait              # until Android reports boot completed
     python tools/emulator.py ready             # until Horizon's home is drawing (on the TSC, VrShell up, frames shared)
     python tools/emulator.py patch-share-vid [--rate HZ] [--undo]  # -share-vid shares more than 60 frames a second
+    python tools/emulator.py patch-pbuffers [--undo]  # gfxstream reuses pbuffers the NVIDIA driver won't release
     python tools/emulator.py clock             # reboot until the guest's clock is the TSC (start --wait does this)
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
@@ -290,6 +291,67 @@ def patch_share_vid(args):
         with open(path, 'wb') as f:
             f.write(data)
         print(f'{name}: shares up to {rate} frames a second (was {was})')
+
+
+# gfxstream backs each guest EGL surface with a 1x1 WGL pbuffer from a pool, and returns it to the
+# pool by releasing its DC first; when wglReleasePbufferDCARB fails it gives up, and the pbuffer is
+# neither reused nor destroyed. On NVIDIA it fails for most of them: making a context current
+# rewrites the DC the driver keeps for other pbuffers (DrvSetContext walks a list of drawables), so
+# the DC gfxstream got for one no longer matches. Every app opened leaked its surfaces, the pool
+# doubled to make up for them, and each pbuffer has a hidden window that every wglMakeCurrent pays
+# for (NtUserWindowFromDC walks them): 1000 of them halve the frame rate. Patching out the jump on
+# that failure (je -> two nops) returns the pbuffer to the pool anyway; gfxstream binds a pbuffer
+# with the DC it gets when handing it out, so the driver's bookkeeping isn't needed. The pattern is
+# the release's tail: call rax; nop; mov qword ptr [rdi + 0x18], 0; mov byte ptr [rdi + 5], 1;
+# test eax, eax; je. The SDK's original is kept beside it as .orig, as for frame sharing.
+PBUFFER_BINARY = os.path.join('lib64', 'libgfxstream_backend.dll')
+PBUFFER_BEFORE = bytes.fromhex('ffd09048c7471800000000c647050185c0')
+PBUFFER_PATCHED = b'\x90\x90'
+
+
+def pbuffer_path():
+    return os.path.join(sdk_root(), 'emulator', PBUFFER_BINARY)
+
+
+def pbuffer_site(data):
+    """(offset of the jump, whether it's patched) in gfxstream's image, or None unless exactly one place fits."""
+    pattern = re.escape(PBUFFER_BEFORE) + rb'(?:\x74[\x00-\x7f]|\x90\x90)'
+    sites = [m.start() + len(PBUFFER_BEFORE) for m in re.finditer(pattern, bytes(data), re.DOTALL)]
+    if len(sites) != 1:
+        return None
+    return sites[0], bytes(data[sites[0]:sites[0] + 2]) == PBUFFER_PATCHED
+
+
+def patch_pbuffers(args):
+    """Makes gfxstream return pbuffers to its pool when the driver won't release their DCs; --undo
+    restores the installed build. The emulator has to be stopped: Windows locks a loaded DLL."""
+    if running():
+        sys.exit('stop the emulator first (python tools/emulator.py stop)')
+    path = pbuffer_path()
+    if args.undo:
+        if os.path.exists(path + '.orig'):
+            shutil.copyfile(path + '.orig', path)
+            print(f'{PBUFFER_BINARY}: restored')
+        else:
+            print(f'{PBUFFER_BINARY}: nothing to restore')
+        return
+    with open(path, 'rb') as f:
+        data = bytearray(f.read())
+    site = pbuffer_site(data)
+    if site is None:
+        sys.exit(f'{PBUFFER_BINARY}: not a build whose pbuffer pool this knows (emulator 37.2.12 is); nothing changed. '
+                 'Horizon runs without it, slowing as apps open: restart the emulator now and then')
+    offset, patched = site
+    if patched:
+        print(f'{PBUFFER_BINARY}: already returns pbuffers to the pool')
+        return
+    if not os.path.exists(path + '.orig'):
+        shutil.copyfile(path, path + '.orig')
+    data[offset:offset + 2] = PBUFFER_PATCHED
+    with open(path + '.tmp', 'wb') as f:
+        f.write(data)
+    os.replace(path + '.tmp', path)
+    print(f'{PBUFFER_BINARY}: returns pbuffers to the pool when the driver keeps their DCs')
 
 
 def start(args):
@@ -655,6 +717,7 @@ def main():
     ps = sub.add_parser('patch-share-vid')
     ps.add_argument('--rate', type=int, help="frames a second (default: the AVD's refresh rate)")
     ps.add_argument('--undo', action='store_true', help='restore the emulator builds as installed')
+    sub.add_parser('patch-pbuffers').add_argument('--undo', action='store_true', help='restore gfxstream as installed')
     s = sub.add_parser('start')
     s.add_argument('--headless', action='store_true', help='no emulator window (the default above 60 Hz)')
     s.add_argument('--window', action='store_true', help='keep the emulator window above 60 Hz too')
@@ -681,7 +744,8 @@ def main():
     if args.command == 'ready':
         sys.exit(0 if ready(args) else 1)
     {'create': create, 'config': configure, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
-     'stop': stop, 'patch-share-vid': patch_share_vid, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
+     'stop': stop, 'patch-share-vid': patch_share_vid, 'patch-pbuffers': patch_pbuffers, 'emulator-flag': emulator_flag,
+     'model': model}[args.command](args)
 
 
 if __name__ == '__main__':

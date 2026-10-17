@@ -186,8 +186,9 @@ tools/relay.py        Builds the binder bridge between arm64 apps and the host's
 tools/guest_media.py  Builds the arm64 media functions Meta's libraries expect
 tools/head.py         Moves the headset from the PC: mouse and keys drive the head pose
 tools/perf.py         Measures shared frame rate, jitter and guest CPU (the benchmark for frame-rate work)
+tools/soak.py         Leaves Horizon running, opening and closing apps, and records frames, memory and crashes
 tools/stamp.py        Whether a build is current: a stamp of what it was made from
-tools/prism.py        The launcher: doctor, setup (each step only when not current), vr, desktop, stop
+tools/prism.py        The launcher: doctor, setup (each step only when not current), vr, desktop, stop, report
 tools/prism_ui.pyw    The launcher's window (Prism.cmd opens it)
 tools/viewer.py       Horizon in a desktop window: the mouse points and clicks, keys move
 tools/steamvr.py      Horizon in a PC headset through SteamVR (OpenXR): its tracking and frames

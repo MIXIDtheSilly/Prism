@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools', 'inventory'))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'ota'))
 sys.path.append(os.path.join(ROOT, 'tools'))
 import dex  # noqa: E402
+import sdk as android_sdk  # noqa: E402
 import stamp  # noqa: E402
 from inventory import Tree, classpaths  # noqa: E402
 
@@ -45,17 +46,23 @@ def inputs(fs=os.path.join(ROOT, 'work', 'fs'), baseline=os.path.join(ROOT, 'wor
             *extracted(fs), *extracted(baseline)]
 
 
-def find_ndk(sdk_hint):
-    roots = [sdk_hint] if sdk_hint else []
-    roots += [os.environ.get('ANDROID_NDK_HOME'), os.environ.get('ANDROID_NDK_ROOT')]
-    for sdk in (os.environ.get('ANDROID_SDK_ROOT'), os.environ.get('ANDROID_HOME'),
-                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'), os.path.expanduser('~/Android/Sdk')):
+def find_ndk(ndk_hint):
+    """--ndk's NDK, else NDK 27 (android_sdk.NDK_MAJOR, the one Prism's builds are tested with) from
+    ANDROID_NDK_HOME, ANDROID_NDK_ROOT or the SDK."""
+    usable = lambda root: root and os.path.isdir(os.path.join(root, 'toolchains', 'llvm'))  # noqa: E731
+    if usable(ndk_hint):
+        return ndk_hint
+    roots = [os.environ.get('ANDROID_NDK_HOME'), os.environ.get('ANDROID_NDK_ROOT')]
+    for sdk in android_sdk.candidates():
         if sdk:
-            roots += sorted(glob.glob(os.path.join(sdk, 'ndk', '*')), reverse=True)
+            roots += android_sdk.ndks(sdk)
+    roots = [r for r in roots if usable(r)]
     for root in roots:
-        if root and os.path.isdir(os.path.join(root, 'toolchains', 'llvm')):
+        if (android_sdk.revision(root) or '').split('.')[0] == android_sdk.NDK_MAJOR:
             return root
-    sys.exit('Android NDK not found; pass --ndk')
+    have = f' (found NDK {android_sdk.revision(roots[0]) or "?"} at {roots[0]})' if roots else ''
+    sys.exit(f'Android NDK {android_sdk.NDK_MAJOR} not found{have}; python tools/sdk.py install installs it '
+             '(or pass --ndk)')
 
 
 def jar_dexes(path):

@@ -100,14 +100,33 @@ This repository contains no Horizon OS files and never will. You supply a full O
 headset; Prism unpacks and analyses it locally. Everything derived from it goes to `work/`, which
 is ignored by git.
 
-Requirements: Windows with the Windows Hypervisor Platform, Python 3.10+, the Android SDK (the
-emulator, platform-tools, the NDK and `system-images;android-34;google_apis;x86_64`, the stock
-baseline Prism builds on), Visual Studio's C++ tools and Git; SteamVR for a headset.
+### What to install first
+
+| What | How |
+|---|---|
+| Windows 10 or 11 with virtualization on | Turn on virtualization (VT-x or AMD-V/SVM) in the BIOS, then Windows Hypervisor Platform: as administrator, `dism /online /enable-feature /featurename:HypervisorPlatform /all`, and restart |
+| Python 3.10 or later | `winget install Python.Python.3.13` (or python.org, with *Add python.exe to PATH* ticked) |
+| Java 17 or later | `winget install EclipseAdoptium.Temurin.21.JDK` |
+| Visual Studio's C++ tools | Visual Studio with *Desktop development with C++*, or just the build tools: `winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
+| Git | `winget install Git.Git` |
+| SteamVR (for a headset) | From Steam; *Desktop* works without it |
+| About 60 GB free | The workspace and the emulator's disk |
+
+Open a new terminal after installing, so the new programs are on its PATH.
+
+You don't need to install the Android SDK yourself: *Set up* installs the parts Prism needs (the
+emulator, platform-tools, NDK 27 and `system-images;android-34;google_apis;x86_64`, the stock
+baseline Prism builds on) with Google's `sdkmanager`, and accepts the Android SDK's licenses as it
+does. It uses the SDK Android Studio has if there is one, or creates one at
+`%LOCALAPPDATA%\Android\Sdk`. Prism builds with NDK 27 even when a newer one is installed, and is
+tested with emulators 37.1.11 and 37.2.12.
+
+### Setting up
 
 Open **`Prism.cmd`**: a small window that does the rest. Under *Setup and settings*, pick your
-OTA, then *Check this PC* (what's missing and how to get it) and *Set up*. The first setup extracts
-the OTA, creates the emulator, builds Prism's parts and deploys Horizon onto it, which takes a
-while; after that, setting up again does only what changed. Then *Start VR* (or *Desktop*): it waits
+OTA, then *Check this PC* (what's missing and how to get it) and *Set up*. The first setup installs
+the SDK's parts, extracts the OTA, creates the emulator, builds Prism's parts and deploys Horizon
+onto it, which takes a while; after that, setting up again does only what changed. Then *Start VR* (or *Desktop*): it waits
 until Horizon's home is drawing and opens it in the headset, with the latency, recenter and the
 Meta and menu buttons in the window.
 
@@ -137,6 +156,8 @@ an inventory to `work\inventory\report.md`, then runs the steps in
   `work\logs\window-setup.log`; run *Set up* again after fixing it, and it picks up from there.
 - If the emulator doesn't start or Horizon doesn't reach Home, `python tools\emulator.py status`
   says how far it got, and `work\logs\emulator.log` has the emulator's own output.
+- Paths with characters outside plain ASCII (a user name with accents or another alphabet, for
+  instance) can trip up the emulator and the NDK. *Check this PC* warns about them.
 
 To report a problem, [open an issue](../../issues/new?template=setup-problem.md) with what
 *Check this PC* prints and the log of the step that failed.
@@ -144,6 +165,7 @@ To report a problem, [open an issue](../../issues/new?template=setup-problem.md)
 ## Repository layout
 
 ```text
+tools/sdk.py          The Android SDK's parts Prism needs, installed with sdkmanager
 tools/prepare.py      One-command workspace setup from an OTA
 tools/ota/            OTA payload, ext4, APEX and super-partition unpackers (pure Python)
 tools/inventory/      Horizon vs stock Android analysis (dex, binary XML, ELF readers)

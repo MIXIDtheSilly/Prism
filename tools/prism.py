@@ -11,7 +11,8 @@
 Each command takes --avd NAME: another of Prism's AVDs than prism-api34, as a test from a fresh clone
 uses so it leaves the working one alone (kept, as the settings are).
 
-setup runs each step that isn't current, in order (STEPS): the workspace from the OTA, the AVD and
+setup runs each step that isn't current, in order (STEPS): the Android SDK's packages Prism needs
+(tools/sdk.py installs what's missing), the workspace from the OTA, the AVD and
 its display rate, the emulator's frame sharing, the builds, the PC apps, the deploy and the Meta
 apps copied from your headset (tools/apps.py pull), installed again after a deploy. Each step
 knows whether it's current (the builds by their stamps, the deploy by the id it leaves on the
@@ -118,34 +119,41 @@ def steamvr_runtime():
 
 def doctor_checks(settings):
     """(what, ok, detail, how to fix it): ok is True, False (Prism can't run) or None (a warning)."""
-    from build import find_ndk
+    import sdk as android_sdk
     from viewer import vcvars
     checks = []
     add = lambda what, ok, detail='', fix='': checks.append((what, ok, detail, fix))  # noqa: E731
     add('Python 3.10 or later', sys.version_info >= (3, 10), sys.version.split()[0],
         'winget install Python.Python.3.13 (or python.org)')
-    sdk = found(emulator.sdk_root)
-    add('Android SDK', bool(sdk), sdk or 'not found',
-        'install Android Studio (or its command-line tools) and set ANDROID_SDK_ROOT')
-    if sdk:
-        image = os.path.join(sdk, emulator.IMAGE, 'system.img')
-        add('Stock Android 14 x86_64 system image', os.path.exists(image), os.path.dirname(image),
-            'sdkmanager "system-images;android-34;google_apis;x86_64"')
-        add('adb', os.path.exists(emulator.adb_path()), emulator.adb_path(), 'sdkmanager "platform-tools"')
-        exe = os.path.join(sdk, 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator')
-        accel = subprocess.run([exe, '-accel-check'], capture_output=True, text=True).stdout if os.path.exists(exe) else ''
-        add('Android Emulator with hardware acceleration', 'is installed and usable' in accel,
-            next((line for line in accel.splitlines() if 'usable' in line or 'not' in line), 'emulator not found'),
-            'sdkmanager "emulator", and turn on Windows Hypervisor Platform in Windows Features')
+    java = android_sdk.java()
+    add('Java 17 or later (smali)', bool(java and java[0] >= 17),
+        f'Java {java[0]} at {java[1]}' if java else 'not found',
+        'winget install EclipseAdoptium.Temurin.21.JDK, then open a new terminal (or set JAVA_HOME to a JDK)')
+    sdk = android_sdk.root()
+    todo = android_sdk.missing(sdk)
+    add('Android SDK packages', not todo, f'{sdk}: ' + (f'missing {", ".join(todo)}' if todo else 'all there'),
+        'Set up installs them (python tools/sdk.py install)')
+    exe = os.path.join(sdk, 'emulator', 'emulator.exe' if os.name == 'nt' else 'emulator')
+    if os.path.exists(exe):
+        version = android_sdk.revision(os.path.dirname(exe))
+        accel = subprocess.run([exe, '-accel-check'], capture_output=True, text=True, encoding='utf-8',
+                               errors='replace').stdout
+        add('Hardware acceleration for the emulator', 'is installed and usable' in accel,
+            next((line for line in accel.splitlines() if 'usable' in line or 'not' in line), accel.strip()),
+            'turn on virtualization in the BIOS, and Windows Hypervisor Platform: as administrator, '
+            'dism /online /enable-feature /featurename:HypervisorPlatform /all, then restart')
+        tested = ' and '.join(android_sdk.EMULATOR_TESTED)
+        add('Android Emulator version', True if version in android_sdk.EMULATOR_TESTED else None,
+            f'{version}, ' + ('one Prism is tested with' if version in android_sdk.EMULATOR_TESTED else
+                              f'and Prism is tested with {tested}'),
+            "if Horizon doesn't boot, say which emulator you have when you report it")
         if settings['refresh'] > 60:
             sites = [found(lambda n=n: emulator.sharer_site(open(emulator.sharer_path(n), 'rb').read()))
                      for n in emulator.SHARER_BINARIES]
             add(f"Emulator frame sharing at {settings['refresh']} Hz", None if None in sites else True,
                 'a build whose frame sharing Prism knows' if None not in sites else
-                'the emulator build is not 37.1.11, whose frame sharing patch-share-vid knows',
-                'install emulator 37.1.11, or set the refresh rate to 60')
-    ndk = found(lambda: find_ndk(None))
-    add('Android NDK', bool(ndk), ndk or 'not found', 'sdkmanager "ndk;27.3.13750724"')
+                f'emulator {version}, whose frame sharing patch-share-vid does not know',
+                f'install emulator {android_sdk.EMULATOR_TESTED[-1]}, or set the refresh rate to 60')
     vs = found(vcvars)
     add("Visual Studio's C++ tools", bool(vs), vs or 'not found',
         'Visual Studio (Community is fine) with "Desktop development with C++", or just its build tools: '
@@ -153,6 +161,10 @@ def doctor_checks(settings):
         '"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
     add('git', bool(shutil.which('git')), shutil.which('git') or 'not found',
         'winget install Git.Git, then open a new terminal')
+    odd = [p for p in (ROOT, emulator.avd_home(), sdk) if not p.isascii()]
+    add('Paths in plain ASCII', True if not odd else None, ', '.join(odd) or 'yes',
+        "the emulator and the NDK's tools can fail on paths with other characters: move Prism to one "
+        'like C:\\Prism, and set ANDROID_AVD_HOME (AVDs) and ANDROID_SDK_ROOT (the SDK) to ones like C:\\Android\\avd')
     runtime = steamvr_runtime()
     add('SteamVR (for vr; desktop works without)', True if runtime else None, runtime or 'not found',
         'install SteamVR from Steam')
@@ -206,6 +218,16 @@ def same_ota(was, path):
     file dialog's C:\\ are the same file."""
     now = ota_identity(path)
     return was == {**now, 'ota': was.get('ota')} and os.path.normcase(was.get('ota') or '') == os.path.normcase(now['ota'])
+
+
+def sdk_state(settings):
+    import sdk as android_sdk
+    todo = android_sdk.missing()
+    return not todo, 'has what Prism needs' if not todo else 'to install: ' + ', '.join(todo)
+
+
+def sdk_run(settings, force):
+    return python('sdk.py', 'install')
 
 
 def workspace_state(settings):
@@ -378,7 +400,8 @@ def apps_run(settings, force):
     return python('apps.py', 'install')
 
 
-STEPS = [('workspace', workspace_state, workspace_run),
+STEPS = [('sdk', sdk_state, sdk_run),
+         ('workspace', workspace_state, workspace_run),
          ('avd', avd_state, avd_run),
          ('refresh', refresh_state, refresh_run),
          ('frame sharing', sharing_state, sharing_run),

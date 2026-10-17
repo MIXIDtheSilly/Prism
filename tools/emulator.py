@@ -233,7 +233,7 @@ def configure(args):
 # The emulator's frame sharing (-share-vid, VideoFrameSharer) skips a frame that comes within 1/fps of
 # the last, and its constructor starts fps at 60: `mov dword ptr [rcx + 8], 60`, the field VideoInfo
 # also reports. At 72 Hz only every other frame (36 a second) got through. Patching that immediate is
-# the whole change, made only where the instructions around it match (emulator 37.1.11), in both
+# the whole change, made only where the instructions around it match (emulators 37.1.11 and 37.2.12), in both
 # builds; the SDK's originals are kept beside them as <name>.orig. Nothing of the emulator is in the repo.
 SHARER_BINARIES = ('qemu-system-x86_64.exe', 'qemu-system-x86_64-headless.exe')
 SHARER_BEFORE = bytes.fromhex('44894104c74108')  # mov [rcx + 4], r8d; mov dword ptr [rcx + 8], imm32
@@ -272,7 +272,8 @@ def patch_share_vid(args):
             data = bytearray(f.read())
         site = sharer_site(data)
         if site is None:
-            sys.exit(f'{name}: not a build whose frame sharing this knows (emulator 37.1.11 is); nothing changed')
+            sys.exit(f'{name}: not a build whose frame sharing this knows (emulator 37.1.11 and 37.2.12 are); nothing '
+                     'changed. At 60 Hz this is not needed: python tools/prism.py setup --refresh 60')
         if data[site] == rate:
             print(f'{name}: already shares up to {rate} frames a second')
             continue

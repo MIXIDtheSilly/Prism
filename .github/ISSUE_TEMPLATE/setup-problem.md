@@ -11,7 +11,9 @@ saw.
 
 **Check this PC**
 
-Paste what *Check this PC* (`python tools\prism.py doctor`) prints:
+Paste what *Check this PC* (`python tools\prism.py doctor`) prints. It names your graphics card and
+driver, which matter: Prism has only been tested on NVIDIA. Run it after the failure, so it also
+says which GPU the emulator drew with.
 
 ```text
 

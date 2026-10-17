@@ -111,6 +111,7 @@ is ignored by git.
 | Git | `winget install Git.Git` |
 | SteamVR (for a headset) | From Steam; *Desktop* works without it |
 | 16 GB of memory and 8 CPU threads | Horizon gets 12 GB and 6 cores. With 12 GB, or 4 to 7 threads, setup gives it less (8 GB, 4 cores) and it runs slower |
+| A graphics card with a current driver | Prism is tested on NVIDIA (an RTX 3080); AMD and Intel may work but haven't been tried. On a laptop with two GPUs, *Check this PC* says if the emulator draws on the integrated one |
 | About 60 GB free | The workspace and the emulator's disk |
 
 Open a new terminal after installing, so the new programs are on its PATH.

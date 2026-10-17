@@ -34,6 +34,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -117,6 +118,49 @@ def steamvr_runtime():
     return openvr_path('runtime')
 
 
+GPU_VENDORS = {'10DE': 'NVIDIA', '1002': 'AMD', '8086': 'Intel'}
+
+
+def gpus():
+    """The PC's graphics cards as (name, vendor, driver version): those on PCI, not virtual displays
+    (a headset's, a remote desktop's)."""
+    try:
+        out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                              'Get-CimInstance Win32_VideoController | ForEach-Object '
+                              '{ "$($_.PNPDeviceID)|$($_.Name)|$($_.DriverVersion)" }'],
+                             capture_output=True, text=True, errors='replace', timeout=60, creationflags=NO_WINDOW).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    cards = []
+    for line in out.splitlines():
+        device, _, rest = line.strip().partition('|')
+        name, _, driver = rest.partition('|')
+        vendor = re.search(r'VEN_([0-9A-F]{4})', device, re.I)
+        if device.upper().startswith('PCI\\') and vendor:
+            vendor, driver = GPU_VENDORS.get(vendor.group(1).upper(), f'vendor {vendor.group(1)}'), driver.strip()
+            digits = driver.replace('.', '')[-5:]
+            if vendor == 'NVIDIA' and digits.isdigit():
+                driver = f'{digits[:3]}.{digits[3:]}'  # Windows' 32.0.16.1656 is NVIDIA's 616.56
+            cards.append((name.strip(), vendor, driver))
+    return cards
+
+
+def emulator_gpus():
+    """(the Vulkan device, the GPU under OpenGL ES) the emulator drew with when it last started, from
+    its log; None before it has started. On a PC with two GPUs (most laptops) Windows can give the
+    emulator's OpenGL the integrated one while Vulkan picks the other."""
+    try:
+        with open(os.path.join(ROOT, emulator.LOG_DIR, 'emulator.log'), encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except OSError:
+        return None
+    vulkan = re.search(r'Selecting Vulkan device: (.+?), Version', text)
+    gl = re.search(r'OpenGL ES Translator \((.+)\)\s*$', text, re.M)
+    if not vulkan and not gl:
+        return None
+    return vulkan.group(1).strip() if vulkan else None, gl.group(1).split('/')[0].strip() if gl else None
+
+
 def doctor_checks(settings):
     """(what, ok, detail, how to fix it): ok is True, False (Prism can't run) or None (a warning)."""
     import sdk as android_sdk
@@ -177,7 +221,23 @@ def doctor_checks(settings):
         add(f'{emulator.AVD} fits this PC', not over, 'yes' if not over else
             'asks for ' + ', '.join(f'{k}={emulator.avd_config().get(k)}' for k in over),
             'Set up lowers it (python tools/emulator.py config --fit)')
-    odd = [p for p in (ROOT, emulator.avd_home(), sdk) if not p.isascii()]
+    cards = gpus()
+    nvidia = [c for c in cards if c[1] == 'NVIDIA']
+    add('Graphics card', True if nvidia else None,
+        '; '.join(f'{name} (driver {driver})' for name, _, driver in cards) or "Windows didn't say",
+        'Prism is tested on NVIDIA only (an RTX 3080): other GPUs may work. Update the graphics driver first, '
+        "and if Horizon doesn't draw, report it with this line")
+    drew = emulator_gpus()
+    if drew:
+        vulkan, gl = drew
+        same = bool(vulkan and gl) and (vulkan.lower() in gl.lower() or gl.lower() in vulkan.lower())
+        best = not nvidia or any(n.lower() in (vulkan or '').lower() for n, _, _ in nvidia)
+        add('The GPU the emulator draws with', True if same and best else None,
+            f'Vulkan on {vulkan or "?"}, OpenGL ES on {gl or "?"} (when it last started)',
+            'Windows Settings > System > Display > Graphics: add ' +
+            ' and '.join(os.path.normpath(emulator.sharer_path(n)) for n in emulator.SHARER_BINARIES) +
+            f', set both to High performance{" (" + nvidia[0][0] + ")" if nvidia else ""}, and start again')
+    odd =[p for p in (ROOT, emulator.avd_home(), sdk) if not p.isascii()]
     add('Paths in plain ASCII', True if not odd else None, ', '.join(odd) or 'yes',
         "the emulator and the NDK's tools can fail on paths with other characters: move Prism to one "
         'like C:\\Prism, and set ANDROID_AVD_HOME (AVDs) and ANDROID_SDK_ROOT (the SDK) to ones like C:\\Android\\avd')

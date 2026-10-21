@@ -521,8 +521,8 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   Unknown Sources is left for other developers' apps. Clicking xrgame there launches
   it through VrShell (`com.oculus.vrshell.intent.action.LAUNCH`) as Horizon's immersive app. The
   library is a cylinder layer around the viewer, its tiles bowed and tilted toward its edges as
-  they should be; its glass background isn't drawn (the dark card behind it is the Store's
-  window), and the first tile of All is blank (an app without an icon).
+  they should be, over a frosted-glass background (see Frosted glass), and the first tile of All
+  is blank (an app without an icon).
 - **Meta's emulator mode.** Meta's runtime has an emulator of its own in mind, and two things put
   Prism in it:
   - `ro.kernel.qemu=1`, from the emulator's `/vendor/build.prop`, which nothing of the emulator's
@@ -546,17 +546,28 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   gatekeepers (`gkcache.dat`) follow its client's values from its next start. A client that
   rewrites its cache at start with what it synced undoes them, as systemdriver's does (the list is
   empty for now).
-- **Frosted glass.** Panels' glass backgrounds are the compositor's: it blurs what's behind a glass
-  layer (`XR_METAX1_composition_layer_glass`). It sets glass up only for the headsets it knows and
-  when `oculus_xrruntime:oculus_frosted_glass` is on. libprism_jni patches both checks, one
-  instruction of `libvrruntimeservice.so` each, written as the translator loads it, after checking
-  the bytes ([guest_patch.c](../native/prism_jni/guest_patch.c)): the device type, and the
-  gatekeeper's answer, since systemdriver's config client rewrites its cache to its synced value
-  (false without a Meta account) at every boot, over what deploy had set. The compositor logs
-  "Glass is enabled" at every boot, with no change in frame rate, but panels still show none:
-  VrShell asks for glass on few of its layers (OCUI theme and per-panel checks), and where glass
-  was forced on every layer, its background was the compositor's solid fallback colour, as no
-  layer is chosen as the source to blur (no passthrough here).
+- **Frosted glass.** Panels' glass backgrounds are the compositor's: each frame it blurs a
+  background layer into a texture, and a glass layer (`XR_METAX1_composition_layer_glass`) shows
+  it where it's transparent. libprism_jni patches what stands in its way, in
+  `libvrruntimeservice.so` and VrShell's `libshell.so` as the translator loads them, after
+  checking every patch's bytes (a library is patched in full or not at all;
+  [guest_patch.c](../native/prism_jni/guest_patch.c)):
+  - The compositor sets glass up only for the headsets it knows (not the emulator's device type)
+    and when `oculus_xrruntime:oculus_frosted_glass` is on; systemdriver's config client rewrites
+    that gatekeeper to its synced value (false without a Meta account) at every boot, over what
+    deploy had set. One instruction each: the device test passes, and the gatekeeper's answer is on.
+  - The background it blurs is a passthrough layer (none here: there are no cameras), so glass
+    showed its solid fallback colour. It now takes the lowest projection layer: Home's
+    environment, or the immersive app under the Universal Menu.
+  - VrShell asks for glass per layer, and here for almost none (its choice depends on the OCUI
+    theme and on panel windows' SurfaceFlinger side). Every layer it builds other than its scene
+    now asks: the library, the system bar, the panels. A small routine in the library's
+    `.note.android.ident` decides, jumped to from the layer builder.
+  Deployed (2026-10-21), every patch applies at load, the compositor logs "Glass is enabled", the
+  library's background is the environment blurred, and with the library open the compositor
+  draws 87 of 90 frames a second (89.7 shared, VrShell 85). xrgame, the Universal Menu over it
+  and 2D app panels (WhatsApp) looked as before. A panel whose own window is opaque (the Store,
+  offline) still shows its window.
 - **SteamVR** (M5; tried with a headset on 2026-10-11: focused and tracking, 90 frames a second
   submitted, and performance good enough to use). `python tools\steamvr.py` starts
   `native/steamvr`, an OpenXR app on the PC (Direct3D 11; its loader, session and controller actions
@@ -688,5 +699,5 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
     30-minute soak from a fresh boot opening an app every 30 s (60 opens, `soak.py`'s new
     `emulator_windows` column) held 103-107 windows throughout, 88.5 shared frames a second on
     average, nothing crashed; unpatched, as many opens had taken the count from 49 into the hundreds.
-- **Next:** panels' glass backgrounds; system_server's deaths by SIGPIPE (twice,
+- **Next:** system_server's deaths by SIGPIPE (twice,
   soon after an app's window was placed; none since).

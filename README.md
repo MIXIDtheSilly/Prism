@@ -62,7 +62,8 @@ What works:
 - **Tracking.** The headset and two Touch Plus controllers are tracked, paired and held, all driven
   from the PC. VrShell draws the controllers and their rays.
 - **Panels.** Panels draw and respond to clicks: the Universal Menu, the system bar and Quick
-  Settings, and the library with Horizon's own apps.
+  Settings, and the library with Horizon's own apps. Their frosted-glass backgrounds blur
+  Home's environment, or the immersive app under the Universal Menu.
 - **Apps.** Android apps installed with adb open as panels. OpenXR apps (Vulkan or OpenGL ES) run
   as Horizon's immersive app at full frame rate. They launch from the library's Unknown Sources,
   and the Universal Menu opens over them and quits them.
@@ -71,7 +72,6 @@ What works:
 
 Not yet:
 
-- Panels' frosted-glass backgrounds.
 - A steady 90 frames a second in Home: it reaches 89.7 shared frames a second (p99 14.6 ms) once the
   emulator's frame sharing is patched and the display set to 90 Hz, but VrShell's frame loop is
   at the edge of its 11.1 ms budget. See [docs/m1-progress.md](docs/m1-progress.md#running-it).

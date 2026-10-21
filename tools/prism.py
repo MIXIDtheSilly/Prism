@@ -14,9 +14,9 @@ uses so it leaves the working one alone (kept, as the settings are).
 
 setup runs each step that isn't current, in order (STEPS): the Android SDK's packages Prism needs
 (tools/sdk.py installs what's missing), the workspace from the OTA, the AVD and its display rate,
-the emulator's frame sharing, pbuffer pool and large transfers, the builds, the PC apps, the
-deploy and the Meta apps copied from your headset (tools/apps.py pull), installed again after a
-deploy. Each step knows
+the emulator's frame sharing, pbuffer pool, large transfers and thread pool, the builds, the PC
+apps, the deploy and the Meta apps copied from your headset (tools/apps.py pull), installed again
+after a deploy. Each step knows
 whether it's current (the builds by their stamps, the deploy by the id it leaves on the guest), so
 setup run again with nothing changed does nothing, and after a pull does only what the change needs.
 vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready) and run
@@ -211,6 +211,11 @@ def doctor_checks(settings):
             f'emulator {version}, whose transfers patch-transfers does not know' if None in sites else
             'patched' if all(s[1] for s in sites) else 'a build whose transfers Prism knows; setup patches them',
             'install emulator 37.1.11; without it an app killed in an upload can freeze the emulator')
+        sites = thread_sites()
+        add("Emulator's thread pool", None if None in sites else True,
+            f'emulator {version}, whose thread pool patch-threads does not know' if None in sites else
+            'patched' if all(s[1] for s in sites) else 'a build whose thread pool Prism knows; setup patches it',
+            'install emulator 37.1.11; without it Horizon slows the longer the emulator runs')
     vs = found(vcvars)
     add("Visual Studio's C++ tools", bool(vs), vs or 'not found',
         'Visual Studio (Community is fine) with "Desktop development with C++", or just its build tools: '
@@ -451,6 +456,34 @@ def transfers_run(settings, force):
     return stopped() and python('emulator.py', 'patch-transfers')
 
 
+def thread_sites():
+    """emulator.threads_site for each qemu build (None where it doesn't know the build)."""
+    sites = []
+    for name in emulator.THREADS_QEMU:
+        try:
+            with open(emulator.sharer_path(name), 'rb') as f:
+                sites.append(emulator.threads_site(f.read()))
+        except OSError:
+            sites.append(None)
+    return sites
+
+
+def threads_state(settings):
+    sites = thread_sites()
+    if None in sites:
+        return None, 'an emulator build patch-threads does not know: Horizon slows the longer it runs'
+    patched = all(s[1] for s in sites)
+    return patched, ('the thread pool keeps its idle workers' if patched else
+                     'Horizon slows the longer the emulator runs')
+
+
+def threads_run(settings, force):
+    if None in thread_sites():
+        say('leaving the emulator as installed')
+        return True
+    return stopped() and python('emulator.py', 'patch-threads')
+
+
 def other_avd():
     """The AVD on Prism's port when it isn't this one (they share the port), else None."""
     running = emulator.running_avd()
@@ -558,6 +591,7 @@ STEPS = [('sdk', sdk_state, sdk_run),
          ('frame sharing', sharing_state, sharing_run),
          ('pbuffers', pbuffers_state, pbuffers_run),
          ('transfers', transfers_state, transfers_run),
+         ('threads', threads_state, threads_run),
          ('emulator', emulator_state, emulator_run),
          ('bionic', bionic_state, bionic_run),
          *[(name, *build_step(module, out)) for name, module, out in BUILDS],

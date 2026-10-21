@@ -364,10 +364,26 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   TelemetryService, Horizon's telemetry daemon, which uploads them to Meta; Prism doesn't run it, so
   the queue was never sent and never dropped. Deploy sets the client's own switch,
   `persist.telemetry.drop_all_client_events`: set on a running system, VrShell's heap stopped
-  growing at once (445.9 -> 445.2 MB over four minutes). Whether it's what made VrShell slow down
-  after long use isn't established: a VrShell restarted fresh (88-89 VrApi FPS, still or moving)
-  held 84-90 for half an hour and through 21 app opens with the leak still running, while the
-  VrShell from boot had dropped to 73 still and 65 moving after the same opens.
+  growing at once (445.9 -> 445.2 MB over four minutes). It isn't what slowed Horizon after long use
+  (next): a VrShell restarted fresh held 84-90 VrApi FPS for half an hour with the leak still
+  running. Nor does the next explain all of it: once, the VrShell from boot was at 73 still and 65
+  moving after 21 app opens and a restarted one at 88-89; restarting VrShell doesn't undo the leak
+  below, so that drop had another cause, not found. An hour with both fixes showed no such drop.
+- **The emulator slowing the longer it runs** (2026-10-21): after half an hour to an hour of use,
+  VrShell's frame rate fell to 9 and the compositor's to 25 ("Slice tear due to CPU delay" on every
+  frame), with qemu's main loop using a whole PC core and the vCPUs getting a third of one each;
+  only restarting the emulator helped. The main loop was walking 3,651 bottom halves on every pass
+  (`aio_compute_timeout`, `aio_bh_poll`), holding the lock the vCPUs need, and gaining ~55 a minute
+  even idle. All but 20 were the emulator's own: its thread-start hook gives every qemu thread a
+  looper (`android::qemu::QemuLooper`) that puts a bottom half in the main loop and leaves it there
+  when the thread ends, and qemu's thread pool (`util/thread-pool.c`, the guest's disk I/O) ends a
+  worker after 10 s idle and starts another for the next request. `python tools/emulator.py
+  patch-threads` (a setup step, checked by doctor) has an idle worker wait without a timeout, so the
+  pool keeps the threads it has made (64 at most). Patched, an hour of the same scripted use (every
+  10 minutes six app opens, xrgame with the Universal Menu, the Store opened and closed) held
+  VrShell at 87-90 still and moving (one phase at 79) and the shared frames at 90, with the bottom
+  halves at 92 from start to end; unpatched, the same script took VrShell from 89 to 9 within 12
+  minutes of it.
 - **Chrome's app zygote spinning** (`com.oculus.browser_zygote` at ~90% of a vCPU, and no
   renderer ever started): Prism started the arm64 libbinder's thread pool at the first namespace,
   which an app zygote makes while preloading, and a zygote forks only once it's down to one thread

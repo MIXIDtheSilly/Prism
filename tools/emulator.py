@@ -12,6 +12,7 @@ uses the same port, so one of them runs at a time.
     python tools/emulator.py patch-share-vid [--rate HZ] [--undo]  # -share-vid shares more than 60 frames a second
     python tools/emulator.py patch-pbuffers [--undo]  # gfxstream reuses pbuffers the NVIDIA driver won't release
     python tools/emulator.py patch-transfers [--undo]  # an app killed mid-upload doesn't freeze the emulator
+    python tools/emulator.py patch-threads [--undo]  # the emulator doesn't slow the longer it runs
     python tools/emulator.py clock             # reboot until the guest's clock is the TSC (start --wait does this)
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
@@ -486,6 +487,59 @@ def patch_transfers(args):
         print(f'{name}: ' + ('as installed' if args.undo else 'a closed context ends an unfinished large transfer'))
 
 
+# Horizon slowed to a crawl after half an hour to an hour of use, the compositor too (25 frames a
+# second), and only restarting the emulator helped. Every qemu thread starts with a looper of its own
+# (the emulator's thread-start hook, android::qemu::QemuLooper), which puts a bottom half in the main
+# loop's list and doesn't take it out when the thread ends. qemu's thread pool (util/thread-pool.c,
+# the guest's disk I/O) ends a worker after 10 s idle and starts another for the next request, about
+# one a second: 3,600 bottom halves after 30 minutes, which the main loop walks on every pass
+# (aio_compute_timeout, aio_bh_poll), holding the lock the vCPUs need. Patched, an idle worker waits
+# for work without a timeout (qemu_sem_timedwait's 10000 ms, which goes to WaitForSingleObject,
+# becomes INFINITE), so the pool keeps the threads it has made, 64 at most. Both qemu builds.
+THREADS_QEMU = SHARER_BINARIES
+THREADS_BEFORE = bytes.fromhex('4889d9ba')  # mov rcx, rbx; mov edx, imm32
+THREADS_TIMEOUT = bytes.fromhex('10270000')  # 10000 ms
+THREADS_PATCHED = bytes.fromhex('ffffffff')  # INFINITE
+THREADS_AFTER = bytes.fromhex('e8') + b'.{4}' + bytes.fromhex('89c5')  # call qemu_sem_timedwait; mov ebp, eax
+
+
+def threads_site(data):
+    """(offset of the timeout, whether it's patched) in a qemu build, or None unless exactly one place fits."""
+    pattern = (re.escape(THREADS_BEFORE) + b'(?:' + re.escape(THREADS_TIMEOUT) + b'|' + re.escape(THREADS_PATCHED) + b')' +
+               THREADS_AFTER)
+    sites = [m.start() + len(THREADS_BEFORE) for m in re.finditer(pattern, bytes(data), re.DOTALL)]
+    if len(sites) != 1:
+        return None
+    return sites[0], bytes(data[sites[0]:sites[0] + 4]) == THREADS_PATCHED
+
+
+def patch_threads(args):
+    """Makes qemu's thread pool keep its idle workers (see above); --undo takes the patch out again.
+    The emulator has to be stopped: Windows locks a running binary."""
+    if running():
+        sys.exit('stop the emulator first (python tools/emulator.py stop)')
+    binaries = []
+    for name in THREADS_QEMU:
+        with open(sharer_path(name), 'rb') as f:
+            data = bytearray(f.read())
+        site = threads_site(data)
+        if site is None:
+            sys.exit(f'{name}: not a build whose thread pool this knows (emulator 37.1.11 is); nothing changed. Horizon '
+                     'runs without it, but slows the longer the emulator runs: restart it now and then')
+        binaries.append((name, sharer_path(name), data, *site))
+    for name, path, data, offset, patched in binaries:
+        if patched == (not args.undo):
+            print(f'{name}: already ' + ('as installed' if args.undo else 'patched'))
+            continue
+        if not os.path.exists(path + '.orig'):
+            shutil.copyfile(path, path + '.orig')
+        data[offset:offset + 4] = THREADS_TIMEOUT if args.undo else THREADS_PATCHED
+        with open(path + '.tmp', 'wb') as f:
+            f.write(data)
+        os.replace(path + '.tmp', path)
+        print(f'{name}: ' + ('as installed' if args.undo else 'the thread pool keeps its idle workers'))
+
+
 def start(args):
     if running():
         other = running_avd()
@@ -851,6 +905,7 @@ def main():
     ps.add_argument('--undo', action='store_true', help='restore the emulator builds as installed')
     sub.add_parser('patch-pbuffers').add_argument('--undo', action='store_true', help='restore gfxstream as installed')
     sub.add_parser('patch-transfers').add_argument('--undo', action='store_true', help='take the patches out')
+    sub.add_parser('patch-threads').add_argument('--undo', action='store_true', help='take the patch out')
     s = sub.add_parser('start')
     s.add_argument('--headless', action='store_true', help='no emulator window (the default above 60 Hz)')
     s.add_argument('--window', action='store_true', help='keep the emulator window above 60 Hz too')
@@ -878,7 +933,7 @@ def main():
         sys.exit(0 if ready(args) else 1)
     {'create': create, 'config': configure, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
      'stop': stop, 'patch-share-vid': patch_share_vid, 'patch-pbuffers': patch_pbuffers,
-     'patch-transfers': patch_transfers, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
+     'patch-transfers': patch_transfers, 'patch-threads': patch_threads, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
 
 
 if __name__ == '__main__':

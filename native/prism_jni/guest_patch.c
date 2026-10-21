@@ -6,36 +6,26 @@
 // expects there; a library is patched only when all of its patches find them (or are already in
 // place), and is otherwise left alone, with a warning: another Horizon build.
 //
-// * Frosted glass. Panels' glass backgrounds are the compositor's (libvrruntimeservice.so): each
-//   frame it blurs a background layer into a texture, and a glass layer shows that texture where
-//   it's transparent. Four things stand in its way on Prism:
-//   - It sets glass up only on the headsets it knows (device types 271-301). Here the device type
-//     is 270, its emulator's: the runtime looks Build.MODEL ("Quest 3") up in a table of codenames,
-//     finds nothing, and the hardware is ranchu. Claiming a real headset instead would change much
-//     more than glass (GPU and format fallbacks, DRM, the HMD's configuration), so the patch makes
-//     only the glass check's device test pass (sub w8, w8, #0x10f becomes mov w8, wzr: the first
-//     known type).
+// * Frosted glass. Glass backgrounds are the compositor's (libvrruntimeservice.so): each frame it
+//   blurs a background layer (passthrough) into a texture, and a layer that asks for glass shows
+//   that texture where it's transparent. The compositor sets glass up only when two checks pass,
+//   which on Prism they don't:
+//   - The headsets it knows (device types 271-301). Here the device type is 270, its emulator's:
+//     the runtime looks Build.MODEL ("Quest 3") up in a table of codenames, finds nothing, and the
+//     hardware is ranchu. Claiming a real headset instead would change much more than glass (GPU
+//     and format fallbacks, DRM, the HMD's configuration), so the patch makes only the glass
+//     check's device test pass (sub w8, w8, #0x10f becomes mov w8, wzr: the first known type).
 //   - The oculus_xrruntime/oculus_frosted_glass gatekeeper is read from the runtime's own cache
 //     (gkcache.dat), which it rebuilds from its Java config client's values. That client rewrites
 //     its cache at every boot with the value it has (false: nothing synced without a Meta account),
 //     over anything set before it starts. The patch takes the gatekeeper's answer as on
 //     (ldrb w8, [sp, #0x50], the value the gatekeeper call wrote, becomes mov w8, #1).
-//   - The background is the layer the compositor nominates each frame: a passthrough layer
-//     (projection-like types 1 and 8 with subtypes 1, 3 or 5), else, with
-//     debug.oculus.frostedGlass.enableVR, a 420 x 440 one. Prism has neither, so the background
-//     was empty and glass showed the runtime's solid fallback, RGB(18,24,30). The patch nominates
-//     the first (lowest) projection layer instead: Home's environment, or the immersive app under
-//     the Universal Menu. In the tagging loop (0x6d2db4), the subtype test's b.eq and the
-//     mov w19, w20 that records the candidate become cmn w19, #1; csel w19, w20, w19, eq.
-//   - Which layers are glass is VrShell's (libshell.so) to say, per layer, in the
-//     XR_METAX1_composition_layer_glass struct its layer builder chains on (0xb0c208, when the
-//     descriptor's flag 0x20 is set). On Prism it's set for almost none: VrShell's own choice
-//     depends on the OCUI theme resources and on the SurfaceFlinger side of panel windows, neither
-//     of which Prism has. The patch has every layer the builder makes, other than projections
-//     (VrShell's scene: the background), ask for glass: the panels, the library, the system bar.
-//     Its routine goes in the library's .note.android.ident (read by the linker as the library
-//     loads, not after), and the builder's tbnz w9, #5 jumps to it.
-//   The compositor holds 90 frames a second with the library's glass on.
+//   Which layers are glass is left to Horizon, as on a headset. A Quest 3S on the same build
+//   (VrShell's and the compositor's code the same) gives the library, the system bar and other
+//   panels glassMode=0 (SurfaceFlinger's list of the layers it sends the compositor): no glass, no
+//   panel shading, the tiles over whatever is behind, and a translucent gray only where a panel
+//   draws one itself (the running app's card). Glass forced onto VrShell's layers instead showed
+//   the blurred environment (no passthrough to blur) or, without it, the runtime's solid fallback.
 
 #ifndef PRISM_STUB_LIB
 
@@ -66,19 +56,6 @@ static const struct {
      "frosted glass on the emulator's device type"},
     {"libvrruntimeservice.so", 0x6bed50, BYTES("\xe8\x43\x41\x39"), BYTES("\x28\x00\x80\x52"),
      "frosted glass without its gatekeeper"},
-    {"libvrruntimeservice.so", 0x6d2df0, BYTES("\x60\x00\x00\x54\xf3\x03\x14\x2a"),
-     BYTES("\x7f\x06\x00\x31\x93\x02\x93\x1a"), "frosted glass blurs the lowest projection layer"},
-    // ldr w10, [x0]; cmp w10, #0x23 (a projection); b.eq 1f; b glass; 1: tbz w9, #5, 2f; b glass;
-    // 2: b no_glass. glass is the builder's own block (0xb0c5a0), no_glass the instruction after
-    // the tbnz (0xb0c434).
-    {"libshell.so", 0x270,
-     BYTES("\x08\x00\x00\x00\x84\x00\x00\x00\x01\x00\x00\x00\x41\x6e\x64\x72\x6f\x69\x64\x00\x22\x00\x00\x00"
-           "\x72\x32\x36\x62"),
-     BYTES("\x0a\x00\x40\xb9\x5f\x8d\x00\x71\x40\x00\x00\x54\xc9\x30\x2c\x14\x49\x00\x28\x36\xc7\x30\x2c\x14"
-           "\x6b\x30\x2c\x14"),
-     "frosted glass on VrShell's layers (its routine)"},
-    {"libshell.so", 0xb0c430, BYTES("\x89\x0b\x28\x37"), BYTES("\x90\xcf\xd3\x17"),
-     "frosted glass on VrShell's layers"},
 };
 
 // The library's base: its mapping from offset 0 (the lowest, which holds its ELF header).

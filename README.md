@@ -62,8 +62,8 @@ What works:
 - **Tracking.** The headset and two Touch Plus controllers are tracked, paired and held, all driven
   from the PC. VrShell draws the controllers and their rays.
 - **Panels.** Panels draw and respond to clicks: the Universal Menu, the system bar and Quick
-  Settings, and the library with Horizon's own apps. Their frosted-glass backgrounds blur
-  Home's environment, or the immersive app under the Universal Menu.
+  Settings, and the library with Horizon's own apps, which look as they do on a headset (no glass
+  behind the library: the same build on a Quest 3S gives its panels none).
 - **Apps.** Android apps installed with adb open as panels. OpenXR apps (Vulkan or OpenGL ES) run
   as Horizon's immersive app at full frame rate. They launch from the library's Unknown Sources,
   and the Universal Menu opens over them and quits them.

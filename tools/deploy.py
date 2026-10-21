@@ -443,6 +443,11 @@ def prism_props(images, emulator_flag='hidden', model='quest3'):
     # most boots and the home stayed empty; AOSP's multiplier is meant for slow (emulated) hardware.
     props['ro.hw_timeout_multiplier'] = '8'
     props['persist.oculus.shell_hw_mult.enable'] = '1'  # read with atoi: 'true' is off
+    # Meta's telemetry client (libossdk) queues each app's events for TelemetryService, Horizon's
+    # telemetry daemon, which uploads them to Meta; Prism doesn't run it, and the queue was never
+    # sent or dropped: VrShell's native heap grew ~4.7 MB a minute while idle (PersistableBundles).
+    # The client's own switch drops events instead.
+    props['persist.telemetry.drop_all_client_events'] = 'true'
     # A headset's SurfaceFlinger hands panel windows' buffers to the runtime as OpenXR layers
     # (single-pass composition); stock SurfaceFlinger can't, and their bodies stayed green. Without
     # it VrShell draws them into surfaces the compositor makes, which Prism's binder bridge

@@ -356,6 +356,18 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   a transfer when it's set: the reader then takes the Exit the destructor queued and the thread
   ends. A live transfer is waited out as before. Patched: 60 kills in a row, the guest answered
   after each and no render thread was left spinning; Home at 90 frames a second.
+- **VrShell's memory growing while idle** (2026-10-21): its native heap grew ~4.7 MB a minute with
+  nothing happening (183 MB fresh, 445 MB after two hours). Android's heap profiler put nearly all
+  of it under one call, Meta's arm64 code allocating through libc, which it can't unwind past; the
+  newest blocks were vectors of `PersistableBundle`, the type of Meta's
+  `ITelemetryService::reportEvents`. Every app's telemetry client (libossdk) queues its events for
+  TelemetryService, Horizon's telemetry daemon, which uploads them to Meta; Prism doesn't run it, so
+  the queue was never sent and never dropped. Deploy sets the client's own switch,
+  `persist.telemetry.drop_all_client_events`: set on a running system, VrShell's heap stopped
+  growing at once (445.9 -> 445.2 MB over four minutes). Whether it's what made VrShell slow down
+  after long use isn't established: a VrShell restarted fresh (88-89 VrApi FPS, still or moving)
+  held 84-90 for half an hour and through 21 app opens with the leak still running, while the
+  VrShell from boot had dropped to 73 still and 65 moving after the same opens.
 - **Chrome's app zygote spinning** (`com.oculus.browser_zygote` at ~90% of a vCPU, and no
   renderer ever started): Prism started the arm64 libbinder's thread pool at the first namespace,
   which an app zygote makes while preloading, and a zygote forks only once it's down to one thread
@@ -573,7 +585,12 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   default's, and the pointer's dot lands within a few pixels of the fitted edges (kViews, scaled
   by that). The `UPDATE_HMDMESH` broadcast, which should reload them, never reached the runtime's
   receiver; killing the runtime service reloads them but took the emulator down the second time.
-  The view stays narrower than a headset's lenses, with black round it. The display is 2560x1440
+  The view stays narrower than a headset's lenses, and a frame arrives ~45 ms after its pose, so
+  turning the head showed black past its edges. Since 2026-10-21 the bridge keeps the world as last
+  seen behind it: each frame is painted into a cube map per eye, and a projection layer under
+  Horizon's draws that cube from where the headset is now (an offscreen check with synthetic
+  frames: within 3 levels of the world on 99.7% of pixels wherever a frame had been, black only
+  where none had; untried in a headset). The display is 2560x1440
   (`tools/emulator.py config --display`), about 630 pixels a tangent unit against 474 at 1920x1080,
   over the same angles: the compositor draws its panel at 3840x2160 whatever the display, and
   Prism's Vulkan driver fits it to the output, so only the output's size changes. That output is

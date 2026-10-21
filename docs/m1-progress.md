@@ -451,8 +451,13 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   xrgame runs the same way: Horizon's runtime brokers are disabled stubs (stock: they return no
   cursor), so its loader takes `/product/etc/openxr/1/active_runtime.aarch64.json` and loads the
   runtime from VrDriver's APK, as a game's loader does on a headset.
-  The running-app card says "App name unavailable": the library service has no record of a
-  system app it didn't install.
+  The running-app card says "App name unavailable", for xrdemo and for xrgame (installed with adb,
+  listed under Unknown Sources) alike. The navigator (LibraryPanelApp's
+  `ActiveImmersiveRepositoryImpl`) names the running app from its task's label, which a
+  NativeActivity that never calls `setTaskDescription` doesn't have, and failing that from the
+  display name in OCMS's package record, through the library's package repository; neither gives
+  one here. Which step of that lookup misses isn't established (the library's own repository
+  leaves out apps of no store channel, as xrgame is).
 - **OpenGL ES apps.** The runtime's swapchain images are the compositor's, shared with the app as
   file descriptors, which it imports into GL through `GL_EXT_memory_object_fd` or EGL dma-buf
   import; the emulator's GLES has neither, and a GLES app's `xrCreateSwapchain` failed. Prism's
@@ -475,8 +480,17 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
 - **2D apps.** An ordinary Android app installed with adb opens as a Horizon panel, with its title
   and window bar.
 - **Launching from the library.** The library's menu (its side bar) has All, Unknown Sources and
-  Downloads. Unknown Sources lists the apps installed with adb (the library service adds an
-  install as it happens, without logging it), under Meta's warning; clicking xrgame there launches
+  Downloads. Unknown Sources lists the apps installed with adb, under Meta's warning. The library
+  service (OCMS) adds an install as it happens; the ones already installed it adds at start only
+  once it has fetched a signed-in user's library, so with no Meta account they were gone after
+  every boot, and with them Unknown Sources, until an app was installed again. `tools/compat.py`
+  has OCMS add them as soon as it has loaded the device's apps (2026-10-21: after a cold boot,
+  Unknown Sources lists the 11 apps `tools/apps.py` copied, and WhatsApp opens from it). On a
+  headset Meta's apps are the Store's and sit under All; here they have no channel, so OCMS counts
+  a Meta package (`tools/apps.py`'s prefixes) with none as the Store's, in the library's origin
+  filter and in the origin it reports (its channel stays NONE, and no entitlement is made): All
+  lists Facebook, Instagram, WhatsApp, Theater Elsewhere and the rest, WhatsApp opens from it, and
+  Unknown Sources is left for other developers' apps. Clicking xrgame there launches
   it through VrShell (`com.oculus.vrshell.intent.action.LAUNCH`) as Horizon's immersive app. The
   library is a cylinder layer around the viewer, its tiles bowed and tilted toward its edges as
   they should be; its glass background isn't drawn (the dark card behind it is the Store's

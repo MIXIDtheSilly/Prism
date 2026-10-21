@@ -66,8 +66,8 @@ What works:
 - **Apps.** Android apps installed with adb open as panels. OpenXR apps (Vulkan or OpenGL ES) run
   as Horizon's immersive app at full frame rate. They launch from the library's Unknown Sources,
   and the Universal Menu opens over them and quits them.
-- **Offline.** First-time setup is skipped and a placeholder local sign-in stands in for a Meta
-  account.
+- **Offline.** First-time setup is skipped and Horizon runs without a Meta account; the library
+  has the apps on the device.
 
 Not yet:
 

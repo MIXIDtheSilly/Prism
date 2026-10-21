@@ -216,6 +216,142 @@ LIBRARY_WHITELIST = Splice(
                  for name in LIBRARY_SYSTEM_APPS]),
     reason="Meta's own apps in the library without the Store's entitlements")
 
+# OCMS hands the library (and Unknown Sources) its package store. Sideloaded apps join it as they're
+# installed, or, at start, once the library content is fetched for a signed-in user
+# (onLibraryContentFetched); with no Meta account OCMS waits for a login that never comes
+# (WAITING_FOR_USER_LOGIN), so after every boot the library had none of them and Unknown Sources
+# was gone until an app was installed again. Once the device's apps are loaded, the sideloaded
+# ones are published the way an install publishes one.
+APP_MANAGER_PROXY = 'Lcom/oculus/ocms/am/init/proxy/AppManagerProxy;'
+APP_SETTING = 'Lcom/oculus/ocms/am/data/entitlement/AppSettingData;'
+PUBLISH_SIDELOADED = f'''
+.method public final prismPublishSideloaded()V
+    .registers 6
+    iget-object v0, p0, {OCMS_LOCAL_APPS}->cacheRef:Ljava/util/concurrent/atomic/AtomicReference;
+    invoke-virtual {{v0}}, Ljava/util/concurrent/atomic/AtomicReference;->get()Ljava/lang/Object;
+    move-result-object v0
+    check-cast v0, Ljava/util/Map;
+    new-instance v1, Ljava/util/LinkedHashMap;
+    invoke-direct {{v1, v0}}, Ljava/util/LinkedHashMap;-><init>(Ljava/util/Map;)V
+    invoke-interface {{v1}}, Ljava/util/Map;->entrySet()Ljava/util/Set;
+    move-result-object v0
+    invoke-interface {{v0}}, Ljava/util/Set;->iterator()Ljava/util/Iterator;
+    move-result-object v0
+    invoke-static {{p0}}, {OCMS_LOCAL_APPS}->A01({OCMS_LOCAL_APPS}){APP_MANAGER_PROXY}
+    move-result-object v1
+    :next
+    invoke-interface {{v0}}, Ljava/util/Iterator;->hasNext()Z
+    move-result v2
+    if-eqz v2, :done
+    invoke-interface {{v0}}, Ljava/util/Iterator;->next()Ljava/lang/Object;
+    move-result-object v2
+    check-cast v2, Ljava/util/Map$Entry;
+    invoke-interface {{v2}}, Ljava/util/Map$Entry;->getValue()Ljava/lang/Object;
+    move-result-object v3
+    check-cast v3, {APP_SETTING}
+    iget-boolean v4, v3, {APP_SETTING}->isSideLoaded:Z
+    if-eqz v4, :next
+    invoke-interface {{v2}}, Ljava/util/Map$Entry;->getKey()Ljava/lang/Object;
+    move-result-object v2
+    check-cast v2, Ljava/lang/String;
+    invoke-virtual {{v1, v2, v3}}, {APP_MANAGER_PROXY}->A0A(Ljava/lang/String;{APP_SETTING})V
+    goto :next
+    :done
+    return-void
+.end method
+'''
+PUBLISH_SIDELOADED_AT_START = [
+    Add(OCMS_LOCAL_APPS, PUBLISH_SIDELOADED, reason='sideloaded apps in the library from the start, signed in or not'),
+    Splice('Lcom/oculus/ocms/am/init/LocalAppDataRepository$initialize$4;', 'invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;',
+           f'invoke-virtual {{v0}}, {OCMS_LOCAL_APPS}->A0A()V',
+           f'''    invoke-virtual {{v0}}, {OCMS_LOCAL_APPS}->A0A()V
+    invoke-virtual {{v0}}, {OCMS_LOCAL_APPS}->prismPublishSideloaded()V''',
+           reason='sideloaded apps in the library from the start, signed in or not'),
+]
+
+# The library's views ask OCMS for apps by origin: All for the Store's (and Q4B's), Unknown Sources
+# for those with no channel. On a headset Meta's apps (Facebook, WhatsApp, TV, ...) are Store
+# entitlements; here tools/apps.py installed them, so they had no channel and sat under Unknown
+# Sources. When the library filters by origin, a Meta app with no channel counts as the Store's.
+# Its channel stays NONE everywhere else, and no entitlement is made up.
+META_PACKAGES = ('com.oculus.', 'com.meta.', 'com.facebook.', 'com.whatsapp', 'com.instagram.')  # as tools/apps.py
+ORIGIN_FILTER = 'Lcom/oculus/ocms/am/init/AppManagerInternal$getFilteredPackageInfoInternal$filteredList$1;'
+PACKAGE_ARG = 'Lcom/meta/libraries/appmanager/aidl/PackageInfoArg;'
+PACKAGE_INTERNAL = 'Lcom/oculus/ocms/am/data/entitlement/PackageInfoInternal;'
+CHANNEL = 'Lcom/oculus/ocms/am/common/ChannelID;'
+ORIGIN_FLAG = 'LX/2Cr;'  # MATCH_ORIGIN_*; A04 is MATCH_ORIGIN_STORE
+META_ORIGIN = f'''
+.method public static prismMetaOrigin({PACKAGE_ARG}{PACKAGE_INTERNAL})Ljava/lang/Boolean;
+    .registers 8
+    invoke-virtual {{p1}}, {PACKAGE_INTERNAL}->A09(){CHANNEL}
+    move-result-object v0
+    sget-object v1, {CHANNEL}->NONE:{CHANNEL}
+    if-ne v0, v1, :stock
+    iget-object v0, p1, {PACKAGE_INTERNAL}->packageName:Ljava/lang/String;
+    if-eqz v0, :stock
+''' + ''.join(f'''    const-string v1, "{prefix}"
+    invoke-virtual {{v0, v1}}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+    move-result v1
+    if-nez v1, :meta
+''' for prefix in META_PACKAGES) + f'''    :stock
+    const/4 v0, 0x0
+    return-object v0
+    :meta
+    const-wide/16 v2, 0x0
+    if-eqz p0, :all
+    iget-wide v2, p0, {PACKAGE_ARG}->A00:J
+    :all
+    const-wide/16 v4, 0x0
+    cmp-long v1, v2, v4
+    if-eqz v1, :yes
+    sget-object v1, {ORIGIN_FLAG}->A04:{ORIGIN_FLAG}
+    iget-wide v4, v1, {ORIGIN_FLAG}->value:J
+    and-long/2addr v2, v4
+    const-wide/16 v4, 0x0
+    cmp-long v1, v2, v4
+    if-eqz v1, :no
+    :yes
+    sget-object v0, Ljava/lang/Boolean;->TRUE:Ljava/lang/Boolean;
+    return-object v0
+    :no
+    sget-object v0, Ljava/lang/Boolean;->FALSE:Ljava/lang/Boolean;
+    return-object v0
+.end method
+'''
+META_APPS_IN_ALL = [
+    Add(ORIGIN_FILTER, META_ORIGIN, reason="Meta's apps under All, as the Store's are on a headset"),
+    Splice(ORIGIN_FILTER, 'invoke(Ljava/lang/Object;)Ljava/lang/Object;',
+           f'''invoke-static {{p1}}, LX/1NK;->A01(Ljava/lang/Object;){PACKAGE_INTERNAL}
+    move-result-object p1
+    iget-object v0, p0, {ORIGIN_FILTER}->$arg:{PACKAGE_ARG}''',
+           f'''    invoke-static {{p1}}, LX/1NK;->A01(Ljava/lang/Object;){PACKAGE_INTERNAL}
+    move-result-object p1
+    iget-object v0, p0, {ORIGIN_FILTER}->$arg:{PACKAGE_ARG}
+    invoke-static {{v0, p1}}, {ORIGIN_FILTER}->prismMetaOrigin({PACKAGE_ARG}{PACKAGE_INTERNAL})Ljava/lang/Boolean;
+    move-result-object v1
+    if-eqz v1, :prism_stock
+    return-object v1
+    :prism_stock''',
+           reason="Meta's apps under All, as the Store's are on a headset"),
+    # The library sorts the apps it's given by the origin each one reports, too.
+    Splice('Lcom/oculus/ocms/am/data/external/PackageInfoConverter;',
+           f'A00({PACKAGE_INTERNAL}{PACKAGE_ARG}Landroid/content/Context;)Lcom/meta/libraries/appmanager/aidl/PackageInfo;',
+           f'''invoke-virtual {{v0}}, {CHANNEL}->A00()I
+    move-result v0
+    iput v0, v3, Lcom/meta/libraries/appmanager/aidl/PackageInfo;->A01:I''',
+           f'''    invoke-virtual {{v0}}, {CHANNEL}->A00()I
+    move-result v0
+    iput v0, v3, Lcom/meta/libraries/appmanager/aidl/PackageInfo;->A01:I
+    const/4 v0, 0x0
+    invoke-static {{v0, p0}}, {ORIGIN_FILTER}->prismMetaOrigin({PACKAGE_ARG}{PACKAGE_INTERNAL})Ljava/lang/Boolean;
+    move-result-object v0
+    if-eqz v0, :prism_origin
+    const/4 v0, 0x1
+    iput v0, v3, Lcom/meta/libraries/appmanager/aidl/PackageInfo;->A01:I
+    :prism_origin''',
+           reason="Meta's apps under All, as the Store's are on a headset"),
+]
+
 # The Library app's system bar waits for the signed-in user's id (ActiveImmersiveRepositoryImpl's
 # active immersive app flow) by asking for it again at once while it's empty: without a Meta account,
 # a dispatcher thread at 55% of a vCPU and system_server's binder threads at about as much again
@@ -330,7 +466,8 @@ BRIDGES = {
     ],
     '/system_ext/framework/oculus-system-services.jar': [REGISTER_LOCK_ORDERING, *SKIP_WINDOWS_WITHOUT_XR_INFO,
                                                        TO_MIRROR_DISPLAY],
-    '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH, LIBRARY_WHITELIST],
+    '/system_ext/priv-app/OCMS/OCMS.apk': [RESOLVE_EMPTY_FETCH, LIBRARY_WHITELIST, *PUBLISH_SIDELOADED_AT_START,
+                                            *META_APPS_IN_ALL],
     '/system_ext/priv-app/LibraryPanelApp/LibraryPanelApp.apk': [WAIT_FOR_USER_ID],
 }
 

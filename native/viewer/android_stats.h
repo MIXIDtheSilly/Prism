@@ -50,7 +50,6 @@ public:
 
     std::atomic<bool> enabled{true};
 
-private:
     // Runs a command without a console window and returns its standard output.
     static bool run(std::string command, std::string& output)
     {
@@ -95,6 +94,7 @@ private:
         return started;
     }
 
+private:
     void poll()
     {
         // logcat's -t counts lines before -s filters them: the last 1000 hold a VrApi line (one a second).

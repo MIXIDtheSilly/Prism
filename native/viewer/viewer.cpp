@@ -146,7 +146,8 @@ void aim(const Input& in, Quat head, Vec& at, Quat& orientation)
 }
 
 // Sends the head, the right controller and its buttons to the tracking service (head.py's lines).
-void tracking_thread(int port)
+// forward is the adb command that brings the tracking service's port to the PC.
+void tracking_thread(int port, std::string forward)
 {
     timeBeginPeriod(1);
     SOCKET sock = INVALID_SOCKET;
@@ -166,7 +167,7 @@ void tracking_thread(int port)
     Vec heldAt{}, leftAt{};
     Quat heldHand{0, 0, 0, 1}, leftHand{0, 0, 0, 1};
     bool holding = false;
-    auto last = Clock::now(), retry = Clock::time_point{};
+    auto last = Clock::now(), retry = Clock::time_point{}, reforward = Clock::now() + std::chrono::seconds(5);
     for (;;) {
         std::this_thread::sleep_for(std::chrono::microseconds(1000000 / kTrackingHz));
         const auto now = Clock::now();
@@ -232,6 +233,13 @@ void tracking_thread(int port)
                 closesocket(sock);
                 sock = INVALID_SOCKET;
                 g_input.connected = false;
+                // A reboot of the emulator drops adb's forward, and then nothing listens here: the
+                // mouse and keys went nowhere until the viewer was started again. Put it back.
+                if (now >= reforward) {
+                    reforward = now + std::chrono::seconds(5);
+                    std::string output;
+                    AndroidStats::run(forward, output);
+                }
                 continue;
             }
             sentInput.clear();
@@ -794,7 +802,8 @@ int main(int argc, char** argv)
     ShowWindow(g_app.window, SW_SHOWNORMAL);
 
     std::thread(frames_thread, emulatorPort).detach();
-    std::thread(tracking_thread, trackingPort).detach();
+    std::thread(tracking_thread, trackingPort, "\"" + adb + "\" -s " + serial + " forward tcp:" +
+                std::to_string(trackingPort) + " tcp:" + std::to_string(trackingPort)).detach();
 
     auto statsAt = Clock::now();
     uint32_t presented = 0;

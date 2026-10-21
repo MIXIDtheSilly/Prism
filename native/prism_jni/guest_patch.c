@@ -12,7 +12,12 @@
 //   in a table of codenames, finds nothing, and the hardware is ranchu. Claiming a real headset
 //   instead would change much more than glass (GPU and format fallbacks, DRM, the HMD's
 //   configuration), so the patch makes only the glass check's device test pass (sub w8, w8, #0x10f
-//   becomes mov w8, wzr: the first known type); the gatekeeper still decides.
+//   becomes mov w8, wzr: the first known type).
+//   The gatekeeper is read from the runtime's own cache (gkcache.dat), which it rebuilds from its
+//   Java config client's values. That client rewrites its cache at every boot with the value it
+//   has (false: nothing synced without a Meta account), over anything set before it starts. The
+//   second patch takes the gatekeeper's answer as on (ldrb w8, [sp, #0x50], the value the
+//   gatekeeper call wrote, becomes mov w8, #1).
 
 #ifndef PRISM_STUB_LIB
 
@@ -37,6 +42,8 @@ static const struct {
 } kPatches[] = {
     {"libvrruntimeservice.so", 0x6becfc, {0x08, 0x3d, 0x04, 0x51}, {0xe8, 0x03, 0x1f, 0x2a},
      "frosted glass on the emulator's device type"},
+    {"libvrruntimeservice.so", 0x6bed50, {0xe8, 0x43, 0x41, 0x39}, {0x28, 0x00, 0x80, 0x52},
+     "frosted glass without its gatekeeper"},
 };
 
 // The library's base: its mapping from offset 0 (the lowest, which holds its ELF header).

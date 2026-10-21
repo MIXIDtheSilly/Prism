@@ -501,13 +501,20 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   `com.oculus.deviceconfigservice.DeviceConfigDebugReceiver`) stores an override but doesn't reach
   a parameter its service has no schema for, which is all of them without a server sync. Deploy's
   `META_PARAMS` are set in those caches at post-fs-data, before apps start; the runtime's native
-  gatekeepers (`gkcache.dat`) follow its client's values from its next start.
+  gatekeepers (`gkcache.dat`) follow its client's values from its next start. A client that
+  rewrites its cache at start with what it synced undoes them, as systemdriver's does (the list is
+  empty for now).
 - **Frosted glass.** Panels' glass backgrounds are the compositor's: it blurs what's behind a glass
   layer (`XR_METAX1_composition_layer_glass`). It sets glass up only for the headsets it knows and
-  when `oculus_xrruntime:oculus_frosted_glass` is on. Prism sets the parameter (`META_PARAMS`), and
-  libprism_jni patches the device check (one instruction of `libvrruntimeservice.so`, written as
-  the translator loads it, after checking the bytes:
-  [guest_patch.c](../native/prism_jni/guest_patch.c)); the compositor logs "Glass is enabled".
+  when `oculus_xrruntime:oculus_frosted_glass` is on. libprism_jni patches both checks, one
+  instruction of `libvrruntimeservice.so` each, written as the translator loads it, after checking
+  the bytes ([guest_patch.c](../native/prism_jni/guest_patch.c)): the device type, and the
+  gatekeeper's answer, since systemdriver's config client rewrites its cache to its synced value
+  (false without a Meta account) at every boot, over what deploy had set. The compositor logs
+  "Glass is enabled" at every boot, with no change in frame rate, but panels still show none:
+  VrShell asks for glass on few of its layers (OCUI theme and per-panel checks), and where glass
+  was forced on every layer, its background was the compositor's solid fallback colour, as no
+  layer is chosen as the source to blur (no passthrough here).
 - **SteamVR** (M5; tried with a headset on 2026-10-11: focused and tracking, 90 frames a second
   submitted, and performance good enough to use). `python tools\steamvr.py` starts
   `native/steamvr`, an OpenXR app on the PC (Direct3D 11; its loader, session and controller actions

@@ -134,12 +134,10 @@ PRELOAD = '/system/lib64/libprism_jni.so'
 # local override (its DC_OVERRIDE debug broadcast) doesn't reach a parameter its service has no
 # schema for, which is all of them without a server sync, so Prism sets the cached value: at
 # post-fs-data, before any app starts, a parameter's row is given its value if the cache has it.
-# The runtime's native gatekeepers (gkcache.dat) are rebuilt from its client's values each run, so
-# a row set on a fresh cache counts from the next boot. (package's data directory, config:param, value)
-META_PARAMS = [
-    # Panels' frosted glass: the compositor's gate (its device check is patched in libprism_jni).
-    ('/data/user_de/0/com.oculus.systemdriver', 'oculus_xrruntime:oculus_frosted_glass', 'true'),
-]
+# A client that rewrites its cache at start with the values it synced undoes this: systemdriver's
+# does, so the compositor's frosted-glass gatekeeper is patched in libprism_jni instead
+# (native/prism_jni/guest_patch.c). (package's data directory, config:param, value)
+META_PARAMS = []
 META_PARAMS_SCRIPT = '/system/bin/prism_meta_params.sh'
 DEVICE_PROPS = '/system/etc/device_props.json'  # vrdevice: chipset, default refresh rate (patched)
 # debugfs is restricted on this image (init unmounts it), so it's mounted just for the write.

@@ -5,7 +5,9 @@
 // VideoInfo, then BGRA pixels, in the mapping SHM_videmulator<port>. A thread watches the frame
 // number; each new frame's eye is uploaded to a D3D11 texture and drawn scaled by the GPU into a
 // flip-model swap chain, drawn only when a back buffer is free (its waitable object), so a frame
-// is shown at the next refresh after it arrives.
+// is shown at the next refresh after it arrives. Where the compositor left the frame empty (turning
+// fast, past what the app drew) the world as last seen fills it, from a cube map per eye that every
+// frame is painted into.
 //
 // The right controller points where the mouse is: its ray goes through the pixel under the mouse,
 // so hovering and clicking work as they look (the left one is held low at the side, pointing
@@ -130,6 +132,47 @@ struct Input {
 };
 Input g_input;
 
+// The head's orientations as sent (the last 5 s), for the one a frame shows (see Frames).
+struct Sent {
+    std::mutex mutex;
+    struct Entry { Clock::time_point time; Quat head; };
+    std::array<Entry, 512> ring{};
+    size_t next = 0, count = 0;
+
+    void add(Clock::time_point time, Quat head)
+    {
+        std::lock_guard lock(mutex);
+        ring[next] = {time, head};
+        next = (next + 1) % ring.size();
+        count = std::min(count + 1, ring.size());
+    }
+
+    // The orientation sent at time, between the two sent around it; false if none was sent then.
+    bool at(Clock::time_point time, Quat& head)
+    {
+        std::lock_guard lock(mutex);
+        const Entry* before = nullptr;
+        const Entry* after = nullptr;
+        for (size_t i = 0; i < count; ++i) {
+            const Entry& e = ring[(next + ring.size() - 1 - i) % ring.size()];  // newest first
+            if (e.time > time) after = &e;
+            else { before = &e; break; }
+        }
+        if (!before || time - before->time > std::chrono::milliseconds(100)) return false;
+        if (!after) { head = before->head; return true; }
+        const double f = std::chrono::duration<double>(time - before->time).count() /
+                         std::chrono::duration<double>(after->time - before->time).count();
+        const Quat a = before->head;
+        Quat b = after->head;
+        if (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0) b = {-b.x, -b.y, -b.z, -b.w};
+        Quat q{a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f, a.w + (b.w - a.w) * f};
+        const double n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        head = {q.x / n, q.y / n, q.z / n, q.w / n};
+        return true;
+    }
+};
+Sent g_sent;
+
 // The right controller's place and orientation: its ray through the mouse's pixel.
 void aim(const Input& in, Quat head, Vec& at, Quat& orientation)
 {
@@ -175,6 +218,7 @@ void tracking_thread(int port, std::string forward)
         last = now;
         char lines[512];
         std::string input;
+        Quat sentHead;
         {
             std::lock_guard lock(g_input.mutex);
             auto& in = g_input;
@@ -189,6 +233,7 @@ void tracking_thread(int port, std::string forward)
                 in.position.z += step * (-m.x * std::sin(yaw) + m.z * std::cos(yaw));
             }
             const Quat head = quaternion(in.yaw, in.pitch);
+            sentHead = head;
             Vec at;
             Quat hand;
             if (!in.looking || !holding) {
@@ -254,6 +299,7 @@ void tracking_thread(int port, std::string forward)
         }
         sentInput = input;
         g_input.connected = true;
+        g_sent.add(Clock::now(), sentHead);
     }
 }
 
@@ -265,6 +311,22 @@ struct Frames {
     std::atomic<uint32_t> count{0};  // new frames since the stats last looked
 };
 Frames g_frames;
+// A frame shows the head where it was this long before the emulator shared it: the compositor turns
+// each frame to the head's latest orientation, and the frame reaches the PC this much later
+// (--latency). Measured turning at a steady rate (60 degrees a second), a frame's yaw (its shift
+// against a still frame) was the one sent 20-35 ms before it was shared.
+double g_latencyMs = 25;
+
+// When the emulator shared a frame, from its VideoInfo's time (Unix microseconds): on Clock, now if
+// the time looks wrong.
+Clock::time_point shared_at(uint64_t unixMicroseconds)
+{
+    const auto now = Clock::now();
+    const int64_t unixNow = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t age = unixNow - static_cast<int64_t>(unixMicroseconds);
+    return age >= 0 && age < 1000000 ? now - std::chrono::microseconds(age) : now;
+}
 // One frame's time at the rate the emulator says it shares (VideoInfo.fps), for the stats colors.
 std::atomic<float> g_budget_ms{1000.0f / 60.0f};
 
@@ -300,10 +362,20 @@ void frames_thread(int emulatorPort)
 
 // --- The window -------------------------------------------------------------------------------
 
+// An eye's frame is drawn (ps) with what the compositor left empty filled from that eye's cube:
+// store paints the frame's covered pixels into the cube's faces, a face texel taking the frame's
+// pixel in its direction; ps looks the empty ones up in it. A face's texels are directions as
+// Direct3D's cube lookups take them.
 const char kShader[] = R"(
 Texture2D image : register(t0);
+TextureCube cube : register(t1);
 SamplerState linearSampler : register(s0);
-cbuffer Params : register(b0) { float2 uvOffset; float2 uvScale; };
+cbuffer Params : register(b0) {
+    float2 uvOffset; float2 uvScale;  // the eye's part of the frame
+    float4 tangents;                  // its edges: left, right, up, down
+    float4 rows[3];                   // a rotation: out of the view (ps), into it (store)
+    float4 extra;                     // store: the face
+};
 struct VsOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 VsOut vs(uint id : SV_VertexID) {
     VsOut o;
@@ -312,10 +384,55 @@ VsOut vs(uint id : SV_VertexID) {
     o.uv = uv;
     return o;
 }
+float3 turn(float3 v) { return float3(dot(rows[0].xyz, v), dot(rows[1].xyz, v), dot(rows[2].xyz, v)); }
+// Where the compositor drew nothing its alpha is 0; anywhere else it's above 0, if not 1 (a layer
+// blended over others leaves less than 1 in alpha, though nothing shows through).
+float coverage(float4 alphas, float a) {
+    float most = max(max(alphas.x, alphas.y), max(alphas.z, alphas.w));
+    return min(min(alphas.x, alphas.y), min(alphas.z, alphas.w)) > 0.002 ? 1 : saturate(a / max(most, 1e-4));
+}
 float4 ps(VsOut i) : SV_Target {
-    return float4(image.Sample(linearSampler, uvOffset + i.uv * uvScale).rgb, 1);
+    float2 uv = uvOffset + i.uv * uvScale;
+    float4 c = image.Sample(linearSampler, uv);
+    float covered = coverage(image.GatherAlpha(linearSampler, uv), c.a);
+    if (covered >= 1) return float4(c.rgb, 1);
+    float3 v = float3(lerp(tangents.x, tangents.y, i.uv.x), lerp(tangents.z, tangents.w, i.uv.y), -1);
+    return float4(c.rgb + cube.SampleLevel(linearSampler, turn(v), 0).rgb * (1 - covered), 1);
+}
+float3 face_direction(uint face, float2 uv) {
+    float s = uv.x * 2 - 1, t = uv.y * 2 - 1;
+    switch (face) {
+    case 0: return float3(1, -t, -s);
+    case 1: return float3(-1, -t, s);
+    case 2: return float3(s, 1, t);
+    case 3: return float3(s, -1, -t);
+    case 4: return float3(s, -t, 1);
+    default: return float3(-s, -t, -1);
+    }
+}
+float4 store(VsOut i) : SV_Target {
+    float3 v = turn(face_direction((uint)extra.x, i.uv));
+    clip(-v.z - 1e-4);
+    float2 t = v.xy / -v.z;
+    float2 uv = float2((t.x - tangents.x) / (tangents.y - tangents.x), (tangents.z - t.y) / (tangents.z - tangents.w));
+    clip(uv);
+    clip(1 - uv);
+    uv = uvOffset + uv * uvScale;
+    float4 c = image.SampleLevel(linearSampler, uv, 0);
+    clip(coverage(image.GatherAlpha(linearSampler, uv), c.a) - 1);  // covered, and so are its neighbours
+    return float4(c.rgb, 1);
 }
 )";
+
+// The constants above.
+struct Params {
+    float uvOffset[2], uvScale[2];
+    float tangents[4];
+    float rows[3][4];
+    float extra[4];
+};
+static_assert(sizeof(Params) == 96);
+constexpr UINT kCubeSize = 1024;  // each face's side: about 11 texels a degree (an eye's frame has 14)
 
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11DeviceContext> g_context;
@@ -326,13 +443,22 @@ struct App {
     HANDLE bufferFree = nullptr;  // the swap chain's frame latency waitable object
     ComPtr<ID3D11RenderTargetView> target;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps, store;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11Texture2D> texture;  // the emulator's display, of which the eye shown is kept current
     ComPtr<ID3D11ShaderResourceView> view;
     UINT textureWidth = 0, textureHeight = 0;
     uint32_t uploaded = 0;  // the frame number in the texture
+    Clock::time_point uploadedShared{};  // when the emulator shared it
+    // The world as last seen, a cube per eye (directions from the head's center): what fills the
+    // frame where the compositor had nothing to show. Horizon's compositor turns an app's latest
+    // frame to where the head is now, and the faster the head turns the more of it is past what the
+    // app drew (VrShell draws from where the head was when it started a frame, tens of milliseconds
+    // earlier): black, a band down the side as wide as the turn.
+    ComPtr<ID3D11Texture2D> cubes[2];
+    ComPtr<ID3D11ShaderResourceView> cubeViews[2];
+    ComPtr<ID3D11RenderTargetView> cubeFaces[2][6];
     bool hasFrame = false, reupload = false;  // reupload: the part shown changed
     UINT width = 0, height = 0;
     bool resized = true, both = false, closed = false, saveRequested = false;
@@ -387,17 +513,116 @@ bool create_device()
 
 bool create_pipeline()
 {
-    ComPtr<ID3DBlob> vsBlob, psBlob;
-    if (!compile("vs", "vs_5_0", vsBlob) || !compile("ps", "ps_5_0", psBlob)) return false;
+    ComPtr<ID3DBlob> vsBlob, psBlob, storeBlob;
+    if (!compile("vs", "vs_5_0", vsBlob) || !compile("ps", "ps_5_0", psBlob) || !compile("store", "ps_5_0", storeBlob)) return false;
     if (FAILED(g_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_app.vs)) ||
-        FAILED(g_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_app.ps))) return false;
+        FAILED(g_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_app.ps)) ||
+        FAILED(g_device->CreatePixelShader(storeBlob->GetBufferPointer(), storeBlob->GetBufferSize(), nullptr, &g_app.store)))
+        return false;
     D3D11_SAMPLER_DESC sampler{};
     sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampler.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(g_device->CreateSamplerState(&sampler, &g_app.sampler))) return false;
-    D3D11_BUFFER_DESC buffer{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
-    return SUCCEEDED(g_device->CreateBuffer(&buffer, nullptr, &g_app.params));
+    D3D11_BUFFER_DESC buffer{sizeof(Params), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+    if (FAILED(g_device->CreateBuffer(&buffer, nullptr, &g_app.params))) return false;
+    const D3D11_TEXTURE2D_DESC cubeDesc{kCubeSize, kCubeSize, 1, 6, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_TEXTURECUBE};
+    const float black[4] = {0, 0, 0, 1};  // nothing seen yet
+    for (int eye = 0; eye < 2; ++eye) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{cubeDesc.Format, D3D11_SRV_DIMENSION_TEXTURECUBE};
+        viewDesc.TextureCube.MipLevels = 1;
+        if (FAILED(g_device->CreateTexture2D(&cubeDesc, nullptr, &g_app.cubes[eye])) ||
+            FAILED(g_device->CreateShaderResourceView(g_app.cubes[eye].Get(), &viewDesc, &g_app.cubeViews[eye]))) return false;
+        for (UINT face = 0; face < 6; ++face) {
+            D3D11_RENDER_TARGET_VIEW_DESC faceDesc{cubeDesc.Format, D3D11_RTV_DIMENSION_TEXTURE2DARRAY};
+            faceDesc.Texture2DArray.FirstArraySlice = face;
+            faceDesc.Texture2DArray.ArraySize = 1;
+            if (FAILED(g_device->CreateRenderTargetView(g_app.cubes[eye].Get(), &faceDesc, &g_app.cubeFaces[eye][face]))) return false;
+            g_context->ClearRenderTargetView(g_app.cubeFaces[eye][face].Get(), black);
+        }
+    }
+    return true;
+}
+
+// The rotation's matrix (rows): rotate(q, v) is m * v.
+std::array<std::array<double, 3>, 3> matrix(Quat q)
+{
+    const double x = q.x, y = q.y, z = q.z, w = q.w;
+    return {{{1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)},
+             {2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)},
+             {2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)}}};
+}
+
+// An eye's constants: its part of the frame, its edges, and the head's orientation (out of the
+// view, or into it).
+Params eye_params(int eye, Quat head, bool into)
+{
+    Params p{};
+    p.uvOffset[0] = 0.5f * eye;
+    p.uvScale[0] = 0.5f;
+    p.uvScale[1] = 1;
+    for (int i = 0; i < 4; ++i) p.tangents[i] = float(kViews[eye][i]);
+    const auto m = matrix(head);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) p.rows[r][c] = float(into ? m[c][r] : m[r][c]);
+    return p;
+}
+
+// A cube face's index (Direct3D's order: +X, -X, +Y, -Y, +Z, -Z) for a direction.
+int cube_face(Vec d)
+{
+    const double x = std::fabs(d.x), y = std::fabs(d.y), z = std::fabs(d.z);
+    if (x >= y && x >= z) return d.x > 0 ? 0 : 1;
+    if (y >= z) return d.y > 0 ? 2 : 3;
+    return d.z > 0 ? 4 : 5;
+}
+
+// A triangle over the viewport with the pixel shader reading the frame and a cube.
+void fullscreen(ID3D11RenderTargetView* target, const D3D11_VIEWPORT& viewport, ID3D11PixelShader* shader,
+                ID3D11ShaderResourceView* cube, const Params& params)
+{
+    g_context->UpdateSubresource(g_app.params.Get(), 0, nullptr, &params, 0, 0);
+    g_context->OMSetRenderTargets(1, &target, nullptr);
+    g_context->RSSetViewports(1, &viewport);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->IASetInputLayout(nullptr);
+    g_context->VSSetShader(g_app.vs.Get(), nullptr, 0);
+    g_context->PSSetShader(shader, nullptr, 0);
+    ID3D11ShaderResourceView* sources[] = {g_app.view.Get(), cube};
+    g_context->PSSetShaderResources(0, 2, sources);
+    g_context->PSSetSamplers(0, 1, g_app.sampler.GetAddressOf());
+    g_context->PSSetConstantBuffers(0, 1, g_app.params.GetAddressOf());
+    g_context->Draw(3, 0);
+    ID3D11ShaderResourceView* none[] = {nullptr, nullptr};
+    g_context->PSSetShaderResources(0, 2, none);
+}
+
+// The new frame's covered pixels into the cubes of the eyes in the texture, seen from where the head
+// was (see g_latencyMs); nothing if that isn't known (no tracking then).
+void store_frame()
+{
+    Quat head;
+    if (!g_app.view || !g_sent.at(g_app.uploadedShared - std::chrono::microseconds(int64_t(g_latencyMs * 1000)), head)) return;
+    const D3D11_VIEWPORT viewport{0, 0, float(kCubeSize), float(kCubeSize), 0, 1};
+    for (int eye = 0; eye < 2; ++eye) {
+        if (!g_app.both && eye != g_app.eye) continue;
+        Params params = eye_params(eye, head, true);
+        // The faces the eye's view reaches: its edges' and inner directions', sampled.
+        unsigned faces = 0;
+        constexpr int kSteps = 16;
+        for (int a = 0; a <= kSteps; ++a)
+            for (int b = 0; b <= kSteps; ++b) {
+                const double* view = kViews[eye];
+                faces |= 1u << cube_face(rotate(head, {view[0] + (view[1] - view[0]) * a / kSteps,
+                                                       view[2] + (view[3] - view[2]) * b / kSteps, -1}));
+            }
+        for (int face = 0; face < 6; ++face) {
+            if (!(faces & (1u << face))) continue;
+            params.extra[0] = float(face);
+            fullscreen(g_app.cubeFaces[eye][face].Get(), viewport, g_app.store.Get(), nullptr, params);
+        }
+    }
 }
 
 bool create_swapchain()
@@ -491,6 +716,7 @@ bool upload()
     g_app.uploadMs = std::chrono::duration<float, std::milli>(Clock::now() - start).count();
     const bool fresh = !g_app.hasFrame || number != g_app.uploaded;
     g_app.uploaded = number;
+    g_app.uploadedShared = shared_at(info->time);
     g_app.hasFrame = true;
     g_app.reupload = false;
     return fresh;
@@ -631,19 +857,19 @@ void render()
         if (g_app.saveRequested) save_png();
         const float aspect = float(g_app.both ? g_app.textureWidth : g_app.textureWidth / 2) / float(g_app.textureHeight);
         g_app.viewport = fit(float(g_app.width), float(g_app.height), aspect);
-        const float params[4] = {g_app.both ? 0.0f : 0.5f * g_app.eye, 0, g_app.both ? 1.0f : 0.5f, 1};
-        g_context->UpdateSubresource(g_app.params.Get(), 0, nullptr, params, 0, 0);
-        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_context->IASetInputLayout(nullptr);
-        g_context->VSSetShader(g_app.vs.Get(), nullptr, 0);
-        g_context->PSSetShader(g_app.ps.Get(), nullptr, 0);
-        g_context->PSSetShaderResources(0, 1, g_app.view.GetAddressOf());
-        g_context->PSSetSamplers(0, 1, g_app.sampler.GetAddressOf());
-        g_context->PSSetConstantBuffers(0, 1, g_app.params.GetAddressOf());
-        g_context->RSSetViewports(1, &g_app.viewport);
-        g_context->Draw(3, 0);
-        ID3D11ShaderResourceView* none = nullptr;
-        g_context->PSSetShaderResources(0, 1, &none);
+        // Each eye seen from where the head was when the frame was made (as if it faced ahead
+        // when that isn't known: no tracking).
+        Quat head{0, 0, 0, 1};
+        g_sent.at(g_app.uploadedShared - std::chrono::microseconds(int64_t(g_latencyMs * 1000)), head);
+        for (int eye = 0; eye < 2; ++eye) {
+            if (!g_app.both && eye != g_app.eye) continue;
+            D3D11_VIEWPORT viewport = g_app.viewport;
+            if (g_app.both) {
+                viewport.Width /= 2;
+                viewport.TopLeftX += eye * viewport.Width;
+            }
+            fullscreen(g_app.target.Get(), viewport, g_app.ps.Get(), g_app.cubeViews[eye].Get(), eye_params(eye, head, false));
+        }
     }
     g_app.saveRequested = false;
     draw_overlay();
@@ -772,6 +998,7 @@ int main(int argc, char** argv)
         else if (arg == "--adb") adb = argv[++i];
         else if (arg == "--serial") serial = argv[++i];
         else if (arg == "--stats") g_app.overlay = std::atoi(argv[++i]) != 0;
+        else if (arg == "--latency") g_latencyMs = std::atof(argv[++i]);
     }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -848,6 +1075,7 @@ int main(int argc, char** argv)
         }
         if (bufferFree && (pending || g_app.resized || g_app.saveRequested)) {
             const bool fresh = upload();
+            if (fresh) store_frame();
             render();
             bufferFree = pending = false;
             if (fresh) {

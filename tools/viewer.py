@@ -1,6 +1,6 @@
 """Prism's viewer: Horizon in a desktop window, driven with the mouse and keyboard.
 
-    python tools/viewer.py [--eye left|right] [--no-stats] [--build]
+    python tools/viewer.py [--eye left|right] [--latency MS] [--no-stats] [--build]
 
 Builds and starts native/viewer (Visual Studio's C++ tools; rebuilt when its sources change):
 one eye of what the compositor puts on the emulator's display, from the emulator's frames in
@@ -15,6 +15,11 @@ Universal Menu), E and Q press A and B, G or the middle button squeezes the grip
 stats (the compositor's frame rate, Android's CPU, the viewer's frames), F2 saves a screenshot to
 work/screenshots, F3 shows both eyes, F11 is fullscreen. Poses and buttons go to Prism's tracking
 service (native/tracking_prism) as tools/head.py sends them.
+
+Turning fast, Horizon's frames have a black band down the side (the compositor turns an app's frame
+to where the head is now, past what the app drew); the viewer fills it with what was there when last
+seen. A frame shows the head where it was --latency ms before it reached the PC (25 by default:
+measured turning at a steady rate, the frame's yaw against when the viewer sent it).
 """
 import argparse
 import glob
@@ -65,6 +70,7 @@ def build(force=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--eye', choices=('left', 'right'), default='left')
+    ap.add_argument('--latency', type=float, default=25, help='ms from the pose a frame shows to the PC')
     ap.add_argument('--no-stats', action='store_true', help='start with the F1 stats hidden')
     ap.add_argument('--build', action='store_true', help='rebuild the viewer even if it looks current')
     ap.add_argument('--log', action='store_true', help="print the viewer's stats once a second")
@@ -75,6 +81,7 @@ def main():
     subprocess.run([adb_path(), '-s', SERIAL, 'forward', f'tcp:{PORT}', f'tcp:{PORT}'], check=True,
                    capture_output=True)
     subprocess.run([EXE, '--emulator-port', str(EMULATOR_PORT), '--tracking-port', str(PORT), '--eye', args.eye,
+                    '--latency', str(args.latency),
                     '--adb', adb_path(), '--serial', SERIAL, '--stats', '0' if args.no_stats else '1',
                     '--shots', os.path.join(ROOT, 'work', 'screenshots')] + (['--log'] if args.log else []))
 

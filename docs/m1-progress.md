@@ -417,6 +417,16 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   right-drag looks around, WASD and R/F move. The compositor draws each half from the head's
   center (not the eye's), the middle of the FOV apps render, undistorted; the runtime's aim pose is
   the published pose turned 5° in and moved 9 mm (xrprobe), which the viewer undoes.
+  Turning fast showed a black band down the side of the view, as wide as the turn: the compositor
+  turns an app's latest frame to where the head is now, and VrShell draws from where it was when it
+  started a frame, tens of milliseconds earlier, so the frame ends short of the view. Where the
+  compositor drew nothing, a frame's alpha is 0 (anywhere else above 0: a layer blended over others
+  leaves less than 1 though nothing shows through). Since 2026-10-22 the viewer fills those pixels
+  with the world as last seen, from a cube map per eye that each frame's drawn pixels are painted
+  into, from where the head was when the frame was made: 25 ms (`--latency`) before the emulator
+  shared it, measured turning at a steady 60° a second (a frame's yaw, by its shift against a still
+  frame, was the one sent 20-35 ms before). Fast turns past the Store's panel show no black and no
+  seam at its edges.
   The compositor runs at 60 Hz, the display's rate: its vsync otherwise starts at the device's
   default 72 whatever the display reports, and the emulator shares at most 60 frames a second, so
   one compositor frame in six was dropped, unevenly. `debug.oculus.refreshRate` ("<rate>", or

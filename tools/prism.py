@@ -14,8 +14,9 @@ uses so it leaves the working one alone (kept, as the settings are).
 
 setup runs each step that isn't current, in order (STEPS): the Android SDK's packages Prism needs
 (tools/sdk.py installs what's missing), the workspace from the OTA, the AVD and its display rate,
-the emulator's frame sharing and pbuffer pool, the builds, the PC apps, the deploy and the Meta apps
-copied from your headset (tools/apps.py pull), installed again after a deploy. Each step knows
+the emulator's frame sharing, pbuffer pool and large transfers, the builds, the PC apps, the
+deploy and the Meta apps copied from your headset (tools/apps.py pull), installed again after a
+deploy. Each step knows
 whether it's current (the builds by their stamps, the deploy by the id it leaves on the guest), so
 setup run again with nothing changed does nothing, and after a pull does only what the change needs.
 vr and desktop bring setup up to date, wait until Home is drawing (emulator.py ready) and run
@@ -205,6 +206,11 @@ def doctor_checks(settings):
             'patched' if site[1] else 'a build whose pbuffer pool Prism knows; setup patches it',
             f'install emulator {android_sdk.EMULATOR_TESTED[-1]}; without it Horizon slows as apps open, '
             'until the emulator restarts')
+        sites = transfer_sites()
+        add("Emulator's large transfers", None if None in sites else True,
+            f'emulator {version}, whose transfers patch-transfers does not know' if None in sites else
+            'patched' if all(s[1] for s in sites) else 'a build whose transfers Prism knows; setup patches them',
+            'install emulator 37.1.11; without it an app killed in an upload can freeze the emulator')
     vs = found(vcvars)
     add("Visual Studio's C++ tools", bool(vs), vs or 'not found',
         'Visual Studio (Community is fine) with "Desktop development with C++", or just its build tools: '
@@ -417,6 +423,34 @@ def pbuffers_run(settings, force):
     return stopped() and python('emulator.py', 'patch-pbuffers')
 
 
+def transfer_sites():
+    """emulator.transfer_site for each binary the patch changes (None where it doesn't know the build)."""
+    sites = []
+    for name in (*emulator.TRANSFER_QEMU, emulator.TRANSFER_BINARY):
+        try:
+            with open(emulator.transfer_path(name), 'rb') as f:
+                sites.append(emulator.transfer_site(name, f.read()))
+        except OSError:
+            sites.append(None)
+    return sites
+
+
+def transfers_state(settings):
+    sites = transfer_sites()
+    if None in sites:
+        return None, 'an emulator build patch-transfers does not know: an app killed in an upload can freeze it'
+    patched = all(s[1] for s in sites)
+    return patched, ('a killed app ends its unfinished transfers' if patched else
+                     'an app killed in an upload can freeze the emulator')
+
+
+def transfers_run(settings, force):
+    if None in transfer_sites():
+        say('leaving the emulator as installed')
+        return True
+    return stopped() and python('emulator.py', 'patch-transfers')
+
+
 def other_avd():
     """The AVD on Prism's port when it isn't this one (they share the port), else None."""
     running = emulator.running_avd()
@@ -523,6 +557,7 @@ STEPS = [('sdk', sdk_state, sdk_run),
          ('refresh', refresh_state, refresh_run),
          ('frame sharing', sharing_state, sharing_run),
          ('pbuffers', pbuffers_state, pbuffers_run),
+         ('transfers', transfers_state, transfers_run),
          ('emulator', emulator_state, emulator_run),
          ('bionic', bionic_state, bionic_run),
          *[(name, *build_step(module, out)) for name, module, out in BUILDS],

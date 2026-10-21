@@ -85,7 +85,7 @@ Each step says whether it's current and is skipped when it is. `setup --force ST
 | Step | Current when |
 |---|---|
 | prepare (OTA) | `work/` has the images and inventory of this OTA (its size and SHA-256 recorded at the end of prepare) |
-| AVD create, config, patch-share-vid, patch-pbuffers | The AVD exists with Prism's `config.ini` values; the qemu binaries carry the frame sharing patch (`sharer_site`) and gfxstream the pbuffer one (`pbuffer_site`) |
+| AVD create, config, patch-share-vid, patch-pbuffers, patch-transfers | The AVD exists with Prism's `config.ini` values; the qemu binaries carry the frame sharing patch (`sharer_site`), gfxstream the pbuffer one (`pbuffer_site`), and both the large-transfer one (`transfer_site`) |
 | root | The guest's system partitions remount writable (verity off) |
 | jni, compat, translator, vulkan, gles, thermal, tracking, hidl, relay, spaces, guest_media | The build's outputs are newer than its sources (`native/<part>`, its `tools/*.py`, and the OTA for the parts built against it) |
 | deploy | The guest's `/data/prism/deploy-id` equals the hash of what deploy would push now (`work/deploy`) |

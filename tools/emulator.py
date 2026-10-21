@@ -11,6 +11,7 @@ uses the same port, so one of them runs at a time.
     python tools/emulator.py ready             # until Horizon's home is drawing (on the TSC, VrShell up, frames shared)
     python tools/emulator.py patch-share-vid [--rate HZ] [--undo]  # -share-vid shares more than 60 frames a second
     python tools/emulator.py patch-pbuffers [--undo]  # gfxstream reuses pbuffers the NVIDIA driver won't release
+    python tools/emulator.py patch-transfers [--undo]  # an app killed mid-upload doesn't freeze the emulator
     python tools/emulator.py clock             # reboot until the guest's clock is the TSC (start --wait does this)
     python tools/emulator.py root              # adb root + make /system, /system_ext, /product writable
     python tools/emulator.py status            # boot state, key processes, services, latest crash
@@ -352,6 +353,137 @@ def patch_pbuffers(args):
         f.write(data)
     os.replace(path + '.tmp', path)
     print(f'{PBUFFER_BINARY}: returns pbuffers to the pool when the driver keeps their DCs')
+
+
+# A guest app killed in the middle of a large transfer (ASG's type 3: a texture or buffer upload)
+# froze the emulator. gfxstream's ring reader (RingStream::readRaw) waits out a large transfer it has
+# begun, spinning on the ring and looking at nothing else until the guest has written all of it,
+# and that guest is gone. Closing its context (qemu's AddressSpaceGraphicsContext destructor) then
+# waits for the render thread to finish, on the vCPU whose write closed it, holding qemu's lock: the
+# whole guest stops, and qemu's hang detector ends the emulator 15 s later ("detected a hanging
+# thread 'QEMU2 main loop'"). An upload killed every second or two froze it within 12 kills. Two
+# patches end the wait, and change nothing while the guest is alive:
+# - qemu's destructor also sets the ring's in_error (asg_ring_config, at the ring storage + 0x884 +
+#   0x18; a guest abandons a transfer when it's set, and gfxstream sets it for a broken transfer), in
+#   a few bytes of padding it calls in place of `mov dword ptr [rsi + 0x408], 1` (mExiting = 1, the
+#   first thing the padding does). Both qemu builds.
+# - gfxstream's spin over an unfinished transfer stops when in_error is set, and the reader goes on
+#   as when there's nothing to read: it takes the Exit the destructor queued, and the thread ends.
+TRANSFER_BINARY = PBUFFER_BINARY
+TRANSFER_QEMU = SHARER_BINARIES
+# if (inLargeXfer) { if (transfer_size) continue; inLargeXfer = transfer_size != 0; } ...
+TRANSFER_SPIN = bytes.fromhex('41f6c601741d488b46408b401441b60185c075d9488b46408b401485c0410f95c6eb03')
+# ... if (inLargeXfer && transfer_size && !in_error) continue; inLargeXfer = false (the xor after it)
+TRANSFER_SPIN_PATCHED = bytes.fromhex('41f6c601741d488b464083781400741383781800750debd5'
+                                      '660f1f840000000000' '6690')
+TRANSFER_SPIN_AFTER = bytes.fromhex('4531f6')  # xor r14d, r14d
+# The destructor: cmp qword ptr [rcx + 0x3b8], 0 (mCurrentConsumer); je; [mExiting = 1]; lea rdi, [rsi + 0x3c0]
+TRANSFER_DTOR_BEFORE = bytes.fromhex('4883b9b8030000007462')
+TRANSFER_DTOR = bytes.fromhex('c7860804000001000000')
+TRANSFER_DTOR_AFTER = bytes.fromhex('488dbec0030000')
+# mExiting = 1; if (ring storage) ring_config->in_error = 1; ret
+TRANSFER_CAVE = TRANSFER_DTOR + bytes.fromhex('488b4610' '4885c0' '740a' 'c7809c08000001000000' 'c3')
+TRANSFER_CALL_NOP = bytes.fromhex('0f1f440000')
+
+
+def pe_sections(data):
+    """(virtual address, raw offset, raw size, executable) of each of a PE image's sections."""
+    pe = int.from_bytes(data[0x3c:0x40], 'little')
+    count = int.from_bytes(data[pe + 6:pe + 8], 'little')
+    table = pe + 24 + int.from_bytes(data[pe + 20:pe + 22], 'little')
+    sections = []
+    for i in range(count):
+        s = table + 40 * i
+        va, size, raw, flags = (int.from_bytes(data[s + o:s + o + 4], 'little') for o in (12, 16, 20, 36))
+        sections.append((va, raw, size, bool(flags & 0x20000000)))
+    return sections
+
+
+def pe_rva(data, offset):
+    return next(va + offset - raw for va, raw, size, _ in pe_sections(data) if raw <= offset < raw + size)
+
+
+def pe_offset(data, rva):
+    return next((raw + rva - va for va, raw, size, _ in pe_sections(data) if va <= rva < va + size), None)
+
+
+def transfer_path(name):
+    return pbuffer_path() if name == TRANSFER_BINARY else sharer_path(name)
+
+
+def transfer_site(name, data):
+    """(offset of the patched bytes, whether they're patched) in one of the binaries, or None unless
+    exactly one place fits."""
+    data = bytes(data)
+    if name == TRANSFER_BINARY:
+        pattern = b'(?:' + re.escape(TRANSFER_SPIN) + b'|' + re.escape(TRANSFER_SPIN_PATCHED) + b')' + re.escape(TRANSFER_SPIN_AFTER)
+        sites = [m.start() for m in re.finditer(pattern, data)]
+        if len(sites) != 1:
+            return None
+        return sites[0], data[sites[0]:sites[0] + len(TRANSFER_SPIN)] == TRANSFER_SPIN_PATCHED
+    pattern = (re.escape(TRANSFER_DTOR_BEFORE) + b'(?:' + re.escape(TRANSFER_DTOR) + b'|\xe8.{4}' + re.escape(TRANSFER_CALL_NOP) +
+               b')' + re.escape(TRANSFER_DTOR_AFTER))
+    sites = [m.start() + len(TRANSFER_DTOR_BEFORE) for m in re.finditer(pattern, data, re.DOTALL)]
+    if len(sites) != 1:
+        return None
+    site = sites[0]
+    if data[site] != 0xe8:
+        return site, False
+    target = pe_offset(data, pe_rva(data, site) + 5 + int.from_bytes(data[site + 1:site + 5], 'little', signed=True))
+    if target is None or data[target:target + len(TRANSFER_CAVE)] != TRANSFER_CAVE:
+        return None
+    return site, True
+
+
+def transfer_cave(data):
+    """The offset of padding the destructor's code can go in: inside the first run of 48 int3s in an
+    executable section, with int3s kept on both sides."""
+    for va, raw, size, executable in pe_sections(data):
+        if executable:
+            m = re.search(rb'\xcc{48,}', bytes(data[raw:raw + size]))
+            if m:
+                return raw + m.start() + 8
+    return None
+
+
+def patch_transfers(args):
+    """Makes closing a context end gfxstream's wait for the rest of a large transfer (see above); --undo
+    takes the patches out again. The emulator has to be stopped: Windows locks a running binary."""
+    if running():
+        sys.exit('stop the emulator first (python tools/emulator.py stop)')
+    binaries = []
+    for name in (*TRANSFER_QEMU, TRANSFER_BINARY):
+        with open(transfer_path(name), 'rb') as f:
+            data = bytearray(f.read())
+        site = transfer_site(name, data)
+        if site is None:
+            sys.exit(f'{name}: not a build whose transfers this knows (emulator 37.1.11 is); nothing changed. Horizon '
+                     'runs without it, but an app killed in an upload can freeze the emulator')
+        if name != TRANSFER_BINARY and not site[1] and not args.undo and transfer_cave(data) is None:
+            sys.exit(f'{name}: no padding for the patch; nothing changed')
+        binaries.append((name, transfer_path(name), data, *site))
+    for name, path, data, offset, patched in binaries:
+        if patched == (not args.undo):
+            print(f'{name}: already ' + ('as installed' if args.undo else 'patched'))
+            continue
+        if not os.path.exists(path + '.orig'):
+            shutil.copyfile(path, path + '.orig')
+        if name == TRANSFER_BINARY:
+            data[offset:offset + len(TRANSFER_SPIN)] = TRANSFER_SPIN if args.undo else TRANSFER_SPIN_PATCHED
+        elif args.undo:
+            rel = int.from_bytes(data[offset + 1:offset + 5], 'little', signed=True)
+            cave = pe_offset(data, pe_rva(data, offset) + 5 + rel)
+            data[cave:cave + len(TRANSFER_CAVE)] = b'\xcc' * len(TRANSFER_CAVE)
+            data[offset:offset + len(TRANSFER_DTOR)] = TRANSFER_DTOR
+        else:
+            cave = transfer_cave(data)
+            data[cave:cave + len(TRANSFER_CAVE)] = TRANSFER_CAVE
+            rel = pe_rva(data, cave) - (pe_rva(data, offset) + 5)
+            data[offset:offset + len(TRANSFER_DTOR)] = b'\xe8' + rel.to_bytes(4, 'little', signed=True) + TRANSFER_CALL_NOP
+        with open(path + '.tmp', 'wb') as f:
+            f.write(data)
+        os.replace(path + '.tmp', path)
+        print(f'{name}: ' + ('as installed' if args.undo else 'a closed context ends an unfinished large transfer'))
 
 
 def start(args):
@@ -718,6 +850,7 @@ def main():
     ps.add_argument('--rate', type=int, help="frames a second (default: the AVD's refresh rate)")
     ps.add_argument('--undo', action='store_true', help='restore the emulator builds as installed')
     sub.add_parser('patch-pbuffers').add_argument('--undo', action='store_true', help='restore gfxstream as installed')
+    sub.add_parser('patch-transfers').add_argument('--undo', action='store_true', help='take the patches out')
     s = sub.add_parser('start')
     s.add_argument('--headless', action='store_true', help='no emulator window (the default above 60 Hz)')
     s.add_argument('--window', action='store_true', help='keep the emulator window above 60 Hz too')
@@ -744,8 +877,8 @@ def main():
     if args.command == 'ready':
         sys.exit(0 if ready(args) else 1)
     {'create': create, 'config': configure, 'start': start, 'wait': wait, 'root': root, 'status': status, 'clock': ensure_tsc,
-     'stop': stop, 'patch-share-vid': patch_share_vid, 'patch-pbuffers': patch_pbuffers, 'emulator-flag': emulator_flag,
-     'model': model}[args.command](args)
+     'stop': stop, 'patch-share-vid': patch_share_vid, 'patch-pbuffers': patch_pbuffers,
+     'patch-transfers': patch_transfers, 'emulator-flag': emulator_flag, 'model': model}[args.command](args)
 
 
 if __name__ == '__main__':

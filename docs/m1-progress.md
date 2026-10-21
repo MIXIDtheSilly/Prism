@@ -341,6 +341,21 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   longer stops the emulator. Asking that way also stops a guest spin: while the PC waits, the
   waiting thread spins on gfxstream's ring buffer (`AddressSpaceStream::speculativeRead`), and the
   runtime service's frame waits kept one of its binder threads at 50-97% of a vCPU.
+- **The emulator freezing when an app is killed mid-upload** (2026-10-21; twice that night while
+  opening and force-stopping WhatsApp in a loop): the same hang detector, after qemu's main loop and
+  the vCPUs stopped for 15 s. One vCPU was closing a GL context (qemu's
+  `AddressSpaceGraphicsContext` destructor, run by the guest's write as the dead app's connection
+  closed) and waited, holding qemu's lock, for the context's render thread to finish; that thread
+  was spinning in gfxstream's ring reader (`RingStream::readRaw`), which waits out a large transfer
+  it has begun (ASG's type 3, used for big uploads: `transfer_size` still nonzero) and looks at
+  nothing else, for bytes the killed app was never going to write. A guest program uploading a
+  64 MB texture over and over, killed every 0.5-3 s, froze the emulator at the 12th kill.
+  `python tools/emulator.py patch-transfers` (a setup step, checked by doctor) has the destructor
+  also set the ring's `in_error` (the guest abandons a transfer when it's set, and gfxstream sets it
+  for a broken one), from padding it calls in both qemu builds, and has the reader stop waiting for
+  a transfer when it's set: the reader then takes the Exit the destructor queued and the thread
+  ends. A live transfer is waited out as before. Patched: 60 kills in a row, the guest answered
+  after each and no render thread was left spinning; Home at 90 frames a second.
 - **Chrome's app zygote spinning** (`com.oculus.browser_zygote` at ~90% of a vCPU, and no
   renderer ever started): Prism started the arm64 libbinder's thread pool at the first namespace,
   which an app zygote makes while preloading, and a zygote forks only once it's down to one thread

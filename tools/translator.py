@@ -5,7 +5,9 @@ libraries lack (see native/berberis_compat). This builds that shim (libpcx.so), 
 bundle to work/build/translator/, points each host binary's DT_NEEDED "libc++.so" at the shim
 (same length, so the change is in place), and checks that every host import then resolves
 against the stock image. It also disables the guest libdl's CFI slow path (see disable_guest_cfi)
-and keeps block chaining's per-thread state usable through thread exit (see keep_chain_sites).
+and keeps block chaining's per-thread state usable through thread exit (see keep_chain_sites),
+and builds two proxies of Prism's: the PC's libm for the guest's (build_proxy_libm) and VrShell's
+ray hit-testing lifted to native code (build_proxy_libshell; needs capstone, else skipped).
 
     python tools/translator.py [--ndk PATH]
 """
@@ -19,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -33,7 +36,8 @@ BIONIC = os.path.join(ROOT, 'work', 'device', 'bionic')
 
 def inputs(bionic=BIONIC):
     """The bundle, the shim, and what imports are checked against: stock's libraries and bionic."""
-    return [BUNDLE, SHIM_SOURCE, PROXY_LIBM_SOURCE, __file__, bionic, *extracted(os.path.join(ROOT, 'work', 'baseline', 'fs'))]
+    return [BUNDLE, SHIM_SOURCE, PROXY_LIBM_SOURCE, PROXY_LIBSHELL_SOURCE, os.path.join(HERE, 'lift_arm64.py'), VRSHELL_APK,
+            __file__, bionic, *extracted(os.path.join(ROOT, 'work', 'baseline', 'fs'))]
 SHIM = 'libpcx.so'
 REPLACED = 'libc++.so'
 assert len(SHIM) == len(REPLACED)
@@ -262,6 +266,64 @@ R_AARCH64_GLOB_DAT, R_AARCH64_RELATIVE = 1025, 1027
 PT_LOAD, PF_X = 1, 1
 
 
+# VrShell's ray hit-testing as native code (native/berberis_proxy_libshell): tools/lift_arm64.py
+# turns these libshell.so functions into C, from the user's own VrShell (work/fs), and the proxy's
+# runtime checks the build and the bytes again in VrShell before libprism_jni has the translator use
+# them. The offsets are this Horizon build's; another one is skipped here (and would be at runtime).
+PROXY_LIBSHELL_SOURCE = os.path.join(ROOT, 'native', 'berberis_proxy_libshell', 'proxy_libshell.c')
+PROXY_LIBSHELL = 'libberberis_proxy_libshell.so'
+VRSHELL_APK = os.path.join(ROOT, 'work', 'fs', 'system_ext', 'priv-app', 'VrShell', 'VrShell.apk')
+LIBSHELL = 'lib/arm64-v8a/libshell.so'
+LIBSHELL_BUILD_ID = '4b820048d9ddd5c6be6ed20598244dd5cc4efb6f'
+LIBSHELL_LIFTED = {  # address: (size, what)
+    0x9cb994: (1332, 'HitTestableHelpers::ObjectRayTrace'),
+    0x9cb700: (660, 'a 4x4 matrix inverse'),
+    0x9cbec8: (388, 'TransformHelpers::GetUnitYAxis'),
+    0x9cc04c: (456, 'TransformHelpers::GetNormal'),
+    0x9ce650: (1068, "HitTestable: a shape's model parameters (GetModelParams)"),
+    0xb14a8c: (128, 'a rotation from an angle (sincosf), for GetModelParams'),
+    0xb0fe8c: (332, 'transform math, for GetModelParams'),
+    0xb15bb4: (16, "a shape type's name, for the asserts' messages"),
+}
+LIBSHELL_EXTERNS = {'sincosf': 'sincosf', 'atan2f': 'atan2f', 'abort': 'abort', '__stack_chk_fail': 'stack_chk_fail',
+                    0xa6a440: 'assert'}
+
+
+def build_proxy_libshell(ndk, lib_dir):
+    """The lifted hit-testing, or why not (another Horizon build, no capstone)."""
+    try:
+        import lift_arm64
+    except ImportError as e:
+        return f'not built ({e.name} is not installed; VrShell hit-tests translated)'
+    if not os.path.exists(VRSHELL_APK):
+        return f'not built (no {os.path.relpath(VRSHELL_APK, ROOT)})'
+    with zipfile.ZipFile(VRSHELL_APK) as apk:
+        data = apk.read(LIBSHELL)
+    build_id = lift_arm64.Elf(data).build_id()
+    if not build_id or build_id.hex() != LIBSHELL_BUILD_ID:
+        return f'not built (VrShell\'s libshell.so is build {build_id.hex() if build_id else "?"}, not {LIBSHELL_BUILD_ID})'
+    source, _blocks = lift_arm64.lift_library(data, LIBSHELL_LIFTED, LIBSHELL_EXTERNS,
+                                              f'VrShell.apk:{LIBSHELL}')
+    work = tempfile.mkdtemp(prefix='prism-lift-')
+    try:
+        lifted = os.path.join(work, 'lifted_libshell.c')
+        with open(lifted, 'w', newline='\n') as f:
+            f.write(source)
+        host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
+        clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
+        # No -mfma: only the lifted functions are built for FMA (their own pragma), as the runtime
+        # checks the CPU has it before any of them runs.
+        subprocess.run([clang, '--target=x86_64-linux-android34', '-shared', '-fPIC', '-O2', '-Wall',
+                        '-Wno-unused-variable', '-Wno-unused-but-set-variable', '-Wno-unused-label',
+                        '-Wno-misleading-indentation', PROXY_LIBSHELL_SOURCE, lifted,
+                        '-o', os.path.join(lib_dir, PROXY_LIBSHELL), f'-Wl,-soname,{PROXY_LIBSHELL}', f'-L{lib_dir}',
+                        '-Wl,--no-as-needed', '-lberberis_arm64', '-llog', '-lm', '-Wl,--allow-shlib-undefined',
+                        '-Wl,--build-id=sha1'], check=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return f'{len(LIBSHELL_LIFTED)} VrShell hit-testing functions lifted'
+
+
 def proxy_names():
     """The functions the proxy lists, from its table."""
     with open(PROXY_LIBM_SOURCE) as f:
@@ -449,6 +511,7 @@ def main():
     shim = build_shim(ndk, os.path.join(args.out, 'system', 'lib64'))
     build_proxy_libm(ndk, os.path.join(args.out, 'system', 'lib64'))
     intercepted = intercept_more_libm(args.out, proxy_names())
+    lifted = build_proxy_libshell(ndk, os.path.join(args.out, 'system', 'lib64'))
     shim_symbols = dynamic_symbols(shim)[1]
 
     hosts = sorted(glob.glob(os.path.join(args.out, 'system', 'lib64', 'libberberis_*.so')) +
@@ -493,7 +556,7 @@ def main():
         sys.exit(f'imports with no provider on Android 14: {unresolved}')
     stamp.write(args.out, fingerprint)
     print(f'{len(hosts)} host binaries, {patched} pointed at {SHIM}; {intercepted} more libm functions proxied; '
-          f'{quieted} proxy checks quieted; '
+          f'{quieted} proxy checks quieted; {lifted}; '
           f'all imports resolve -> {args.out}')
 
 

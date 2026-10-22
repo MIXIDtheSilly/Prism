@@ -26,12 +26,17 @@
 //   panel shading, the tiles over whatever is behind, and a translucent gray only where a panel
 //   draws one itself (the running app's card). Glass forced onto VrShell's layers instead showed
 //   the blurred environment (no passthrough to blur) or, without it, the runtime's solid fallback.
+//
+// * VrShell's ray hit-testing, run as native code: as libshell.so loads, libberberis_proxy_libshell
+//   (native/berberis_proxy_libshell) checks it and has the translator call its lifted functions
+//   in place of the guest's (lift_libshell below). The guest code itself is left as it is.
 
 #ifndef PRISM_STUB_LIB
 
 #include "prism_guest.h"
 
 #include <android/log.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -89,6 +94,23 @@ static int write_code(uintptr_t address, const uint8_t *bytes, size_t size) {
   return 1;
 }
 
+// VrShell's ray hit-testing runs as native code (libberberis_proxy_libshell.so, from
+// tools/lift_arm64.py): that library checks the build and asks the translator to call its code for
+// the guest functions' addresses (berberis::InterceptGuestSymbol), before any of them has run.
+static void lift_libshell(const char *name) {
+  uintptr_t base = library_base(name);
+  void *lift = dlopen("libberberis_proxy_libshell.so", RTLD_NOW);
+  void *translator = dlopen("libberberis_arm64.so", RTLD_NOW | RTLD_NOLOAD);
+  int (*attach)(uintptr_t, void *) = lift ? (int (*)(uintptr_t, void *))dlsym(lift, "prism_lift_attach") : NULL;
+  void *intercept = translator ? dlsym(translator, "_ZN8berberis20InterceptGuestSymbolEmPKcS1_S1_") : NULL;
+  if (!base || !attach || !intercept) {
+    LOGW("arm64 %s: hit-testing not lifted (%s)", name,
+         !base ? "library not found" : !attach ? "no libberberis_proxy_libshell.so" : "no InterceptGuestSymbol");
+    return;
+  }
+  attach(base, intercept);
+}
+
 void prism_patch_guest_library(const char *path) {
   const char *slash = path ? strrchr(path, '/') : NULL;
   const char *name = slash ? slash + 1 : path;
@@ -116,6 +138,7 @@ void prism_patch_guest_library(const char *path) {
     else
       LOGW("arm64 %s+%#x: can't write; %s not patched", name, kPatches[i].offset, kPatches[i].what);
   }
+  if (!strcmp(name, "libshell.so")) lift_libshell(name);
 }
 
 #endif  // PRISM_STUB_LIB

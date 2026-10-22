@@ -68,6 +68,9 @@ class Elf:
     def offset(self, vaddr):
         return next(off + vaddr - va for va, off, size in self.loads if va <= vaddr < va + size)
 
+    def vaddr(self, offset):
+        return next(va + offset - off for va, off, size in self.loads if off <= offset < off + size)
+
     def string(self, index):
         start = self.strtab + index
         return self.data[start:self.data.index(0, start)].decode()
@@ -198,6 +201,50 @@ def keep_chain_sites(out_dir):
     with open(path, 'wb') as f:
         f.write(elf.data)
     return True
+
+
+# The bundle's translator and its proxy libraries (rebuilt by Refract, prebuilts/digitalis/MANIFEST.txt)
+# check the first argument of their proxies' marshallers: from 1 to 0xffff one writes "BAD proxy
+# PRE-EXTRACT" and the guest's registers to stderr and twice to the log, then makes the call anyway.
+# A zero-length memcpy or memcmp from an empty container passes such a pointer, and crcs does ~40 a
+# second, the most of any log source. Prism makes each check's jump past the logging unconditional
+# (ja rel32 -> jmp rel32; nop), where the logging it skips is the message's.
+PROXY_CHECK = bytes.fromhex('483dfeff00000f87')  # cmp rax, 0xfffe; ja rel32
+PROXY_CHECK_MESSAGE = b'BAD proxy PRE-EXTRACT'
+
+
+def quiet_proxy_checks(out_dir):
+    total = 0
+    for path in sorted(glob.glob(os.path.join(out_dir, 'system', 'lib64', 'libberberis_*.so'))):
+        if os.path.basename(path) == PROXY_LIBM:
+            continue
+        with open(path, 'rb') as f:
+            elf = Elf(f.read())
+        data = elf.data
+        message = data.find(PROXY_CHECK_MESSAGE + b':')
+        if message == -1:
+            continue
+        message = elf.vaddr(message)
+        sites, at = [], data.find(PROXY_CHECK)
+        while at != -1:
+            ja = at + 6
+            rel, = struct.unpack_from('<i', data, ja + 2)
+            # The message's address, loaded rip-relative (lea r, [rip + d]) on the path the jump skips.
+            skipped = range(ja + 6, ja + 6 + rel - 7)
+            if not any(data[i] in (0x48, 0x4C) and data[i + 1] == 0x8D and data[i + 2] & 0xC7 == 0x05 and
+                       elf.vaddr(i) + 7 + struct.unpack_from('<i', data, i + 3)[0] == message for i in skipped):
+                sys.exit(f'{os.path.basename(path)}: a check at {at:#x} that does not skip the message')
+            sites.append(ja)
+            at = data.find(PROXY_CHECK, at + 1)
+        if not sites:
+            sys.exit(f'{os.path.basename(path)}: "{PROXY_CHECK_MESSAGE.decode()}" but no check found')
+        for ja in sites:
+            rel, = struct.unpack_from('<i', data, ja + 2)
+            data[ja:ja + 6] = b'\xe9' + struct.pack('<i', rel + 1) + b'\x90'
+        with open(path, 'wb') as f:
+            f.write(data)
+        total += len(sites)
+    return total
 
 
 # Math through the PC's libm (native/berberis_proxy_libm): Digitalis proxies only expf and powf. A
@@ -397,6 +444,7 @@ def main():
     shutil.copytree(os.path.join(BUNDLE, 'system'), os.path.join(args.out, 'system'))
     disable_guest_cfi(args.out)
     keep_chain_sites(args.out)
+    quieted = quiet_proxy_checks(args.out)
     ndk = find_ndk(args.ndk)
     shim = build_shim(ndk, os.path.join(args.out, 'system', 'lib64'))
     build_proxy_libm(ndk, os.path.join(args.out, 'system', 'lib64'))
@@ -445,6 +493,7 @@ def main():
         sys.exit(f'imports with no provider on Android 14: {unresolved}')
     stamp.write(args.out, fingerprint)
     print(f'{len(hosts)} host binaries, {patched} pointed at {SHIM}; {intercepted} more libm functions proxied; '
+          f'{quieted} proxy checks quieted; '
           f'all imports resolve -> {args.out}')
 
 

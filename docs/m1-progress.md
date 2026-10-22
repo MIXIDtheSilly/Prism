@@ -427,6 +427,22 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   shared it, measured turning at a steady 60° a second (a frame's yaw, by its shift against a still
   frame, was the one sent 20-35 ms before). Fast turns past the Store's panel show no black and no
   seam at its edges.
+  The band itself comes from the head pose apps render from. libtrackingserviceclients extrapolates
+  the head to the time a reader asks for (an app, its frame's predicted display time; the
+  compositor, its own) from the HeadState's velocities, unless the region's mode word is 1, which
+  returns the latest state as it is; tracking_prism set mode 1 and no velocities, so VrShell drew
+  from where the head was and the compositor turned that frame by all the time since. Since
+  2026-10-22 it sets trackingservice's mode, measures the head's velocities over the poses of the
+  last 50 ms (the angular one in the head's axes: the reader turns the orientation by it on the
+  right, q·exp(ωt/2)), keeps a history of states for earlier times, and drops the velocities once no
+  pose has come for 100 ms. Refract does the same on the PC's side (its games render from poses
+  predicted to the runtime's display time; unpredicted, the runtime reprojected the whole delay and
+  it looked smeared). Turning at a steady 60° and 120° a second through the pose port (scratch
+  script, the left eye's empty columns at a frame's edges), 90th percentiles went from 2.5° and
+  4.5° to 1.75° and 3.4°, and most frames have no band either way (the median is the compositor's
+  fixed 0.43° border). What's left comes in stretches: every frame ~1° (one refresh late at the
+  compositor), or every other frame 2° (VrShell at ~45 frames a second there), so it follows
+  VrShell's frame rate, and the viewer's cube still covers it.
   The compositor runs at 60 Hz, the display's rate: its vsync otherwise starts at the device's
   default 72 whatever the display reports, and the emulator shares at most 60 frames a second, so
   one compositor frame in six was dropped, unevenly. `debug.oculus.refreshRate` ("<rate>", or

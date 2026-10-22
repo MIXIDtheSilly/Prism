@@ -34,14 +34,20 @@
  *
  * The head tracker's region (libtrackingserviceclients' HeadTrackerSharedMemory, 0x1680 bytes):
  *   0x0000  the latest HeadState (two copies)
- *   0x0148  a sequence word and a history of 32 HeadStates, for interpolating past poses
+ *   0x0148  a sequence word and a history of 32 HeadStates, for interpolating past poses (as a
+ *           controller's history: odd while a slot is written, the latest in slot (sequence/2)%32)
  *   0x1588  a mode word (two copies); in mode 1 a reader returns the latest state as of the time
- *           it asks for, unextrapolated
+ *           it asks for, unextrapolated. Otherwise (trackingservice's) a time after the latest
+ *           state's is extrapolated from it, by its velocities, and an earlier one interpolated
+ *           from the history
  * HeadState (0xa0 bytes) holds a valid flag, its tracking flags (at 4, as a pose sample's: what a
  * reader reports, the low four bits and 0x80), the orientation (a quaternion, x y z w) and
- * position, and its time (ns, CLOCK_MONOTONIC); a second quaternion at 0x80 must be a unit one
- * too for the state to count as valid. Without the flags the headset is valid but not tracked:
- * Guardian takes its tracking for lost, and a controller located relative to it isn't located.
+ * position, its velocities and accelerations, and its time (ns, CLOCK_MONOTONIC); a second
+ * quaternion at 0x80 must be a unit one too for the state to count as valid. Without the flags the
+ * headset is valid but not tracked: Guardian takes its tracking for lost, and a controller located
+ * relative to it isn't located. Extrapolating, a reader turns the orientation by the angular
+ * velocity on its right (q * exp(w dt / 2): w in the head's own axes) and moves the position by
+ * the linear velocity (in the world's).
  *
  * Controllers (two, Touch Plus: left and right). Each is in three regions, which InputHub (in
  * libtrackingserviceclients, which the runtime reads them with) finds through the input map:
@@ -125,7 +131,11 @@ struct head_state {
   uint8_t reserved4[8];
   float orientation[4];  // x y z w
   float position[3];
-  uint8_t reserved1[0x34];
+  float angular_velocity[3];  // radians a second, the head's axes
+  float linear_velocity[3];   // meters a second
+  float angular_acceleration[3];
+  float linear_acceleration[3];
+  uint32_t reserved1;
   int64_t time_ns;
   int64_t sample_time_ns;
   uint8_t reserved2[0x10];
@@ -139,9 +149,17 @@ struct seqlock {
 };
 
 #define LATEST 0x0000
+#define HEAD_HISTORY_SEQUENCE 0x148
+#define HEAD_HISTORY 0x150
 #define MODE 0x1588
-#define MODE_LATEST 1
+#define MODE_EXTRAPOLATE 0
 #define RATE_HZ 100
+// The head's velocities are measured over the poses that came in this long before the latest (a
+// client sends one a frame of its own, 60-90 a second, and adb's forward sometimes brings two at
+// once), and dropped once no pose has come for HEAD_STALE_NS: readers would carry a turn on forever.
+#define HEAD_WINDOW_NS 50000000LL
+#define HEAD_STALE_NS 100000000LL
+#define HEAD_SAMPLES 16
 #define POSE_PORT 7340  // on the guest's loopback
 
 // --- controllers ---------------------------------------------------------------------------------
@@ -260,7 +278,17 @@ static void seed(uint8_t *at, const void *value, size_t size, size_t stride) {
   memcpy(at + sizeof(struct seqlock) + stride, value, size);
 }
 
-static void publish_head(uint8_t *region) {
+// The head's poses as they came, for its velocities.
+static struct head_sample {
+  int64_t ns;
+  float position[3], orientation[4];
+} g_head_samples[HEAD_SAMPLES];
+static unsigned g_head_count;
+static int64_t g_head_ns;  // when the latest pose came; 0: none yet
+static float g_head_angular[3], g_head_linear[3];
+
+// The latest state, as readers extrapolate it from time_ns on, and into the history.
+static void publish_head(uint8_t *region, int64_t time_ns) {
   struct head_state state = {
       .valid = 1,
       .flags = POSE_TRACKED,
@@ -268,18 +296,76 @@ static void publish_head(uint8_t *region) {
   };
   memcpy(state.orientation, g_orientation, sizeof g_orientation);
   memcpy(state.position, g_position, sizeof g_position);
-  state.time_ns = state.sample_time_ns = now_ns();
+  memcpy(state.angular_velocity, g_head_angular, sizeof g_head_angular);
+  memcpy(state.linear_velocity, g_head_linear, sizeof g_head_linear);
+  state.time_ns = state.sample_time_ns = time_ns;
   publish(region + LATEST, &state, sizeof state, sizeof state);
+  _Atomic uint32_t *sequence = (_Atomic uint32_t *)(region + HEAD_HISTORY_SEQUENCE);
+  uint32_t old = atomic_fetch_add_explicit(sequence, 1, memory_order_relaxed);  // odd: writing
+  atomic_thread_fence(memory_order_seq_cst);
+  memcpy(region + HEAD_HISTORY + (((old >> 1) + 1) % HISTORY_SLOTS) * sizeof state, &state, sizeof state);
+  atomic_fetch_add_explicit(sequence, 1, memory_order_release);
+}
+
+// A new head pose: its velocities from the oldest pose in the window before it (the angular one
+// in the head's axes, from conj(then) * now), and published at once.
+static void head_pose(const float p[3], const float q[4]) {
+  int64_t now = now_ns();
+  struct head_sample *s = &g_head_samples[g_head_count++ % HEAD_SAMPLES];
+  s->ns = now;
+  memcpy(s->position, p, sizeof s->position);
+  memcpy(s->orientation, q, sizeof s->orientation);
+  const struct head_sample *from = NULL;
+  for (unsigned i = 1; i < HEAD_SAMPLES && i < g_head_count; i++) {
+    const struct head_sample *o = &g_head_samples[(g_head_count - 1 - i) % HEAD_SAMPLES];
+    if (now - o->ns > HEAD_WINDOW_NS) break;
+    from = o;
+  }
+  float dt = from ? (float)(now - from->ns) * 1e-9f : 0;
+  if (dt > 0.005f) {
+    const float *a = from->orientation;
+    // conj(a) * q
+    float w = a[3] * q[3] + a[0] * q[0] + a[1] * q[1] + a[2] * q[2];
+    float v[3] = {a[3] * q[0] - a[0] * q[3] - a[1] * q[2] + a[2] * q[1],
+                  a[3] * q[1] - a[1] * q[3] - a[2] * q[0] + a[0] * q[2],
+                  a[3] * q[2] - a[2] * q[3] - a[0] * q[1] + a[1] * q[0]};
+    if (w < 0) {
+      w = -w;
+      for (int i = 0; i < 3; i++) v[i] = -v[i];
+    }
+    float sine = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    float rate = sine > 1e-7f ? 2 * atan2f(sine, w) / sine / dt : 0;
+    for (int i = 0; i < 3; i++) {
+      g_head_angular[i] = v[i] * rate;
+      g_head_linear[i] = (p[i] - from->position[i]) / dt;
+    }
+  } else if (!from) {
+    memset(g_head_angular, 0, sizeof g_head_angular);
+    memset(g_head_linear, 0, sizeof g_head_linear);
+  }
+  memcpy(g_position, p, sizeof g_position);
+  memcpy(g_orientation, q, sizeof g_orientation);
+  g_head_ns = now;
+  if (g_region) publish_head(g_region, now);
+}
+
+// With no pose for a while (no client, or one that stopped), the head holds still where it is.
+static void head_tick(void) {
+  int64_t now = now_ns();
+  if (!g_region || (g_head_ns && now - g_head_ns <= HEAD_STALE_NS)) return;
+  memset(g_head_angular, 0, sizeof g_head_angular);
+  memset(g_head_linear, 0, sizeof g_head_linear);
+  publish_head(g_region, now);
 }
 
 static void region_ready(void *context, void *memory) {
   (void)context;
   uint8_t *region = memory;
-  uint32_t mode = MODE_LATEST;
+  uint32_t mode = MODE_EXTRAPOLATE;
   pthread_mutex_lock(&g_lock);
   memset(region, 0, REGION_SIZE);
   publish(region + MODE, &mode, sizeof mode, sizeof mode);
-  publish_head(region);
+  publish_head(region, now_ns());
   g_region = region;
   pthread_mutex_unlock(&g_lock);
   LOG("head tracker region at %p", memory);
@@ -560,9 +646,7 @@ static void take_line(const char *line) {
     memcpy(c->stick, stick, sizeof stick);
     c->input_changed = 1;
   } else if (sscanf(line, "%f %f %f %f %f %f %f", &p[0], &p[1], &p[2], &q[0], &q[1], &q[2], &q[3]) == 7) {
-    if (!unit(q)) return;
-    memcpy(g_position, p, sizeof p);
-    memcpy(g_orientation, q, sizeof q);
+    if (unit(q)) head_pose(p, q);
   }
 }
 
@@ -704,7 +788,7 @@ static int run_host(void) {
   pthread_create(&poses, NULL, serve_poses, NULL);
   for (;;) {
     pthread_mutex_lock(&g_lock);
-    if (g_region) publish_head(g_region);
+    head_tick();
     for (int i = 0; i < 2; i++) {
       struct controller *c = &g_controllers[i];
       if (c->tracking) publish_pose(c);

@@ -576,6 +576,16 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
   or without it the compositor's opaque fallback colour (`debug.oculus.blurColor`, 0xff1e1812).
   The glass shader makes a glass layer opaque (`resultColor.a = 1.0`) and has no tint of its own;
   it's compiled into a cache, `/data/user_de/0/com.oculus.systemdriver/files/compositor/`.
+- **Navigator dim.** With the Universal Menu open over an app, a headset dims the app: the
+  compositor's `layer_navigatorDim` desaturates its layers and scales them down by luminance
+  (`NavigatorToneMapAndDesat`), fading in at `oculus_navigator_dim_speed`. The gatekeeper
+  `oculus_navigator_dim` was already on here, but the app stayed at full brightness: the compositor
+  learns that the Navigator is up from `signal://shell/navigator/visibility`, which VrShell sends
+  ("Sending Navigator Visibility Signal: 1") through `crcs`, Horizon's resource coordinator
+  (`internal.horizonos.resource.IFeatureManager`), and Prism didn't run crcs. Deploy now runs it
+  (its init script, and its policy `/odm/etc/crcs/policy.dag`, without which it exits at start).
+  2026-10-22, xrgame under the Universal Menu: its blue (63,97,160) went to (42,53,79) half a second
+  after the Meta button, and its whites to gray; without crcs it stayed (63,97,160).
 - **SteamVR** (M5; tried with a headset on 2026-10-11: focused and tracking, 90 frames a second
   submitted, and performance good enough to use). `python tools\steamvr.py` starts
   `native/steamvr`, an OpenXR app on the PC (Direct3D 11; its loader, session and controller actions

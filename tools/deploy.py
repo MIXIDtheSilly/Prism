@@ -188,6 +188,9 @@ DAEMON_RCS = {
     'runtimeipcbroker.rc': ['runtimeipc_manifest.xml'],  # RuntimeIPC, which the XR runtime's clients use
     'vrfocusserver.rc': [],  # vrfocus: which app has VR focus
     'xrservice.rc': ['xrservice-permission.xml', 'xrservice-spaces.xml'],  # SpaceManager, for volumetric windows
+    # crcs: resource coordination and Horizon's signal:// bus (IFeatureManager). VrShell's Navigator
+    # visibility reaches the compositor through it, which dims the app under the Universal Menu.
+    'crcs.rc': [],
 }
 # VINTF fragments for stable-AIDL services system_server hosts (Meta's Java services): the service
 # refuses to start if servicemanager won't register it.
@@ -575,6 +578,7 @@ def build(args):
     # The emulator's /odm/etc links to /vendor/odm/etc. Only the files: the directories hold
     # tracking models (over 200 MB), and the partition's own files stay stock.
     overlay.add_tree(odm, '/etc', '/vendor/odm/etc', ODM_STOCK, flat=True)
+    overlay.add_tree(odm, '/etc/crcs', '/vendor/odm/etc/crcs')  # crcs's policy (it won't start without it)
 
     # The Digitalis translator: its guest directories replace stock's, host files are added.
     for guest in ('/system/lib64/arm64', '/system/bin/arm64'):

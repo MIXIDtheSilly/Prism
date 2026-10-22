@@ -13,6 +13,7 @@ import argparse
 import glob
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -32,7 +33,7 @@ BIONIC = os.path.join(ROOT, 'work', 'device', 'bionic')
 
 def inputs(bionic=BIONIC):
     """The bundle, the shim, and what imports are checked against: stock's libraries and bionic."""
-    return [BUNDLE, SHIM_SOURCE, __file__, bionic, *extracted(os.path.join(ROOT, 'work', 'baseline', 'fs'))]
+    return [BUNDLE, SHIM_SOURCE, PROXY_LIBM_SOURCE, __file__, bionic, *extracted(os.path.join(ROOT, 'work', 'baseline', 'fs'))]
 SHIM = 'libpcx.so'
 REPLACED = 'libc++.so'
 assert len(SHIM) == len(REPLACED)
@@ -199,6 +200,159 @@ def keep_chain_sites(out_dir):
     return True
 
 
+# Math through the PC's libm (native/berberis_proxy_libm): Digitalis proxies only expf and powf. A
+# proxied function takes two halves: the host proxy's table, and the guest library handing the
+# function's address to the translator at load (native_bridge_intercept_symbol(address, "libm.so",
+# name), from an init function, which Digitalis's guest libm does for its two). Prism builds the
+# proxy, and gives the guest libm a new init function that calls the old one, then intercepts every
+# other function the proxy lists at its own address; the code and names go in the zero padding after
+# the guest libm's code segment, which grows over them.
+PROXY_LIBM_SOURCE = os.path.join(ROOT, 'native', 'berberis_proxy_libm', 'proxy_libm.c')
+PROXY_LIBM = 'libberberis_proxy_libm.so'
+GUEST_LIBM = os.path.join('system', 'lib64', 'arm64', 'libm.so')
+INTERCEPT = 'native_bridge_intercept_symbol'
+R_AARCH64_GLOB_DAT, R_AARCH64_RELATIVE = 1025, 1027
+PT_LOAD, PF_X = 1, 1
+
+
+def proxy_names():
+    """The functions the proxy lists, from its table."""
+    with open(PROXY_LIBM_SOURCE) as f:
+        source = f.read()
+    table = source[source.index('kTrampolines[] = {'):]
+    table = table[:table.index('};')]
+    return [a or b for a, b in re.findall(r'\b(?:F|FF|D|DD)\((\w+)\)|\{"(\w+)"', table)]
+
+
+def arm64_adr(pc, target, rd):
+    d = target - pc
+    assert -(1 << 20) <= d < (1 << 20)
+    return struct.pack('<I', 0x10000000 | (d & 3) << 29 | ((d >> 2) & 0x7FFFF) << 5 | rd)
+
+
+def arm64_bl(pc, target):
+    return struct.pack('<I', 0x94000000 | ((target - pc) >> 2) & 0x3FFFFFF)
+
+
+def intercept_more_libm(out_dir, names):
+    path = os.path.join(out_dir, GUEST_LIBM)
+    with open(path, 'rb') as f:
+        elf = Elf(f.read())
+    data = elf.data
+    values = symbol_values(bytes(data))
+    phoff, = struct.unpack_from('<Q', data, 0x20)
+    phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 0x3A)
+    sections = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+    strtab = sections[shstrndx][4]
+    section = {data[strtab + s[0]:data.index(b'\0', strtab + s[0])].decode(): s for s in sections}
+    dynsym, dynstr = section['.dynsym'], section['.dynstr']
+
+    def symbol_name(index):
+        name, = struct.unpack_from('<I', data, dynsym[4] + index * 24)
+        return data[dynstr[4] + name:data.index(b'\0', dynstr[4] + name)].decode()
+
+    # The init function: .init_array's one entry, a relative relocation.
+    init_array = section['.init_array']
+    rela = section['.rela.dyn']
+    slots = [rela[4] + i for i in range(0, rela[5], 24)
+             if struct.unpack_from('<QQ', data, rela[4] + i) == (init_array[3], R_AARCH64_RELATIVE)]
+    if init_array[5] != 8 or len(slots) != 1:
+        sys.exit(f'{GUEST_LIBM}: expected one init function')
+    old_init, = struct.unpack_from('<q', data, slots[0] + 16)
+    # The intercept call's PLT entry: the init function's first bl, whose GOT slot is the import's.
+    at = elf.offset(old_init)
+    for i in range(0, 0x100, 4):
+        w, = struct.unpack_from('<I', data, at + i)
+        if w & 0xFC000000 == 0x94000000:
+            plt = old_init + i + ((w & 0x3FFFFFF) << 2 if not w & 0x2000000 else ((w & 0x3FFFFFF) - (1 << 26)) << 2)
+            break
+    else:
+        sys.exit(f'{GUEST_LIBM}: its init function calls nothing')
+    adrp, ldr = struct.unpack_from('<II', data, elf.offset(plt))
+    page = ((adrp >> 29 & 3 | (adrp >> 5 & 0x7FFFF) << 2) ^ 1 << 20) - (1 << 20)
+    got = (plt & ~0xFFF) + (page << 12) + ((ldr >> 10 & 0xFFF) << 3)
+    relplt = section['.rela.plt']
+    imports = {struct.unpack_from('<Q', data, relplt[4] + i)[0]:
+               symbol_name(struct.unpack_from('<Q', data, relplt[4] + i + 8)[0] >> 32) for i in range(0, relplt[5], 24)}
+    if imports.get(got) != INTERCEPT:
+        sys.exit(f'{GUEST_LIBM}: its init function does not start with {INTERCEPT}')
+    # The functions it intercepts already: the addresses it loads from the GOT (adrp, then ldr).
+    got_symbols = {struct.unpack_from('<Q', data, rela[4] + i)[0]:
+                   symbol_name(struct.unpack_from('<Q', data, rela[4] + i + 8)[0] >> 32) for i in range(0, rela[5], 24)
+                   if struct.unpack_from('<Q', data, rela[4] + i + 8)[0] & 0xFFFFFFFF == R_AARCH64_GLOB_DAT}
+    done, pages = set(), {}
+    for i in range(0, 0x100, 4):
+        w, = struct.unpack_from('<I', data, at + i)
+        if w & 0x9F000000 == 0x90000000:  # adrp
+            imm = ((w >> 29 & 3 | (w >> 5 & 0x7FFFF) << 2) ^ 1 << 20) - (1 << 20)
+            pages[w & 31] = ((old_init + i) & ~0xFFF) + (imm << 12)
+        elif w & 0xFFC00000 == 0xF9400000 and (w >> 5 & 31) in pages:  # ldr xt, [xn, #imm]
+            name = got_symbols.get(pages[w >> 5 & 31] + ((w >> 10 & 0xFFF) << 3))
+            if name:
+                done.add(name)
+        elif w == 0xD65F03C0:
+            break
+    if not done:
+        sys.exit(f'{GUEST_LIBM}: its init function intercepts nothing')
+    library = data.find(b'\0libm.so\0') + 1
+    if library <= 0 or elf.offset(library) != library:
+        sys.exit(f'{GUEST_LIBM}: no "libm.so"')
+    missing = [n for n in names if n not in values]
+    if missing:
+        sys.exit(f'{GUEST_LIBM}: no {", ".join(missing)}')
+    names = [n for n in names if n not in done]
+
+    # The code segment, and the padding after it.
+    for i in range(phnum):
+        h = phoff + i * phentsize
+        p_type, p_flags, p_offset, p_vaddr, _, p_filesz, p_memsz = struct.unpack_from('<IIQQQQQ', data, h)
+        if p_type == PT_LOAD and p_flags & PF_X:
+            break
+    else:
+        sys.exit(f'{GUEST_LIBM}: no code segment')
+    next_offset = min(struct.unpack_from('<Q', data, phoff + j * phentsize + 8)[0] for j in range(phnum)
+                      if struct.unpack_from('<I', data, phoff + j * phentsize)[0] == PT_LOAD
+                      and struct.unpack_from('<Q', data, phoff + j * phentsize + 8)[0] > p_offset)
+    start = (p_vaddr + p_filesz + 15) & ~15
+    code_size = 4 * (3 + 4 * len(names) + 2)
+    strings = start + code_size
+    end = strings + sum(len(n) + 1 for n in names)
+    if p_offset != p_vaddr or end - p_vaddr > next_offset - p_offset or any(data[p_offset + p_filesz:end]):
+        sys.exit(f'{GUEST_LIBM}: no room after its code')
+    code = bytearray()
+    pc = lambda: start + len(code)
+    code += struct.pack('<II', 0xA9BF7BFD, 0x910003FD)  # stp x29, x30, [sp, #-16]!; mov x29, sp
+    code += arm64_bl(pc(), old_init)
+    at_name = strings
+    for name in names:
+        code += arm64_adr(pc(), values[name], 0)
+        code += arm64_adr(pc(), library, 1)
+        code += arm64_adr(pc(), at_name, 2)
+        code += arm64_bl(pc(), plt)
+        at_name += len(name) + 1
+    code += struct.pack('<II', 0xA8C17BFD, 0xD65F03C0)  # ldp x29, x30, [sp], #16; ret
+    assert len(code) == code_size
+    blob = bytes(code) + b''.join(n.encode() + b'\0' for n in names)
+    data[start:end] = blob
+    struct.pack_into('<QQ', data, h + 32, end - p_vaddr, end - p_vaddr)
+    struct.pack_into('<q', data, slots[0] + 16, start)
+    with open(path, 'wb') as f:
+        f.write(data)
+    return len(names)
+
+
+def build_proxy_libm(ndk, lib_dir):
+    host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
+    clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
+    out = os.path.join(lib_dir, PROXY_LIBM)
+    subprocess.run([clang, '--target=x86_64-linux-android34', '-shared', '-fPIC', '-O2', '-Wall', PROXY_LIBM_SOURCE,
+                    '-o', out, f'-Wl,-soname,{PROXY_LIBM}', f'-L{lib_dir}', '-Wl,--no-as-needed', '-lberberis_arm64',
+                    '-lm', '-Wl,--allow-shlib-undefined', '-Wl,--build-id=sha1'], check=True)
+    return out
+
+
 def build_shim(ndk, out_dir):
     host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64'
     clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
@@ -243,7 +397,10 @@ def main():
     shutil.copytree(os.path.join(BUNDLE, 'system'), os.path.join(args.out, 'system'))
     disable_guest_cfi(args.out)
     keep_chain_sites(args.out)
-    shim = build_shim(find_ndk(args.ndk), os.path.join(args.out, 'system', 'lib64'))
+    ndk = find_ndk(args.ndk)
+    shim = build_shim(ndk, os.path.join(args.out, 'system', 'lib64'))
+    build_proxy_libm(ndk, os.path.join(args.out, 'system', 'lib64'))
+    intercepted = intercept_more_libm(args.out, proxy_names())
     shim_symbols = dynamic_symbols(shim)[1]
 
     hosts = sorted(glob.glob(os.path.join(args.out, 'system', 'lib64', 'libberberis_*.so')) +
@@ -287,7 +444,8 @@ def main():
     if unresolved:
         sys.exit(f'imports with no provider on Android 14: {unresolved}')
     stamp.write(args.out, fingerprint)
-    print(f'{len(hosts)} host binaries, {patched} pointed at {SHIM}; all imports resolve -> {args.out}')
+    print(f'{len(hosts)} host binaries, {patched} pointed at {SHIM}; {intercepted} more libm functions proxied; '
+          f'all imports resolve -> {args.out}')
 
 
 if __name__ == '__main__':

@@ -714,6 +714,22 @@ python tools\perf.py --guest                      # shared frame rate, jitter, b
     p99 14.5 ms and 15 gaps with the PC quiet, so measure with it quiet. The jitter is VrShell's
     ~10.4 ms of translated code a frame in an 11.1 ms budget; shrinking it needs the translator's
     code quality, or less work in the shell, not a driver or emulator change.
+  - *Math through the PC's libm (2026-10-22):* with the library open a fresh VrShell holds ~70 frames
+    a second still or moving (Home alone 86-91), its ShellFrameLoop 94% busy: ~13 ms of translated
+    work a frame. Translated libm was 5% of it (atanf 2.0%, sincosf 1.8%, tanf 1.0%): Digitalis's
+    libm proxy lists only expf and powf, and its guest libm hands only those two to the translator
+    (an init function calling `native_bridge_intercept_symbol(address, "libm.so", name)`). In an
+    arm64 test program, 2,000,000 calls each: atanf 1,921 ns a loop translated and 209 through the
+    proxy, sincosf 1,657 and 304, the bare loop 194. `tools/translator.py` now builds Prism's proxy
+    (native/berberis_proxy_libm: 58 float and double functions, its table sorted by name, as the
+    builder searches it) and gives the guest libm a second init function, in the padding after its
+    code, that calls the first and intercepts the other 56 at their own addresses. All 58 give the
+    same bits as translated and as native x86 (754 results, ordinary and edge inputs). VrShell's
+    libm went to 0.2% of the thread (native); its frame rate with the library open stayed ~70-76
+    (noise is ±5): the rest is libshell's own code, layer ordering (SortRenderGroups, ~11%) and
+    ray tracing against every hit-testable object (~11%, with both controllers pointing behind),
+    ~5% shared, and the rest spread thin. A VrShell at ~75 after 90 minutes of use had the library
+    and the Store open; a fresh one with the library open is as slow, so that wasn't a decay.
   - *Slower the longer it runs (2026-10-17):* after hours of opening apps the shared frames fell from
     85 to ~42 a second and stayed there until the emulator restarted. The host's render thread spent
     ~58% of a core in the kernel's `NtUserWindowFromDC`, which NVIDIA's `DrvSetContext` calls on every

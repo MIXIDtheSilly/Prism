@@ -190,6 +190,8 @@ tools/soak.py         Leaves Horizon running, opening and closing apps, and reco
 tools/stamp.py        Whether a build is current: a stamp of what it was made from
 tools/prism.py        The launcher: doctor, setup (each step only when not current), vr, desktop, stop, report
 tools/prism_ui.pyw    The launcher's window (Prism.cmd opens it)
+tools/backend.py      The backend of the Tauri launcher (launcher/): its state, tasks, apps, shell and logcat
+launcher/             The Tauri launcher: start and stop, setup and its checks, install apps, logcat and a shell
 tools/viewer.py       Horizon in a desktop window: the mouse points and clicks, keys move
 tools/steamvr.py      Horizon in a PC headset through SteamVR (OpenXR): its tracking and frames
 tools/xrprobe.py      Builds and runs Prism's OpenXR test apps (xrprobe, xrdemo, xrgame)

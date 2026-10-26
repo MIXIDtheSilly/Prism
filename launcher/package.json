@@ -1,0 +1,26 @@
+{
+  "name": "prism-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prism's launcher window (Tauri)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "start": "tauri dev",
+    "release": "tauri build --no-bundle"
+  },
+  "dependencies": {
+    "@fontsource-variable/jost": "^5.3.0",
+    "@tauri-apps/api": "^2.12.0",
+    "lucide-react": "^1.48.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "vite": "^8.3.0"
+  }
+}

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-256 -256 512 512">
+  <defs>
+    <linearGradient id="fade" gradientUnits="userSpaceOnUse" x1="0" y1="22" x2="0" y2="82">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#fff"/>
+    </linearGradient>
+    <mask id="bar" maskUnits="userSpaceOnUse" x="-256" y="-256" width="512" height="512">
+      <rect x="-36" y="0" width="72" height="196" fill="url(#fade)"/>
+    </mask>
+  </defs>
+  <rect x="-256" y="-256" width="512" height="512" rx="112" fill="#000"/>
+  <g transform="translate(0 16) scale(0.98)">
+    <path d="M0 -190 L164.5 95 L-164.5 95 Z" fill="none" stroke="#fff" stroke-width="30" stroke-linejoin="miter"/>
+    <rect x="-36" y="0" width="72" height="196" fill="#a4e830" mask="url(#bar)"/>
+    <rect x="-36" y="0" width="72" height="196" fill="#5592de" mask="url(#bar)" transform="rotate(120)"/>
+    <rect x="-36" y="0" width="72" height="196" fill="#ff6570" mask="url(#bar)" transform="rotate(-120)"/>
+  </g>
+</svg>

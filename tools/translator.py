@@ -266,10 +266,11 @@ R_AARCH64_GLOB_DAT, R_AARCH64_RELATIVE = 1025, 1027
 PT_LOAD, PF_X = 1, 1
 
 
-# VrShell's ray hit-testing as native code (native/berberis_proxy_libshell): tools/lift_arm64.py
-# turns these libshell.so functions into C, from the user's own VrShell (work/fs), and the proxy's
-# runtime checks the build and the bytes again in VrShell before libprism_jni has the translator use
-# them. The offsets are this Horizon build's; another one is skipped here (and would be at runtime).
+# VrShell's hottest code as native code (native/berberis_proxy_libshell): tools/lift_arm64.py turns
+# these libshell.so functions into C, from the user's own VrShell (work/fs), and the proxy's runtime
+# checks the build and the bytes again in VrShell before libprism_jni has the translator use them.
+# The offsets are this Horizon build's; another one is skipped here (and would be at runtime). A
+# size of None: the function is the code reachable from its address.
 PROXY_LIBSHELL_SOURCE = os.path.join(ROOT, 'native', 'berberis_proxy_libshell', 'proxy_libshell.c')
 PROXY_LIBSHELL = 'libberberis_proxy_libshell.so'
 VRSHELL_APK = os.path.join(ROOT, 'work', 'fs', 'system_ext', 'priv-app', 'VrShell', 'VrShell.apk')
@@ -284,9 +285,58 @@ LIBSHELL_LIFTED = {  # address: (size, what)
     0xb14a8c: (128, 'a rotation from an angle (sincosf), for GetModelParams'),
     0xb0fe8c: (332, 'transform math, for GetModelParams'),
     0xb15bb4: (16, "a shape type's name, for the asserts' messages"),
+    # Each frame's transforms and animation.
+    0xdc85bc: (None, "a hand's 26 joint poses, from its tracked pose"),
+    0x957dbc: (None, "a ClayEntity's world transform (its parent's first, when dirty)"),
+    0x9c5078: (None, 'HsrPlayerInputSystem: pose math'),
+    0x9c54f4: (None, 'HsrPlayerInputSystem: pose math'),
+    0x9c57c0: (None, 'HsrPlayerInputSystem: pose math'),
+    0xb42d3c: (None, 'transform math'),
+    0xe63f6c: (None, "VrPlatformOpenXr: the tracking space's location math"),
+    0xc0dfc4: (None, 'HzAnimPlayback: sampling animations'),
+    0xc103b4: (None, 'HzAnim: pose math'),
+    0xe5c6b0: (None, 'AnimationPlayback::fillBoneDataImpl (its entry setting the flag)'),
+    0xe5c6b8: (None, 'AnimationPlayback::fillBoneDataImpl'),
+    0xbcf42c: (None, 'transform composition'),
+    0xe1b820: (None, "the renderer's bounds math"),
+    0x95e0c8: (None, 'a tree walk, for the hand grip ray'),
 }
+# And the rest of its hottest code, the 178 functions next in a frame-thread profile (2026-10-27):
+# call-heavy C++, about 6000 calls out to translated code, which pays now that such a call is
+# cheap (native/berberis_proxy_libshell/proxy_libshell.c: prism_guest_call). With the Store, the
+# library, Browser and TV open, VrShell's frame thread went from 10.1 ms a frame to 8.6 (9.3 with
+# only the functions above and the cheap calls).
+LIBSHELL_HOT = (
+    0xa6a860, 0x92b95c, 0x93aee4, 0x958b34, 0x9584fc, 0xb0b024, 0x989f44, 0x9e57f8, 0xea1ff4, 0x926dac,
+    0x92c054, 0x92c7b4, 0x92a160, 0x94cea4, 0xa16a48, 0x9eb130, 0x9cce28, 0x9582a4, 0x93bda8, 0xb42940,
+    0xb0a580, 0x9e394c, 0xa98e50, 0x91ed0c, 0x95b2c4, 0x92f38c, 0xb91bf8, 0x9266b0, 0xdf9b50, 0x932e70,
+    0x9ca278, 0x9512c4, 0xa2d54c, 0xa99bb0, 0xed3024, 0xeb459c, 0x973a9c, 0xea2ea4, 0x9d4acc, 0xa5ca28,
+    0x13375fc, 0xbcc668, 0xe64404, 0x92c4b0, 0x9c1cd4, 0x962b30, 0x91e82c, 0xb2dbb8, 0x9e5180, 0x92ae58,
+    0xad6b20, 0xa8dd90, 0x987ba4, 0x9cdeb4, 0xe1b5e8, 0x988368, 0x9214c8, 0x99def4, 0x929cd8, 0x94b1c0,
+    0x94fd58, 0xc0c330, 0x9cb314, 0x93f300, 0xa0b8f0, 0x94a370, 0x177a6c8, 0xb9f464, 0x93565c, 0x980230,
+    0xe820d8, 0x9201d4, 0xddccd4, 0x931208, 0x95c2ec, 0xe76ca8, 0x25418b4, 0x9cf7e0, 0xbb82a4, 0x91ea34,
+    0x9eaa4c, 0x92ab38, 0x1338db4, 0xe1a5c8, 0x9bebe4, 0x989ef4, 0x949d68, 0x927468, 0x958a10, 0xa904cc,
+    0xe87040, 0x9a3e70, 0x9edcec, 0xa6ff88, 0x928ddc, 0x95351c, 0xa98764, 0x9bb93c, 0xc35e78, 0x926374,
+    0xcb87d0, 0xb0c208, 0x925ec0, 0x9c1384, 0xd067a8, 0x952804, 0xa2de84, 0x9d1594, 0xa17894, 0x9ac338,
+    0x94dafc, 0x9554b8, 0x9ec8ac, 0x9c6480, 0x935994, 0x9e45f4, 0xa1f138, 0x93371c, 0x980a48, 0x9b953c,
+    0x93e8f0, 0x9c06d4, 0xad1a80, 0xa06e34, 0xb31f9c, 0xa72730, 0xe8e93c, 0xbcd1f0, 0xb9ed80, 0x954338,
+    0xa588f0, 0x93f9f4, 0x97045c, 0xa5032c, 0xa0b270, 0xcb45e0, 0x92e974, 0x9ac458, 0xe9e00c, 0x9624d4,
+    0x988d2c, 0x9ef840, 0xddc814, 0xacef1c, 0xafcfe4, 0x955290, 0x939aa8, 0x9caeb8, 0xbb7aa0, 0xa820c0,
+    0x965edc, 0xe1babc, 0x987100, 0xddd600, 0x9f1608, 0xd05c4c, 0xb71f8c, 0x9c88b0, 0x929178, 0x9669d0,
+    0x97d3e0, 0x9b7a64, 0xa2637c, 0xcadf70, 0xe1bcd4, 0x96dc28, 0xcbcc40, 0xb1a368, 0x9cead0, 0xec2588,
+    0xcaf710, 0x9bd760, 0x9d80b0, 0xa9b1e8, 0x1852084, 0x92788c, 0x9d0e34, 0x9cee7c,
+)
+
+
+def libshell_functions():
+    """{address: (size, what)} of everything lifted from libshell.so."""
+    return {**LIBSHELL_LIFTED, **{a: (None, 'hot') for a in LIBSHELL_HOT if a not in LIBSHELL_LIFTED}}
+
+
 LIBSHELL_EXTERNS = {'sincosf': 'sincosf', 'atan2f': 'atan2f', 'abort': 'abort', '__stack_chk_fail': 'stack_chk_fail',
-                    0xa6a440: 'assert'}
+                    0xa6a440: 'assert', 'memcpy': 'memcpy', 'memmove': 'memmove', 'memset': 'memset',
+                    **{name: name for name in ('sinf', 'cosf', 'tanf', 'asinf', 'acosf', 'atanf', 'expf', 'exp2f',
+                                               'logf', 'log2f', 'log10f', 'powf', 'fmodf')}}
 
 
 def build_proxy_libshell(ndk, lib_dir):
@@ -302,7 +352,8 @@ def build_proxy_libshell(ndk, lib_dir):
     build_id = lift_arm64.Elf(data).build_id()
     if not build_id or build_id.hex() != LIBSHELL_BUILD_ID:
         return f'not built (VrShell\'s libshell.so is build {build_id.hex() if build_id else "?"}, not {LIBSHELL_BUILD_ID})'
-    source, _blocks = lift_arm64.lift_library(data, LIBSHELL_LIFTED, LIBSHELL_EXTERNS,
+    functions = libshell_functions()
+    source, _lifter = lift_arm64.lift_library(data, functions, LIBSHELL_EXTERNS,
                                               f'VrShell.apk:{LIBSHELL}')
     work = tempfile.mkdtemp(prefix='prism-lift-')
     try:
@@ -321,7 +372,7 @@ def build_proxy_libshell(ndk, lib_dir):
                         '-Wl,--build-id=sha1'], check=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return f'{len(LIBSHELL_LIFTED)} VrShell hit-testing functions lifted'
+    return f'{len(functions)} VrShell functions lifted'
 
 
 def proxy_names():

@@ -2,8 +2,8 @@
 // variants (floats scaled, negated, zeroed, replaced; small integers such as shape types changed,
 // in memory and in argument registers), runs the lifted code on each with recording on, and writes
 // them for replay (replay.c checks them against arm64): calls VrShell didn't make while recording,
-// down paths it didn't take. Variants that fault or reach a fatal assert are dropped. COVER: where
-// to write the basic blocks reached.
+// down paths it didn't take. Variants that fault, reach a fatal assert or a guest call (code the
+// translator would run, not here) are dropped. COVER: where to write the basic blocks reached.
 #define _GNU_SOURCE
 #include <elf.h>
 #include <fcntl.h>
@@ -19,14 +19,19 @@
 
 struct op { uint8_t kind, size; uint8_t pad[6]; uint64_t addr; uint8_t value[16]; };
 struct regs { uint64_t x[31]; uint64_t sp; uint8_t v[32][16]; };
-struct header { uint32_t magic, function, ops, pad; uint64_t base, tls; struct regs in, out; };
+struct header { uint32_t magic, function, ops, pad; uint64_t base, tls, canary; struct regs in, out; };  // canary: the stack guard at tls + 0x28
+enum { OP_LOAD, OP_STORE, OP_CALL };
+#define CALL_SLOTS (2 * sizeof(struct regs) / sizeof(struct op))
+static uint32_t next_op(const struct op *ops, uint32_t i) { return ops[i].kind == OP_CALL ? i + 1 + CALL_SLOTS : i + 1; }
 
 uint64_t BASE;
 void record_abandon(void);
 void record_call(void *lifted, void *thread_state, uint32_t function);
 void record_open(const char *path);
 void record_dump_cover(const char *path);
-struct prism_lifted { uint32_t offset, size; uint64_t fnv; void (*lifted)(uint8_t *); const char *name; };
+struct prism_lifted { uint32_t offset, nranges; const uint32_t *ranges; uint64_t fnv; void (*lifted)(uint8_t *); const char *name;
+                      uint32_t nstops; const uint32_t *stops; };
+int record_guest_calls(void);
 extern const struct prism_lifted prism_lifted[];
 extern const unsigned prism_lifted_count;
 static void *lifted_for(uint32_t f) {
@@ -60,7 +65,7 @@ static void map_library(const char *path, uint64_t base) {
   BASE = base;
 }
 
-static sigjmp_buf g_jump;
+sigjmp_buf g_jump;
 static void on_fault(int sig) { (void)sig; siglongjmp(g_jump, 1); }
 static int g_fatal;
 void lift_fatal_assert(uint64_t file, uint64_t format, uint64_t arg) { (void)file, (void)format, (void)arg; g_fatal++; siglongjmp(g_jump, 2); }
@@ -131,8 +136,8 @@ int main(int argc, char **argv) {
     for (int m = 0; m < per; m++) {
       npages = 0;
       int ok = 1;
-      for (uint32_t i = 0; i < h->ops && ok; i++) {
-        if (ops[i].addr == h->tls + 0x28) continue;
+      for (uint32_t i = 0; i < h->ops && ok; i = next_op(ops, i)) {
+        if (ops[i].kind == OP_CALL || ops[i].addr == h->tls + 0x28) continue;
         for (uint64_t p = ops[i].addr & ~0xfffull; p < ops[i].addr + ops[i].size && ok; p += 0x1000) ok = map_page(p);
       }
       for (uint64_t p = (h->in.sp & ~0xfffull) - 0x2000; p <= (h->in.sp & ~0xfffull) && ok; p += 0x1000) ok = map_page(p);
@@ -142,7 +147,8 @@ int main(int argc, char **argv) {
       int ncand = 0;
       static uint64_t written[65536];
       int nwritten = 0;
-      for (uint32_t i = 0; i < h->ops; i++) {
+      for (uint32_t i = 0; i < h->ops; i = next_op(ops, i)) {
+        if (ops[i].kind == OP_CALL) break;  // a variant goes no further than its first guest call
         if (ops[i].addr == h->tls + 0x28) continue;
         for (int k = 0; k < ops[i].size; k++) {
           uint64_t a = ops[i].addr + k;
@@ -189,15 +195,16 @@ int main(int argc, char **argv) {
       }
     cleanup:
       for (int i = 0; i < npages; i++) munmap((void *)pages[i], 0x1000);
-      for (uint32_t i = 0; i < h->ops; i++)
-        if (ops[i].addr >= g_lo && ops[i].addr < g_hi) {
+      for (uint32_t i = 0; i < h->ops; i = next_op(ops, i))
+        if (ops[i].kind != OP_CALL && ops[i].addr >= g_lo && ops[i].addr < g_hi) {
           uint64_t p = ops[i].addr & ~0xfffull;
           memcpy((void *)p, g_image + (p - g_lo), 0x1000);
         }
     }
   }
   if (argc > 6) record_dump_cover(argv[6]);
-  fprintf(stderr, "%d variants recorded; dropped: %d reaching a fatal assert, %d touching memory the recording "
-          "didn't have, %d with pages this process can't map\n", made, g_fatal, faulted - g_fatal, unmappable);
+  fprintf(stderr, "%d variants recorded; dropped: %d reaching a fatal assert, %d a guest call, %d touching memory "
+          "the recording didn't have, %d with pages this process can't map\n", made, g_fatal, record_guest_calls(),
+          faulted - g_fatal - record_guest_calls(), unmappable);
   return 0;
 }
